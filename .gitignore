@@ -28,8 +28,12 @@ target
 # Local environment and cloud credentials
 .env.local
 .envrc
+.venv/
+__pycache__/
+*.pyc
 .aws/
 .terraform/
 *.tfstate
 *.tfstate.*
 crash.log
+infra/tofu/terraform.tfvars

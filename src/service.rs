@@ -7,17 +7,15 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    bedrock::{
-        ChatCompletionBackend, ChatCompletionRequest, SyntheticChatBackend, build_chat_backend,
-    },
-    config::AppConfig,
+    bedrock::{ChatCompletionBackend, ChatCompletionRequest, SyntheticChatBackend},
     model::{
         Artifact, ArtifactKind, AssembleContextRequest, AssembleContextResponse,
-        CaptureEntryResponse, ChatRespondRequest, ChatResponse, ConversationRole,
-        CreateAudioEntryRequest, CreateTextEntryRequest, EmbeddingVector, Entry, EntryKind,
-        MemoryKind, MemoryRecord, MemoryState, MemorySubtype, PatchMemoryRequest, PersistedState,
-        PreparedArtifactInput, PreparedMemoryInput, ProfileBlock, RetrievalTrace, ScoredMemory,
-        SearchMemoriesRequest, Thread, ThreadKind, ThreadStatus, empty_object, now_utc,
+        CaptureEntryResponse, ChatModelsResponse, ChatRespondRequest, ChatResponse,
+        ConversationRole, CreateAudioEntryRequest, CreateTextEntryRequest, EmbeddingVector, Entry,
+        EntryKind, MemoryKind, MemoryRecord, MemoryState, MemorySubtype, PatchMemoryRequest,
+        PersistedState, PreparedArtifactInput, PreparedMemoryInput, ProfileBlock, RetrievalTrace,
+        ScoredMemory, SearchMemoriesRequest, Thread, ThreadKind, ThreadStatus, empty_object,
+        now_utc,
     },
     retrieval::{
         SearchEnvironment, build_context_bundle, build_trace, gate_candidates,
@@ -57,15 +55,6 @@ impl AppService {
     ) -> anyhow::Result<Self> {
         Self::load_with_chat_backend(snapshot_path, database_url, Arc::new(SyntheticChatBackend))
             .await
-    }
-
-    pub async fn load_with_config(
-        snapshot_path: Option<PathBuf>,
-        database_url: Option<String>,
-        config: &AppConfig,
-    ) -> anyhow::Result<Self> {
-        let chat_backend = build_chat_backend(config).await?;
-        Self::load_with_chat_backend(snapshot_path, database_url, chat_backend).await
     }
 
     pub async fn load_with_chat_backend(
@@ -352,10 +341,11 @@ impl AppService {
             })
             .await?;
 
-        let answer = self
+        let completion = self
             .chat_backend
             .complete(&ChatCompletionRequest {
                 message: request.message.clone(),
+                model_id: request.model_id.clone(),
                 recent_turns: request.recent_turns.clone(),
                 recent_context,
                 injected_context: context.context.clone(),
@@ -385,11 +375,16 @@ impl AppService {
             .await?;
 
         Ok(ChatResponse {
-            answer,
+            answer: completion.answer,
             trace_id: context.trace_id,
             injected_context: context.context,
             selected_memories: context.selected_memories,
+            model_id: completion.model_id,
         })
+    }
+
+    pub fn chat_models(&self) -> ChatModelsResponse {
+        self.chat_backend.models()
     }
 
     pub async fn state(&self) -> PersistedState {
@@ -908,9 +903,23 @@ mod tests {
 
     #[async_trait]
     impl ChatCompletionBackend for RecordingBackend {
-        async fn complete(&self, request: &ChatCompletionRequest) -> anyhow::Result<String> {
+        async fn complete(
+            &self,
+            request: &ChatCompletionRequest,
+        ) -> anyhow::Result<crate::bedrock::ChatCompletionResult> {
             self.seen.lock().unwrap().push(request.clone());
-            Ok(format!("bedrock-mock: {}", request.message))
+            Ok(crate::bedrock::ChatCompletionResult {
+                answer: format!("bedrock-mock: {}", request.message),
+                model_id: request.model_id.clone(),
+            })
+        }
+
+        fn models(&self) -> ChatModelsResponse {
+            ChatModelsResponse {
+                backend: "bedrock".to_string(),
+                default_model_id: Some("anthropic.claude-opus-4-6-v1".to_string()),
+                models: Vec::new(),
+            }
         }
     }
 
@@ -1088,6 +1097,7 @@ mod tests {
         let response = service
             .chat_respond(ChatRespondRequest {
                 message: "What am I building?".to_string(),
+                model_id: Some("anthropic.claude-opus-4-6-v1".to_string()),
                 recent_turns: Vec::new(),
                 recent_context: None,
                 active_thread_id: None,
@@ -1098,9 +1108,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.answer, "bedrock-mock: What am I building?");
+        assert_eq!(
+            response.model_id.as_deref(),
+            Some("anthropic.claude-opus-4-6-v1")
+        );
         assert!(!response.selected_memories.is_empty());
         let seen = backend.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].model_id.as_deref(),
+            Some("anthropic.claude-opus-4-6-v1")
+        );
         assert!(
             seen[0]
                 .injected_context

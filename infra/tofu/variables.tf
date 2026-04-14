@@ -137,6 +137,19 @@ variable "bedrock_chat_model_id" {
   type        = string
 }
 
+variable "bedrock_chat_models" {
+  description = "Curated Bedrock chat models exposed to the TUI model picker."
+  type = list(object({
+    label                  = string
+    model_id               = string
+    description            = optional(string)
+    thinking_mode          = optional(string)
+    thinking_effort        = optional(string)
+    thinking_budget_tokens = optional(number)
+  }))
+  default = []
+}
+
 variable "bedrock_chat_max_tokens" {
   description = "Default Bedrock max output tokens."
   type        = number

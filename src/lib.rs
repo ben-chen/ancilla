@@ -1,8 +1,12 @@
 pub mod api;
 pub mod bedrock;
-pub mod cli;
+pub mod client;
+pub mod client_cli;
+pub mod client_config;
 pub mod config;
 pub mod model;
 pub mod retrieval;
+pub mod server_cli;
+pub mod server_config;
 pub mod service;
 pub mod store;

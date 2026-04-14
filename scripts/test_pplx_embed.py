@@ -3,7 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts import pplx_embed
+try:
+    from scripts import pplx_embed
+except ModuleNotFoundError:
+    import pplx_embed
 
 
 class _FakeAvailable:

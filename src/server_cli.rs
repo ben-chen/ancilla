@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, bail};
 use axum::serve;
@@ -8,17 +8,18 @@ use uuid::Uuid;
 
 use crate::{
     api,
-    config::AppConfig,
+    bedrock::build_chat_backend,
     model::{
         ChatRespondRequest, CreateAudioEntryRequest, CreateTextEntryRequest, PatchMemoryRequest,
         SearchMemoriesRequest, empty_object,
     },
+    server_config::ServerConfig,
     service::AppService,
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "ancilla")]
-#[command(about = "Personal LLM memory system")]
+#[command(name = "ancilla-server")]
+#[command(about = "Ancilla server and admin CLI")]
 pub struct Cli {
     #[arg(long, global = true)]
     pub data_file: Option<PathBuf>,
@@ -28,7 +29,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Server {
+    Serve {
         #[arg(long, default_value = "127.0.0.1:3000")]
         bind: String,
     },
@@ -47,6 +48,14 @@ pub enum Command {
     Ask {
         message: String,
     },
+    InitConfig {
+        #[arg(long)]
+        force: bool,
+    },
+    ShowConfig {
+        #[arg(long)]
+        show_secrets: bool,
+    },
     Timeline,
     Review,
     Search {
@@ -62,17 +71,47 @@ pub enum Command {
     },
 }
 
-pub async fn run(cli: Cli, config: AppConfig) -> anyhow::Result<()> {
-    let data_file = cli.data_file.clone().unwrap_or(config.data_file.clone());
+pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    let Cli { data_file, command } = cli;
+    match command {
+        Command::InitConfig { force } => {
+            return print_json(&ServerConfig::init_user_config(force)?);
+        }
+        Command::ShowConfig { show_secrets } => {
+            let mut config = ServerConfig::load()?;
+            if let Some(data_file) = data_file {
+                config.data_file = data_file;
+            }
+            return print_json(&config.to_view(show_secrets));
+        }
+        Command::Serve { .. }
+        | Command::Capture { .. }
+        | Command::Ask { .. }
+        | Command::Timeline
+        | Command::Review
+        | Command::Search { .. }
+        | Command::Forget { .. }
+        | Command::PatchMemory { .. } => {}
+    }
+
+    let config = ServerConfig::load()?;
+    let data_file = data_file.unwrap_or(config.data_file.clone());
     let snapshot_path = if config.database_url.is_some() {
         None
     } else {
         Some(data_file)
     };
-    let service =
-        AppService::load_with_config(snapshot_path, config.database_url.clone(), &config).await?;
-    match cli.command {
-        Command::Server { bind } => run_server(service, &bind).await,
+    let chat_backend: Arc<dyn crate::bedrock::ChatCompletionBackend> =
+        build_chat_backend(&config).await?;
+    let service = AppService::load_with_chat_backend(
+        snapshot_path,
+        config.database_url.clone(),
+        chat_backend,
+    )
+    .await?;
+
+    match command {
+        Command::Serve { bind } => run_server(service, &bind).await,
         Command::Capture {
             text,
             audio_asset,
@@ -117,6 +156,7 @@ pub async fn run(cli: Cli, config: AppConfig) -> anyhow::Result<()> {
             &service
                 .chat_respond(ChatRespondRequest {
                     message,
+                    model_id: None,
                     recent_turns: Vec::new(),
                     recent_context: None,
                     active_thread_id: None,
@@ -161,6 +201,9 @@ pub async fn run(cli: Cli, config: AppConfig) -> anyhow::Result<()> {
                 )
                 .await?,
         ),
+        Command::InitConfig { .. } | Command::ShowConfig { .. } => {
+            unreachable!("config command handled before service load")
+        }
     }
 }
 
@@ -185,9 +228,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_parses_capture_and_server_commands() {
+    fn cli_parses_server_commands() {
         let capture = Cli::parse_from([
-            "ancilla",
+            "ancilla-server",
             "--data-file",
             "/tmp/state.json",
             "capture",
@@ -197,10 +240,22 @@ mod tests {
         assert!(matches!(capture.command, Command::Capture { .. }));
         assert_eq!(capture.data_file, Some(PathBuf::from("/tmp/state.json")));
 
-        let server = Cli::parse_from(["ancilla", "server", "--bind", "127.0.0.1:4000"]);
-        match server.command {
-            Command::Server { bind } => assert_eq!(bind, "127.0.0.1:4000"),
-            _ => panic!("expected server command"),
+        let serve = Cli::parse_from(["ancilla-server", "serve", "--bind", "127.0.0.1:4000"]);
+        match serve.command {
+            Command::Serve { bind } => assert_eq!(bind, "127.0.0.1:4000"),
+            _ => panic!("expected serve command"),
+        }
+
+        let init_config = Cli::parse_from(["ancilla-server", "init-config", "--force"]);
+        match init_config.command {
+            Command::InitConfig { force } => assert!(force),
+            _ => panic!("expected init-config command"),
+        }
+
+        let show_config = Cli::parse_from(["ancilla-server", "show-config", "--show-secrets"]);
+        match show_config.command {
+            Command::ShowConfig { show_secrets } => assert!(show_secrets),
+            _ => panic!("expected show-config command"),
         }
     }
 }

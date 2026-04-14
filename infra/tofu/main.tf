@@ -269,6 +269,7 @@ resource "aws_ecs_task_definition" "app" {
         { name = "AWS_REGION", value = var.aws_region },
         { name = "AWS_DEFAULT_REGION", value = var.aws_region },
         { name = "BEDROCK_CHAT_MODEL_ID", value = var.bedrock_chat_model_id },
+        { name = "BEDROCK_CHAT_MODELS_JSON", value = jsonencode(var.bedrock_chat_models) },
         { name = "BEDROCK_CHAT_MAX_TOKENS", value = tostring(var.bedrock_chat_max_tokens) },
         { name = "BEDROCK_CHAT_TEMPERATURE", value = tostring(var.bedrock_chat_temperature) }
       ]

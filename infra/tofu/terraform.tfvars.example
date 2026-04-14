@@ -8,7 +8,26 @@ vpc_cidr                = "10.42.0.0/16"
 public_subnet_cidrs     = ["10.42.0.0/24", "10.42.1.0/24"]
 private_app_subnet_cidrs = ["10.42.10.0/24", "10.42.11.0/24"] # reserved for future private services
 private_db_subnet_cidrs  = ["10.42.20.0/24", "10.42.21.0/24"]
-bedrock_chat_model_id    = "replace-me"
+bedrock_chat_model_id    = "us.anthropic.claude-opus-4-6-v1"
+bedrock_chat_models = [
+  {
+    label           = "Claude Opus 4.6"
+    model_id        = "us.anthropic.claude-opus-4-6-v1"
+    description     = "Deepest reasoning"
+    thinking_mode   = "adaptive"
+  },
+  {
+    label           = "Claude Sonnet 4.6"
+    model_id        = "us.anthropic.claude-sonnet-4-6"
+    description     = "Balanced reasoning and speed"
+    thinking_mode   = "adaptive"
+  },
+  {
+    label       = "Claude Haiku 4.5"
+    model_id    = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    description = "Fastest responses"
+  },
+]
 container_image_tag      = "latest"
 desired_count            = 1
 task_cpu                 = 256

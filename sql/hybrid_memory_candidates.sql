@@ -128,7 +128,7 @@ lexical AS (
         e.salience DESC,
         e.confidence DESC
     ) AS lexical_rank,
-    ts_rank_cd(e.search_vector, c.ts_query, 32) AS lexical_score
+    ts_rank_cd(e.search_vector, c.ts_query, 32)::double precision AS lexical_score
   FROM eligible e
   CROSS JOIN context c
   WHERE c.ts_query IS NOT NULL
@@ -252,16 +252,16 @@ SELECT
   r.salience,
   r.semantic_rank,
   r.lexical_rank,
-  r.semantic_score,
-  r.lexical_score,
-  r.fusion_score,
-  r.temporal_bonus,
-  r.thread_bonus,
-  r.salience_bonus,
-  r.confidence_bonus,
-  r.reinjection_penalty,
-  r.stale_penalty,
-  r.final_score,
+  r.semantic_score::double precision AS semantic_score,
+  r.lexical_score::double precision AS lexical_score,
+  r.fusion_score::double precision AS fusion_score,
+  r.temporal_bonus::double precision AS temporal_bonus,
+  r.thread_bonus::double precision AS thread_bonus,
+  r.salience_bonus::double precision AS salience_bonus,
+  r.confidence_bonus::double precision AS confidence_bonus,
+  r.reinjection_penalty::double precision AS reinjection_penalty,
+  r.stale_penalty::double precision AS stale_penalty,
+  r.final_score::double precision AS final_score,
   r.prior_injected,
   coalesce(src.source_artifact_ids, ARRAY[]::uuid[]) AS source_artifact_ids,
   r.candidate_rank

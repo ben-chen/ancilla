@@ -33,6 +33,7 @@ pub fn router(service: AppService) -> Router {
         .route("/v1/entries/text", post(create_text_entry))
         .route("/v1/entries/audio", post(create_audio_entry))
         .route("/v1/timeline", get(get_timeline))
+        .route("/v1/chat/models", get(get_chat_models))
         .route("/v1/context/assemble", post(assemble_context))
         .route("/v1/memories/search", post(search_memories))
         .route(
@@ -100,6 +101,10 @@ async fn profile_blocks(State(state): State<ApiState>) -> Json<Vec<crate::model:
     Json(state.service.profile_blocks().await)
 }
 
+async fn get_chat_models(State(state): State<ApiState>) -> Json<crate::model::ChatModelsResponse> {
+    Json(state.service.chat_models())
+}
+
 async fn chat_respond(
     State(state): State<ApiState>,
     Json(request): Json<ChatRespondRequest>,
@@ -124,6 +129,7 @@ pub enum ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
+        eprintln!("{error:#}");
         let message = error.to_string();
         if message.contains("not found") {
             Self::BadRequest(message)

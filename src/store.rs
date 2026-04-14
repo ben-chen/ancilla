@@ -190,7 +190,7 @@ impl PostgresStore {
         }
 
         let memory_sources = sqlx::query_as::<_, MemorySourceRow>(
-            "SELECT memory_id, artifact_id, evidence_rank FROM memory_sources ORDER BY memory_id, evidence_rank",
+            "SELECT memory_id, artifact_id FROM memory_sources ORDER BY memory_id, evidence_rank",
         )
         .fetch_all(&self.pool)
         .await
@@ -259,7 +259,7 @@ impl PostgresStore {
               candidate_rank,
               selected,
               injected_rank,
-              created_at
+              rtc.created_at AS created_at
             FROM retrieval_trace_candidates rtc
             JOIN memory_records mr ON mr.id = rtc.memory_id
             ORDER BY trace_id, candidate_rank
@@ -1352,7 +1352,6 @@ impl MemoryEmbeddingRow {
 struct MemorySourceRow {
     memory_id: Uuid,
     artifact_id: Uuid,
-    _evidence_rank: i16,
 }
 
 #[derive(FromRow)]

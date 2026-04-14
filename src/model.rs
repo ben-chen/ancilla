@@ -135,6 +135,45 @@ pub struct ConversationTurn {
     pub text: String,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatThinkingMode {
+    Adaptive,
+    Enabled,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatThinkingEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatModelOption {
+    pub label: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub thinking_mode: Option<ChatThinkingMode>,
+    #[serde(default)]
+    pub thinking_effort: Option<ChatThinkingEffort>,
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatModelsResponse {
+    pub backend: String,
+    #[serde(default)]
+    pub default_model_id: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ChatModelOption>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     pub id: Uuid,
@@ -284,6 +323,8 @@ pub struct ChatResponse {
     pub trace_id: Uuid,
     pub injected_context: Option<String>,
     pub selected_memories: Vec<MemoryRecord>,
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -395,6 +436,8 @@ pub struct PatchMemoryRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChatRespondRequest {
     pub message: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
     #[serde(default)]
     pub recent_turns: Vec<ConversationTurn>,
     pub recent_context: Option<String>,
