@@ -112,8 +112,8 @@ Current runtime note:
 Terraform/OpenTofu scaffolding for the MVP is in [infra/tofu/README.md](/Users/benchen/workspace/ancilla/infra/tofu/README.md).
 It now supports both modes:
 
-- create a dedicated MVP VPC, subnets, NAT, and route tables
+- create a dedicated MVP VPC, subnets, and route tables
 - or attach the app stack to an existing VPC/subnet layout
 
-The app resources still target ECS Fargate, an ALB, Aurora PostgreSQL, S3, ECR, IAM, and Secrets Manager.
+The default side-project shape uses a small public ECS Fargate service, single-instance RDS PostgreSQL, S3, ECR, IAM, and Secrets Manager.
 Nothing in this repo applies infrastructure automatically.

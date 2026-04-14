@@ -9,16 +9,11 @@ output "public_subnet_ids" {
 }
 
 output "private_app_subnet_ids" {
-  description = "Created private application subnet IDs."
+  description = "Created private application subnet IDs reserved for future private service deployments."
   value       = aws_subnet.private_app[*].id
 }
 
 output "private_db_subnet_ids" {
   description = "Created private database subnet IDs."
   value       = aws_subnet.private_db[*].id
-}
-
-output "nat_gateway_id" {
-  description = "Created NAT gateway ID."
-  value       = aws_nat_gateway.this.id
 }

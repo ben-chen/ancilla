@@ -4,28 +4,33 @@ output "vpc_id" {
 }
 
 output "public_subnet_ids" {
-  description = "Public subnet IDs used by the ALB."
+  description = "Public subnet IDs used by the ECS service."
   value       = local.public_subnet_ids
 }
 
 output "private_app_subnet_ids" {
-  description = "Private application subnet IDs used by ECS."
+  description = "Private application subnet IDs reserved for future private service deployments."
   value       = local.private_app_subnet_ids
 }
 
 output "private_db_subnet_ids" {
-  description = "Private database subnet IDs used by Aurora."
+  description = "Private database subnet IDs used by PostgreSQL."
   value       = local.private_db_subnet_ids
 }
 
-output "alb_dns_name" {
-  description = "Public DNS name for the Ancilla MVP ALB."
-  value       = aws_lb.app.dns_name
+output "ecs_cluster_name" {
+  description = "ECS cluster name for the Ancilla API."
+  value       = aws_ecs_cluster.app.name
 }
 
-output "api_base_url" {
-  description = "HTTP base URL for the MVP API."
-  value       = "http://${aws_lb.app.dns_name}"
+output "ecs_service_name" {
+  description = "ECS service name for the Ancilla API."
+  value       = aws_ecs_service.app.name
+}
+
+output "app_port" {
+  description = "Public port exposed directly by the ECS task."
+  value       = var.app_port
 }
 
 output "ecr_repository_url" {
@@ -38,9 +43,9 @@ output "assets_bucket_name" {
   value       = aws_s3_bucket.assets.bucket
 }
 
-output "aurora_cluster_endpoint" {
-  description = "Aurora writer endpoint."
-  value       = aws_rds_cluster.aurora.endpoint
+output "database_endpoint" {
+  description = "RDS PostgreSQL endpoint."
+  value       = aws_db_instance.postgres.address
 }
 
 output "database_url_secret_arn" {

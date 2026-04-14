@@ -23,7 +23,9 @@ locals {
   public_subnet_ids      = var.create_network ? module.network[0].public_subnet_ids : var.public_subnet_ids
   private_app_subnet_ids = var.create_network ? module.network[0].private_app_subnet_ids : var.private_app_subnet_ids
   private_db_subnet_ids  = var.create_network ? module.network[0].private_db_subnet_ids : var.private_db_subnet_ids
-  database_url           = "postgres://${var.db_username}:${random_password.db_password.result}@${aws_rds_cluster.aurora.endpoint}:${aws_rds_cluster.aurora.port}/${var.db_name}?sslmode=require"
+  db_engine_version      = coalesce(var.db_engine_version, var.aurora_engine_version, "15.8")
+  db_instance_class      = coalesce(var.db_instance_class, var.aurora_instance_class, "db.t4g.micro")
+  database_url           = "postgres://${var.db_username}:${random_password.db_password.result}@${aws_db_instance.postgres.address}:${aws_db_instance.postgres.port}/${var.db_name}?sslmode=require"
   bucket_name            = "${var.name_prefix}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-memory-assets"
   tags = {
     Project     = "ancilla"
@@ -81,14 +83,14 @@ resource "aws_s3_bucket_public_access_block" "assets" {
   restrict_public_buckets = true
 }
 
-resource "aws_security_group" "alb" {
-  name        = "${local.service_name}-alb"
-  description = "Ancilla MVP ALB"
+resource "aws_security_group" "ecs_service" {
+  name        = "${local.service_name}-ecs"
+  description = "Ancilla MVP public ECS tasks"
   vpc_id      = local.vpc_id
 
   ingress {
-    from_port   = 80
-    to_port     = 80
+    from_port   = var.app_port
+    to_port     = var.app_port
     protocol    = "tcp"
     cidr_blocks = var.allowed_ingress_cidr_blocks
   }
@@ -101,29 +103,9 @@ resource "aws_security_group" "alb" {
   }
 }
 
-resource "aws_security_group" "ecs_service" {
-  name        = "${local.service_name}-ecs"
-  description = "Ancilla MVP ECS tasks"
-  vpc_id      = local.vpc_id
-
-  ingress {
-    from_port       = var.app_port
-    to_port         = var.app_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
 resource "aws_security_group" "db" {
   name        = "${local.service_name}-db"
-  description = "Ancilla MVP Aurora PostgreSQL"
+  description = "Ancilla MVP PostgreSQL"
   vpc_id      = local.vpc_id
 
   ingress {
@@ -141,73 +123,31 @@ resource "aws_security_group" "db" {
   }
 }
 
-resource "aws_lb" "app" {
-  name               = substr("${local.service_name}-alb", 0, 32)
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = local.public_subnet_ids
-}
-
-resource "aws_lb_target_group" "app" {
-  name        = substr("${local.service_name}-tg", 0, 32)
-  port        = var.app_port
-  protocol    = "HTTP"
-  target_type = "ip"
-  vpc_id      = local.vpc_id
-
-  health_check {
-    enabled             = true
-    path                = "/healthz"
-    protocol            = "HTTP"
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-    interval            = 30
-    timeout             = 5
-    matcher             = "200-399"
-  }
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.app.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
-  }
-}
-
-resource "aws_db_subnet_group" "aurora" {
+resource "aws_db_subnet_group" "postgres" {
   name       = "${local.service_name}-db-subnets"
   subnet_ids = local.private_db_subnet_ids
 }
 
-resource "aws_rds_cluster" "aurora" {
-  cluster_identifier              = "${local.service_name}-aurora"
-  engine                          = "aurora-postgresql"
-  engine_version                  = var.aurora_engine_version
-  database_name                   = var.db_name
-  master_username                 = var.db_username
-  master_password                 = random_password.db_password.result
-  db_subnet_group_name            = aws_db_subnet_group.aurora.name
+resource "aws_db_instance" "postgres" {
+  identifier                      = "${local.service_name}-postgres"
+  engine                          = "postgres"
+  engine_version                  = local.db_engine_version
+  instance_class                  = local.db_instance_class
+  db_name                         = var.db_name
+  username                        = var.db_username
+  password                        = random_password.db_password.result
+  allocated_storage               = var.db_allocated_storage_gb
+  max_allocated_storage           = var.db_max_allocated_storage_gb
+  storage_type                    = var.db_storage_type
+  db_subnet_group_name            = aws_db_subnet_group.postgres.name
   vpc_security_group_ids          = [aws_security_group.db.id]
   backup_retention_period         = var.backup_retention_period
   storage_encrypted               = true
-  skip_final_snapshot             = true
   deletion_protection             = false
+  skip_final_snapshot             = true
   copy_tags_to_snapshot           = true
   enabled_cloudwatch_logs_exports = ["postgresql"]
-}
-
-resource "aws_rds_cluster_instance" "writer" {
-  identifier          = "${local.service_name}-writer-1"
-  cluster_identifier  = aws_rds_cluster.aurora.id
-  engine              = aws_rds_cluster.aurora.engine
-  engine_version      = aws_rds_cluster.aurora.engine_version
-  instance_class      = var.aurora_instance_class
-  publicly_accessible = false
+  publicly_accessible             = false
 }
 
 resource "aws_secretsmanager_secret" "database_url" {
@@ -307,6 +247,11 @@ resource "aws_ecs_task_definition" "app" {
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
+  runtime_platform {
+    cpu_architecture        = "ARM64"
+    operating_system_family = "LINUX"
+  }
+
   container_definitions = jsonencode([
     {
       name      = "ancilla"
@@ -352,21 +297,12 @@ resource "aws_ecs_service" "app" {
   desired_count                      = var.desired_count
   launch_type                        = "FARGATE"
   enable_execute_command             = true
-  health_check_grace_period_seconds  = 60
   deployment_maximum_percent         = 200
   deployment_minimum_healthy_percent = 50
 
   network_configuration {
-    subnets          = local.private_app_subnet_ids
+    subnets          = local.public_subnet_ids
     security_groups  = [aws_security_group.ecs_service.id]
-    assign_public_ip = false
+    assign_public_ip = true
   }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.app.arn
-    container_name   = "ancilla"
-    container_port   = var.app_port
-  }
-
-  depends_on = [aws_lb_listener.http]
 }

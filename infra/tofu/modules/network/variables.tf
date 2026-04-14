@@ -29,11 +29,11 @@ variable "public_subnet_cidrs" {
 }
 
 variable "private_app_subnet_cidrs" {
-  description = "CIDR blocks for private application subnets."
+  description = "CIDR blocks for private application subnets reserved for future private service deployments."
   type        = list(string)
 }
 
 variable "private_db_subnet_cidrs" {
-  description = "CIDR blocks for private database subnets."
+  description = "CIDR blocks for private PostgreSQL subnets."
   type        = list(string)
 }

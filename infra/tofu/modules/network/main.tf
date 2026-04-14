@@ -68,25 +68,6 @@ resource "aws_subnet" "private_db" {
   })
 }
 
-resource "aws_eip" "nat" {
-  domain = "vpc"
-
-  tags = merge(local.tags, {
-    Name = "${local.name_prefix}-nat-eip"
-  })
-}
-
-resource "aws_nat_gateway" "this" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public[0].id
-
-  tags = merge(local.tags, {
-    Name = "${local.name_prefix}-nat"
-  })
-
-  depends_on = [aws_internet_gateway.this]
-}
-
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.this.id
 
@@ -109,11 +90,6 @@ resource "aws_route_table_association" "public" {
 
 resource "aws_route_table" "private_app" {
   vpc_id = aws_vpc.this.id
-
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.this.id
-  }
 
   tags = merge(local.tags, {
     Name = "${local.name_prefix}-private-app"

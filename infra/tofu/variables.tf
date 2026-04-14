@@ -23,7 +23,7 @@ variable "app_env" {
 }
 
 variable "create_network" {
-  description = "When true, create a dedicated MVP VPC, subnets, route tables, and a single NAT gateway."
+  description = "When true, create a dedicated MVP VPC, public app subnets, reserved private app subnets, and private DB subnets."
   type        = bool
   default     = true
 }
@@ -42,7 +42,7 @@ variable "public_subnet_ids" {
 }
 
 variable "private_app_subnet_ids" {
-  description = "Existing private application subnet IDs to use when create_network is false."
+  description = "Existing private application subnet IDs reserved for future private service deployments."
   type        = list(string)
   default     = []
 }
@@ -72,19 +72,19 @@ variable "public_subnet_cidrs" {
 }
 
 variable "private_app_subnet_cidrs" {
-  description = "CIDR blocks for private ECS/application subnets in the created network."
+  description = "CIDR blocks for private application subnets reserved for future private service deployments."
   type        = list(string)
   default     = ["10.42.10.0/24", "10.42.11.0/24"]
 }
 
 variable "private_db_subnet_cidrs" {
-  description = "CIDR blocks for private Aurora subnets in the created network."
+  description = "CIDR blocks for private PostgreSQL subnets in the created network."
   type        = list(string)
   default     = ["10.42.20.0/24", "10.42.21.0/24"]
 }
 
 variable "allowed_ingress_cidr_blocks" {
-  description = "CIDR blocks allowed to reach the public ALB."
+  description = "CIDR blocks allowed to reach the public ECS task."
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
@@ -111,13 +111,13 @@ variable "container_image_tag" {
 variable "task_cpu" {
   description = "Fargate task CPU units."
   type        = number
-  default     = 1024
+  default     = 256
 }
 
 variable "task_memory" {
   description = "Fargate task memory in MiB."
   type        = number
-  default     = 2048
+  default     = 1024
 }
 
 variable "desired_count" {
@@ -150,31 +150,65 @@ variable "bedrock_chat_temperature" {
 }
 
 variable "db_name" {
-  description = "Aurora PostgreSQL database name."
+  description = "PostgreSQL database name."
   type        = string
   default     = "ancilla"
 }
 
 variable "db_username" {
-  description = "Aurora PostgreSQL master username."
+  description = "PostgreSQL master username."
   type        = string
   default     = "ancilla"
 }
 
-variable "aurora_engine_version" {
-  description = "Aurora PostgreSQL engine version. Use a version that supports pgvector."
+variable "db_engine_version" {
+  description = "RDS PostgreSQL engine version. Use a version that supports pgvector."
   type        = string
-  default     = "15.8"
+  default     = null
+  nullable    = true
+}
+
+variable "db_instance_class" {
+  description = "RDS PostgreSQL instance class."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
+variable "db_allocated_storage_gb" {
+  description = "Allocated PostgreSQL storage in GB."
+  type        = number
+  default     = 20
+}
+
+variable "db_max_allocated_storage_gb" {
+  description = "Upper bound for PostgreSQL storage autoscaling in GB."
+  type        = number
+  default     = 100
+}
+
+variable "db_storage_type" {
+  description = "RDS PostgreSQL storage type."
+  type        = string
+  default     = "gp3"
+}
+
+variable "aurora_engine_version" {
+  description = "Deprecated alias for db_engine_version."
+  type        = string
+  default     = null
+  nullable    = true
 }
 
 variable "aurora_instance_class" {
-  description = "Aurora instance class for the writer."
+  description = "Deprecated alias for db_instance_class."
   type        = string
-  default     = "db.t4g.medium"
+  default     = null
+  nullable    = true
 }
 
 variable "backup_retention_period" {
-  description = "Aurora backup retention period in days."
+  description = "PostgreSQL backup retention period in days."
   type        = number
   default     = 1
 }

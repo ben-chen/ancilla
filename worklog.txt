@@ -1,0 +1,239 @@
+Ancilla Worklog
+Date: 2026-04-13
+Repo: /Users/benchen/workspace/ancilla
+
+Purpose
+Ancilla is a personal LLM memory system. The core idea is not "chat with history", but an append-only personal event log that produces derived memories and assembles compact personal context on demand. The product goal is selective recall: always retrieve weak signals in the background, then inject only high-signal context into an LLM prompt when it is actually useful.
+
+Core product model
+- Immutable entries are the source of truth.
+- Artifacts are derived from entries: transcripts, chunks, summaries, reflections.
+- Memory records are derived, versioned, and temporally bounded.
+- Retrieval is hybrid: lexical plus semantic plus deterministic policy features.
+- Context assembly is selective and traceable.
+- Chat is a client of memory, not the primary abstraction.
+
+Current technology choices
+- Backend: Rust
+- Runtime storage: PostgreSQL when DATABASE_URL is set, local JSON fallback otherwise
+- Vector support: pgvector in PostgreSQL
+- Chat model: AWS Bedrock Converse when BEDROCK_CHAT_MODEL_ID is configured; deterministic synthetic fallback otherwise
+- Embeddings: Perplexity 0.6B family
+  - perplexity-ai/pplx-embed-v1-0.6b for query and memory embeddings
+  - perplexity-ai/pplx-embed-context-v1-0.6b for artifact/chunk embeddings
+- Local embedding execution: PyTorch, device auto-selection in this order: cuda -> mps -> cpu
+- Infra provisioning: Terraform/OpenTofu
+
+Key design decisions already reflected in the repo
+- The backend no longer owns transcription or embedding generation. Clients/frontends can transcribe locally, compute embeddings locally, and submit transcript text, prepared artifacts, prepared memories, and query embeddings.
+- Audio is represented as a source kind, but the backend does not need to run Transcribe for MVP.
+- Embeddings are versioned/stored separately from memory rows and artifact rows.
+- The system is designed so memory survives model swaps.
+- Retrieval traces are persisted so injected context is explainable.
+
+Repository state summary
+- The Rust app implements a vertical slice of the product:
+  - entry capture
+  - artifact derivation
+  - deterministic memory extraction
+  - thread tracking
+  - profile block maintenance
+  - retrieval traces
+  - context assembly
+  - REST API
+  - CLI
+- Postgres is the real normalized runtime backend when DATABASE_URL is set.
+- The SQL candidate retrieval query exists and is used on the Postgres path before Rust-side gating/context assembly.
+- Bedrock is wired for final answer generation.
+- OpenTofu infra exists for a deployable MVP stack.
+
+Important files and what they do
+- README.md
+  - top-level project summary, local AWS setup, app config, ingest contract, local embed helper, infra summary
+- src/config.rs
+  - env-driven runtime configuration
+- src/api.rs
+  - HTTP routes, including /healthz and the memory/chat endpoints
+- src/service.rs
+  - application orchestration, context assembly, chat flow
+- src/store.rs
+  - persistence and migration wiring, Postgres path, normalized table access
+- src/retrieval.rs
+  - retrieval and gating logic
+- src/bedrock.rs
+  - Bedrock Converse integration
+- src/cli.rs
+  - CLI entrypoints
+- migrations/0001_init.sql
+  - normalized schema and required extensions
+- sql/v1_schema.sql
+  - schema design artifact
+- sql/hybrid_memory_candidates.sql
+  - hybrid retrieval SQL
+- scripts/pplx_embed.py
+  - local PyTorch embedding helper for the Perplexity embedding models
+- infra/tofu/*
+  - Terraform/OpenTofu stack for the MVP deployment
+
+Current runtime behavior
+- If DATABASE_URL is set:
+  - the app runs migrations via sqlx
+  - the app uses Postgres and the normalized schema
+  - the retrieval path uses SQL candidate generation
+- If DATABASE_URL is not set:
+  - the app falls back to a local JSON state file
+- If BEDROCK_CHAT_MODEL_ID is set:
+  - POST /v1/chat/respond uses Bedrock Converse
+- If BEDROCK_CHAT_MODEL_ID is not set:
+  - chat uses the deterministic synthetic backend
+
+Testing state
+- cargo test -q was previously passing with 20 tests after the recent infra/runtime work
+- tofu validate passed for the OpenTofu configuration
+- tofu plan using the repo-local AWS credentials succeeded for the current low-cost stack shape
+- No full live AWS smoke test has completed yet
+
+Current infra shape
+The infra was deliberately reduced from the more expensive baseline to something reasonable for a personal side project.
+
+Current default deployment shape
+- no ALB
+- no NAT gateway
+- ECS Fargate service in public subnets with a public IP
+- ARM64 Fargate defaults: 256 CPU / 1024 MiB
+- single-instance RDS PostgreSQL instead of Aurora
+- S3 bucket
+- ECR repository
+- IAM roles/policies
+- Secrets Manager secret
+- optional network creation
+
+Network shape when create_network = true
+- 1 VPC
+- 2 public subnets
+- 2 reserved private app subnets
+- 2 private DB subnets
+- Internet Gateway
+- route tables
+- no NAT gateway by default
+
+Why the infra was changed
+- The earlier ALB + NAT + Aurora shape was too expensive for a personal side project.
+- The repo now defaults to a cheaper stack that still keeps the database private while letting the app run publicly on ECS without a load balancer.
+
+AWS credentials policy used during recent work
+The repo is configured to use project-local AWS configuration only. The intended shell exports are:
+
+export AWS_CONFIG_FILE="$PWD/.aws/config"
+export AWS_SHARED_CREDENTIALS_FILE="$PWD/.aws/credentials"
+export AWS_PROFILE=ancilla-dev
+export AWS_REGION=us-west-2
+export AWS_DEFAULT_REGION=us-west-2
+
+This was explicitly done to avoid accidentally using ~/.aws credentials.
+
+AWS account used for recent plan/deploy setup
+- Account: 249985744588
+- Identity observed during recent commands: arn:aws:iam::249985744588:root
+
+What has actually been created in AWS so far
+- An ECR repository was created by targeted OpenTofu apply:
+  - repository: ancilla-mvp
+  - URI: 249985744588.dkr.ecr.us-west-2.amazonaws.com/ancilla-mvp
+
+What has NOT been created yet
+- No full stack apply completed
+- No VPC/subnets from this stack were applied during the recent interrupted deployment turn
+- No ECS service/task from this stack was applied
+- No RDS instance from this stack was applied
+- No end-to-end deployed app smoke test has been completed
+
+Recent deployment work and current blocker
+Goal of the interrupted deployment turn
+- push the app container image to ECR
+- apply the full OpenTofu stack
+- discover the ECS task endpoint
+- run minimal live smoke tests
+
+What was added to support deployment
+- Dockerfile
+- .dockerignore
+
+Why those were needed
+- The repo previously had no container build path, but the ECS stack expects a container image.
+
+Container build status
+- The original Dockerfile builder image was too old for current AWS SDK crates.
+- The Dockerfile was updated from rust:1.86-bookworm to rust:1.91-bookworm.
+- ECR login succeeded against the correct account/repository.
+- Local buildx on the default builder failed with a Docker filesystem error:
+  - "commit failed: input/output error"
+- There is very little free disk space on the machine's data volume, which likely contributed to the local builder failure.
+- A previous remote builder path using Depot compiled much further, but an earlier push attempt ended up targeting the wrong repository name and failed with 404.
+- The last turn was interrupted while trying alternate build paths, so the image push is not complete yet.
+
+Observed local environment issue relevant to container builds
+- Available disk on the data volume was low: roughly 6.9 GiB available at the time of inspection.
+- This is enough to make Docker build failures plausible, especially with BuildKit layer commits and Rust builds.
+
+Current plan from the interrupted deployment effort
+1. Push a valid ARM64 container image to:
+   249985744588.dkr.ecr.us-west-2.amazonaws.com/ancilla-mvp:latest
+2. Run full OpenTofu apply using the repo-local AWS credentials and the intended tfvars file.
+3. Wait for ECS readiness.
+4. Discover the service endpoint.
+5. Run minimal live tests:
+   - GET /healthz
+   - POST /v1/entries/text
+   - GET /v1/timeline
+6. If a real Bedrock model ID is configured, run POST /v1/chat/respond as a second-phase smoke test.
+
+Minimal live smoke test target once deployed
+- GET /healthz should return 200
+- POST /v1/entries/text should accept a simple text journal entry
+- GET /v1/timeline should show the captured entry and derived state
+
+Known outstanding work after deployment
+- Confirm or set a real BEDROCK_CHAT_MODEL_ID in runtime config
+- Ensure PostgreSQL has CREATE EXTENSION IF NOT EXISTS vector
+- Push the app image successfully to ECR
+- Run full OpenTofu apply
+- Run end-to-end smoke tests against the deployed service
+- Potentially refine Docker/build tooling if local build reliability remains poor
+
+Useful operational notes for the next person
+- Do not assume the default AWS CLI profile is safe; keep using the repo-local ./.aws files.
+- The infra can be planned with the example tfvars, but real deployment should use a deliberate terraform.tfvars file.
+- The current stack exposes the app through the ECS task public IP because there is no ALB.
+- The Postgres runtime path expects pgvector support.
+- The backend is already prepared for client-side embeddings and client-side transcripts, which is the current intended MVP operating model.
+
+Suggested immediate next actions
+1. Resolve the Docker image push path cleanly.
+2. Create or verify the real OpenTofu tfvars to avoid accidental placeholder values.
+3. Apply the stack.
+4. Verify database readiness and extensions.
+5. Run the minimal live smoke tests.
+
+Files changed in the current uncommitted work at the time this log was written
+- README.md
+- infra/tofu/README.md
+- infra/tofu/main.tf
+- infra/tofu/modules/network/main.tf
+- infra/tofu/modules/network/outputs.tf
+- infra/tofu/modules/network/variables.tf
+- infra/tofu/outputs.tf
+- infra/tofu/terraform.tfvars.example
+- infra/tofu/variables.tf
+- Dockerfile
+- .dockerignore
+- worklog.txt
+
+Intent of this worklog
+This file is meant to give a new reader enough context to understand:
+- what Ancilla is trying to build
+- why the architecture looks the way it does
+- how the current code and infra are organized
+- what has been validated already
+- what was actually created in AWS
+- exactly what remains to get to a real deployed MVP smoke test

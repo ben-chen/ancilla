@@ -1,15 +1,14 @@
 # Ancilla MVP Infra
 
-This directory contains Terraform/OpenTofu-compatible HCL for the first deployable MVP shape.
+This directory contains Terraform/OpenTofu-compatible HCL for a low-cost deployable MVP shape.
 
 It creates:
 
 - a dedicated VPC when `create_network = true`
-- 2 public subnets, 2 private app subnets, and 2 private DB subnets
-- an Internet Gateway, public route table, private route tables, and a single NAT Gateway
-- an internet-facing ALB
-- an ECS Fargate service for the Rust API
-- an Aurora PostgreSQL cluster for runtime state and retrieval data
+- 2 public subnets, 2 reserved private app subnets, and 2 private DB subnets
+- an Internet Gateway and route tables, with no NAT Gateway by default
+- a public ECS Fargate service for the Rust API
+- a single-instance RDS PostgreSQL database for runtime state and retrieval data
 - an S3 bucket for artifacts/imports
 - an ECR repository for the app image
 - IAM roles for ECS execution, Bedrock invocation, and S3 access
@@ -18,14 +17,13 @@ It creates:
 If you already have a network, set `create_network = false` and provide:
 
 - an existing `vpc_id`
-- public subnets for the ALB
-- private app subnets for ECS
-- private DB subnets for Aurora
+- public subnets for ECS
+- private DB subnets for PostgreSQL
 
 ## Preconditions
 
-- Build and push the app image to the managed ECR repository, or set `container_image` directly.
-- Use an Aurora PostgreSQL engine version that supports `pgvector`.
+- Build and push an ARM64 or multi-arch app image to the managed ECR repository, or set `container_image` directly.
+- Use an RDS PostgreSQL engine version that supports `pgvector`.
 - If `create_network = true`, use at least two availability zones and matching subnet CIDR lists.
 - After the database is live, connect once and run:
 
@@ -34,6 +32,18 @@ CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
 The app migrations will create the schema, but the extension must exist first.
+
+## Cost Shape
+
+The defaults are tuned for a personal side project:
+
+- ECS runs directly in public subnets with a public IP
+- no ALB
+- no NAT Gateway
+- PostgreSQL defaults to `db.t4g.micro`
+- Fargate defaults to ARM `256 CPU / 1024 MiB`
+
+That keeps the fixed AWS baseline much lower than the original ALB + NAT + Aurora setup. The tradeoff is that the app endpoint is tied to the current ECS task public IP instead of a stable load balancer DNS name.
 
 ## Commands
 
