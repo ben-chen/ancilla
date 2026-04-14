@@ -1,0 +1,15 @@
+aws_region              = "us-west-2"
+aws_profile             = "ancilla-dev"
+name_prefix             = "ancilla"
+app_env                 = "production"
+create_network          = true
+availability_zones      = ["us-west-2a", "us-west-2b"]
+vpc_cidr                = "10.42.0.0/16"
+public_subnet_cidrs     = ["10.42.0.0/24", "10.42.1.0/24"]
+private_app_subnet_cidrs = ["10.42.10.0/24", "10.42.11.0/24"]
+private_db_subnet_cidrs  = ["10.42.20.0/24", "10.42.21.0/24"]
+bedrock_chat_model_id   = "replace-me"
+container_image_tag     = "latest"
+desired_count           = 1
+aurora_engine_version   = "15.8"
+aurora_instance_class   = "db.t4g.medium"
