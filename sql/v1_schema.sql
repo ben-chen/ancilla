@@ -37,7 +37,7 @@ $$;
 CREATE TABLE entries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   kind text NOT NULL CHECK (
-    kind IN ('text_journal', 'audio_dictation', 'chat_turn', 'import')
+    kind IN ('text', 'chat_turn', 'import')
   ),
   raw_text text,
   asset_ref text,

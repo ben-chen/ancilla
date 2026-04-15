@@ -138,7 +138,9 @@ impl BedrockChatBackend {
 }
 
 #[allow(deprecated)]
-fn build_profile_files(settings: &BedrockChatSettings) -> anyhow::Result<Option<ProfileFiles>> {
+pub(crate) fn build_profile_files(
+    settings: &BedrockChatSettings,
+) -> anyhow::Result<Option<ProfileFiles>> {
     let config_file = settings
         .config_file
         .as_deref()
@@ -170,7 +172,7 @@ fn build_profile_files(settings: &BedrockChatSettings) -> anyhow::Result<Option<
     Ok(Some(builder.build()))
 }
 
-fn expand_home_path(path: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn expand_home_path(path: &Path) -> anyhow::Result<PathBuf> {
     let raw = path.to_string_lossy();
     if raw == "~" {
         return env::var_os("HOME")

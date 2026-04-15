@@ -6,8 +6,10 @@ use std::{
 use crate::{
     client_config::{ClientConfig, normalize_base_url},
     model::{
-        ApiErrorBody, CaptureEntryResponse, ChatModelOption, ChatModelsResponse,
-        ChatRespondRequest, ChatResponse, CreateTextEntryRequest, Entry, EntryKind, empty_object,
+        ApiErrorBody, AssembleContextRequest, AssembleContextResponse, CaptureEntryResponse,
+        ChatModelOption, ChatModelsResponse, ChatRespondRequest, ChatResponse, ConversationRole,
+        ConversationTurn, CreateMemoryRequest, Entry, EntryKind, GateDecision, MemoryKind,
+        MemoryRecord, MemorySubtype, empty_object,
     },
 };
 use anyhow::{Context, bail};
@@ -24,6 +26,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
+use uuid::Uuid;
 
 const COLOR_BG: Color = Color::Rgb(12, 16, 24);
 const COLOR_PANEL: Color = Color::Rgb(20, 26, 38);
@@ -66,7 +69,15 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
             }
             ClientAction::SubmitAsk { message, model_id } => {
                 app.set_info("Sending question to remote service...");
-                match api.ask(&message, model_id.as_deref()).await {
+                match api
+                    .ask(
+                        &message,
+                        model_id.as_deref(),
+                        app.conversation_id,
+                        &app.recent_turns,
+                    )
+                    .await
+                {
                     Ok(response) => {
                         app.set_chat_response(message, response);
                         app.set_success("Answer received.");
@@ -74,12 +85,25 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                     Err(error) => app.set_error(error.to_string()),
                 }
             }
+            ClientAction::SubmitAssemble(message) => {
+                app.set_info("Assembling retrieval context on remote service...");
+                match api
+                    .assemble_context(&message, app.conversation_id, &app.recent_turns)
+                    .await
+                {
+                    Ok(response) => {
+                        app.set_context_preview(message, response);
+                        app.set_success("Context preview received.");
+                    }
+                    Err(error) => app.set_error(error.to_string()),
+                }
+            }
             ClientAction::SubmitCapture(text) => {
-                app.set_info("Capturing text entry on remote service...");
+                app.set_info("Capturing memory on remote service...");
                 match api.capture_text(&text).await {
                     Ok(response) => {
                         app.set_success(format!(
-                            "Captured entry {} with {} memories.",
+                            "Captured memory entry {} with {} memories.",
                             response.entry.id,
                             response.memories.len()
                         ));
@@ -137,32 +161,71 @@ impl RemoteApi {
 
     async fn capture_text(&self, raw_text: &str) -> anyhow::Result<CaptureEntryResponse> {
         self.post_json(
-            "/v1/entries/text",
-            &CreateTextEntryRequest {
-                raw_text: raw_text.to_string(),
+            "/v1/memories",
+            &CreateMemoryRequest {
+                display_text: raw_text.to_string(),
+                retrieval_text: None,
+                kind: MemoryKind::Semantic,
+                subtype: MemorySubtype::Fact,
                 captured_at: None,
                 timezone: Some("UTC".to_string()),
                 source_app: Some("ratatui-client".to_string()),
-                prepared_artifacts: Vec::new(),
-                prepared_memories: Vec::new(),
+                attrs: empty_object(),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: None,
                 metadata: empty_object(),
             },
         )
         .await
     }
 
-    async fn ask(&self, message: &str, model_id: Option<&str>) -> anyhow::Result<ChatResponse> {
+    async fn ask(
+        &self,
+        message: &str,
+        model_id: Option<&str>,
+        conversation_id: Uuid,
+        recent_turns: &[ConversationTurn],
+    ) -> anyhow::Result<ChatResponse> {
         self.post_json(
             "/v1/chat/respond",
             &ChatRespondRequest {
                 message: message.to_string(),
                 model_id: model_id.map(ToOwned::to_owned),
-                recent_turns: Vec::new(),
+                recent_turns: recent_turns.to_vec(),
                 recent_context: None,
+                conversation_id: Some(conversation_id),
                 active_thread_id: None,
                 focus_from: None,
                 focus_to: None,
                 query_embedding: None,
+            },
+        )
+        .await
+    }
+
+    async fn assemble_context(
+        &self,
+        message: &str,
+        conversation_id: Uuid,
+        recent_turns: &[ConversationTurn],
+    ) -> anyhow::Result<AssembleContextResponse> {
+        self.post_json(
+            "/v1/context/assemble",
+            &AssembleContextRequest {
+                query: message.to_string(),
+                recent_turns: recent_turns.to_vec(),
+                recent_context: None,
+                conversation_id: Some(conversation_id),
+                active_thread_id: None,
+                focus_from: None,
+                focus_to: None,
+                query_embedding: None,
+                max_candidates: Some(20),
+                max_injected: Some(5),
             },
         )
         .await
@@ -264,6 +327,7 @@ impl Drop for TerminalSession {
 enum InputMode {
     Normal,
     Ask,
+    ContextPreview,
     Capture,
     ModelPicker,
 }
@@ -283,6 +347,8 @@ struct StatusLine {
 
 struct ClientApp {
     base_url: String,
+    conversation_id: Uuid,
+    recent_turns: Vec<ConversationTurn>,
     mode: InputMode,
     timeline: Vec<Entry>,
     timeline_state: ListState,
@@ -302,13 +368,16 @@ impl ClientApp {
         timeline_state.select(Some(0));
         Self {
             base_url,
+            conversation_id: Uuid::new_v4(),
+            recent_turns: Vec::new(),
             mode: InputMode::Normal,
             timeline: Vec::new(),
             timeline_state,
             input: String::new(),
             response_title: "Response".to_string(),
-            response_body: "Press 'a' to ask the live service or 'c' to capture a new text entry."
-                .to_string(),
+            response_body:
+                "Press 's' to preview retrieval context, 'a' to ask the live service, or 'c' to capture a new memory."
+                    .to_string(),
             status: StatusLine {
                 kind: StatusKind::Info,
                 message: "Ready.".to_string(),
@@ -374,6 +443,7 @@ impl ClientApp {
         match self.mode {
             InputMode::Normal => self.handle_normal_key(key),
             InputMode::Ask => self.handle_input_key(key, InputMode::Ask),
+            InputMode::ContextPreview => self.handle_input_key(key, InputMode::ContextPreview),
             InputMode::Capture => self.handle_input_key(key, InputMode::Capture),
             InputMode::ModelPicker => self.handle_model_picker_key(key),
         }
@@ -389,10 +459,16 @@ impl ClientApp {
                 self.set_info("Ask mode. Type a question and press Enter.");
                 ClientAction::None
             }
+            KeyCode::Char('s') => {
+                self.mode = InputMode::ContextPreview;
+                self.input.clear();
+                self.set_info("Context preview mode. Type a message and press Enter.");
+                ClientAction::None
+            }
             KeyCode::Char('c') => {
                 self.mode = InputMode::Capture;
                 self.input.clear();
-                self.set_info("Capture mode. Type journal text and press Enter.");
+                self.set_info("Capture mode. Type a memory and press Enter.");
                 ClientAction::None
             }
             KeyCode::Char('m') => {
@@ -447,6 +523,7 @@ impl ClientApp {
                             message: input,
                             model_id: self.selected_model_id.clone(),
                         },
+                        InputMode::ContextPreview => ClientAction::SubmitAssemble(input),
                         InputMode::Capture => ClientAction::SubmitCapture(input),
                         InputMode::Normal | InputMode::ModelPicker => ClientAction::None,
                     }
@@ -515,6 +592,18 @@ impl ClientApp {
     }
 
     fn set_chat_response(&mut self, prompt: String, response: ChatResponse) {
+        self.recent_turns.push(ConversationTurn {
+            role: ConversationRole::User,
+            text: prompt.clone(),
+        });
+        self.recent_turns.push(ConversationTurn {
+            role: ConversationRole::Assistant,
+            text: response.answer.clone(),
+        });
+        if self.recent_turns.len() > 12 {
+            let keep_from = self.recent_turns.len() - 12;
+            self.recent_turns.drain(0..keep_from);
+        }
         let model_label = response
             .model_id
             .as_deref()
@@ -529,6 +618,62 @@ impl ClientApp {
             response.trace_id
         );
         self.response_body = format!("Q: {prompt}\n\n{}", response.answer);
+    }
+
+    fn set_context_preview(&mut self, prompt: String, response: AssembleContextResponse) {
+        self.response_title = format!(
+            "Context [{} | {} selected | {} candidates | trace {}]",
+            gate_decision_label(response.decision),
+            response.selected_memories.len(),
+            response.candidates.len(),
+            response.trace_id
+        );
+
+        let mut lines = vec![
+            format!("Q: {prompt}"),
+            String::new(),
+            format!(
+                "Decision: {} ({:.2})",
+                gate_decision_label(response.decision),
+                response.gate_confidence
+            ),
+            format!("Reason: {}", response.gate_reason),
+            String::new(),
+            "Context".to_string(),
+            response
+                .context
+                .clone()
+                .unwrap_or_else(|| "(no context injected)".to_string()),
+            String::new(),
+            "Selected memories".to_string(),
+        ];
+
+        if response.selected_memories.is_empty() {
+            lines.push("(none)".to_string());
+        } else {
+            for (index, memory) in response.selected_memories.iter().enumerate() {
+                lines.push(format!("{}. {}", index + 1, format_memory(memory)));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("Top candidates".to_string());
+        if response.candidates.is_empty() {
+            lines.push("(none)".to_string());
+        } else {
+            for (index, candidate) in response.candidates.iter().take(6).enumerate() {
+                lines.push(format!(
+                    "{}. {:.3} final | {:.3} sem | {:.3} lex | {}",
+                    index + 1,
+                    candidate.final_score,
+                    candidate.semantic_score,
+                    candidate.lexical_score,
+                    format_memory(&candidate.memory)
+                ));
+            }
+        }
+
+        self.response_body = lines.join("\n");
     }
 
     fn set_info(&mut self, message: impl Into<String>) {
@@ -645,6 +790,7 @@ enum ClientAction {
         message: String,
         model_id: Option<String>,
     },
+    SubmitAssemble(String),
     SubmitCapture(String),
 }
 
@@ -673,6 +819,7 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
     let mode = match app.mode {
         InputMode::Normal => "NAV",
         InputMode::Ask => "ASK",
+        InputMode::ContextPreview => "CONTEXT",
         InputMode::Capture => "CAPTURE",
         InputMode::ModelPicker => "MODELS",
     };
@@ -710,7 +857,7 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
             ),
         ]),
         Line::from(vec![Span::styled(
-            "Browse timeline, ask live questions, capture entries, and switch models.",
+            "Browse timeline, preview retrieval, ask live questions, capture entries, and switch models.",
             Style::default().fg(COLOR_MUTED),
         )]),
     ])
@@ -869,6 +1016,7 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
     let title = match app.mode {
         InputMode::Normal => " Keys ",
         InputMode::Ask => " Ask ",
+        InputMode::ContextPreview => " Context ",
         InputMode::Capture => " Capture ",
         InputMode::ModelPicker => " Models ",
     };
@@ -881,6 +1029,8 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
                 Span::styled(" refresh  ", Style::default().fg(COLOR_MUTED)),
                 keycap("m"),
                 Span::styled(" models  ", Style::default().fg(COLOR_MUTED)),
+                keycap("s"),
+                Span::styled(" context  ", Style::default().fg(COLOR_MUTED)),
                 keycap("a"),
                 Span::styled(" ask  ", Style::default().fg(COLOR_MUTED)),
                 keycap("c"),
@@ -901,6 +1051,16 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
             Line::from(Span::styled(
                 app.input.as_str(),
                 Style::default().fg(COLOR_ACCENT),
+            )),
+        ]),
+        InputMode::ContextPreview => Text::from(vec![
+            Line::from(Span::styled(
+                "Type a message to preview retrieval and context assembly without calling the model.",
+                Style::default().fg(COLOR_TEXT),
+            )),
+            Line::from(Span::styled(
+                app.input.as_str(),
+                Style::default().fg(COLOR_SUCCESS),
             )),
         ]),
         InputMode::Capture => Text::from(vec![
@@ -1075,6 +1235,43 @@ fn keycap(label: &str) -> Span<'static> {
     )
 }
 
+fn gate_decision_label(decision: GateDecision) -> &'static str {
+    match decision {
+        GateDecision::NoInject => "no inject",
+        GateDecision::InjectCompact => "inject compact",
+        GateDecision::DeferToTool => "defer to tool",
+    }
+}
+
+fn format_memory(memory: &MemoryRecord) -> String {
+    format!(
+        "{} / {}: {}",
+        memory_kind_label(memory.kind),
+        memory_subtype_label(memory.subtype),
+        memory.display_text
+    )
+}
+
+fn memory_kind_label(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Semantic => "semantic",
+        MemoryKind::Episodic => "episodic",
+        MemoryKind::Procedural => "procedural",
+    }
+}
+
+fn memory_subtype_label(subtype: MemorySubtype) -> &'static str {
+    match subtype {
+        MemorySubtype::Fact => "fact",
+        MemorySubtype::Preference => "preference",
+        MemorySubtype::Project => "project",
+        MemorySubtype::Habit => "habit",
+        MemorySubtype::Person => "person",
+        MemorySubtype::Place => "place",
+        MemorySubtype::Goal => "goal",
+    }
+}
+
 fn selected_entry_text(entry: Option<&Entry>) -> Text<'static> {
     let Some(entry) = entry else {
         return Text::from(vec![
@@ -1152,8 +1349,7 @@ fn selected_entry_text(entry: Option<&Entry>) -> Text<'static> {
 
 fn entry_kind_label(kind: EntryKind) -> &'static str {
     match kind {
-        EntryKind::TextJournal => "TEXT",
-        EntryKind::AudioDictation => "AUDIO",
+        EntryKind::Text => "TEXT",
         EntryKind::ChatTurn => "CHAT",
         EntryKind::Import => "IMPORT",
     }
@@ -1174,7 +1370,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{GateDecision, MemoryState, ScoredMemory, now_utc};
     use ratatui::{Terminal, backend::TestBackend};
+    use uuid::Uuid;
 
     #[test]
     fn truncate_preserves_short_text() {
@@ -1202,6 +1400,80 @@ mod tests {
         let screen = render_screen(&mut app);
 
         assert!(screen.contains("I want to remember this long sentence."));
+    }
+
+    #[test]
+    fn context_mode_renders_full_input_line() {
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        app.mode = InputMode::ContextPreview;
+        app.input = "What am I building right now?".to_string();
+
+        let screen = render_screen(&mut app);
+
+        assert!(screen.contains("What am I building right now?"));
+    }
+
+    #[test]
+    fn context_preview_formats_selected_memories_and_candidates() {
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            lineage_id: Uuid::new_v4(),
+            kind: MemoryKind::Semantic,
+            subtype: MemorySubtype::Project,
+            display_text: "You are building Ancilla.".to_string(),
+            retrieval_text: "project Ancilla".to_string(),
+            attrs: empty_object(),
+            observed_at: Some(now_utc()),
+            valid_from: now_utc(),
+            valid_to: None,
+            confidence: 0.95,
+            salience: 0.9,
+            state: MemoryState::Accepted,
+            embedding: None,
+            source_artifact_ids: Vec::new(),
+            thread_id: None,
+            parent_id: None,
+            path: None,
+            created_at: now_utc(),
+            updated_at: now_utc(),
+        };
+        app.set_context_preview(
+            "What am I building?".to_string(),
+            AssembleContextResponse {
+                trace_id: Uuid::new_v4(),
+                decision: GateDecision::InjectCompact,
+                gate_confidence: 0.88,
+                gate_reason: "project memory available".to_string(),
+                context: Some(
+                    "Relevant personal context:\n- You are building Ancilla.".to_string(),
+                ),
+                selected_memories: vec![memory.clone()],
+                candidates: vec![ScoredMemory {
+                    memory,
+                    semantic_score: 0.8,
+                    lexical_score: 0.6,
+                    fusion_score: 0.7,
+                    temporal_bonus: 0.0,
+                    thread_bonus: 0.0,
+                    salience_bonus: 0.1,
+                    confidence_bonus: 0.1,
+                    reinjection_penalty: 0.0,
+                    stale_penalty: 0.0,
+                    final_score: 0.9,
+                    prior_injected: false,
+                    candidate_rank: 0,
+                }],
+            },
+        );
+
+        assert!(app.response_title.contains("Context [inject compact"));
+        assert!(app.response_body.contains("Selected memories"));
+        assert!(
+            app.response_body
+                .contains("semantic / project: You are building Ancilla.")
+        );
+        assert!(app.response_body.contains("Top candidates"));
     }
 
     fn render_screen(app: &mut ClientApp) -> String {

@@ -17,6 +17,8 @@ pub struct ServerConfig {
     pub app_env: String,
     pub data_file: PathBuf,
     pub database_url: Option<String>,
+    pub embedder_base_url: Option<String>,
+    pub embedder_timeout_seconds: i32,
     pub aws_region: String,
     pub aws_profile: Option<String>,
     pub aws_config_file: Option<PathBuf>,
@@ -29,7 +31,6 @@ pub struct ServerConfig {
     pub accept_client_transcripts: bool,
     pub local_embed_model: String,
     pub local_context_embed_model: String,
-    pub local_embed_device: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -40,6 +41,8 @@ pub struct EffectiveServerConfigView {
     pub data_backend: String,
     pub data_file: PathBuf,
     pub database_url: Option<String>,
+    pub embedder_base_url: Option<String>,
+    pub embedder_timeout_seconds: i32,
     pub aws_region: String,
     pub aws_profile: Option<String>,
     pub aws_config_file: Option<PathBuf>,
@@ -55,7 +58,6 @@ pub struct EffectiveServerConfigView {
     pub accept_client_transcripts: bool,
     pub local_embed_model: String,
     pub local_context_embed_model: String,
-    pub local_embed_device: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -64,6 +66,8 @@ struct FileConfig {
     pub app_env: Option<String>,
     pub data_file: Option<PathBuf>,
     pub database_url: Option<String>,
+    pub embedder_base_url: Option<String>,
+    pub embedder_timeout_seconds: Option<i32>,
     pub aws_region: Option<String>,
     pub aws_profile: Option<String>,
     pub aws_config_file: Option<PathBuf>,
@@ -76,7 +80,6 @@ struct FileConfig {
     pub accept_client_transcripts: Option<bool>,
     pub local_embed_model: Option<String>,
     pub local_context_embed_model: Option<String>,
-    pub local_embed_device: Option<String>,
 }
 
 impl ServerConfig {
@@ -127,6 +130,8 @@ impl ServerConfig {
                     redact_database_url(url)
                 }
             }),
+            embedder_base_url: self.embedder_base_url.clone(),
+            embedder_timeout_seconds: self.embedder_timeout_seconds,
             aws_region: self.aws_region.clone(),
             aws_profile: self.aws_profile.clone(),
             aws_config_file: self.aws_config_file.clone(),
@@ -145,7 +150,6 @@ impl ServerConfig {
             accept_client_transcripts: self.accept_client_transcripts,
             local_embed_model: self.local_embed_model.clone(),
             local_context_embed_model: self.local_context_embed_model.clone(),
-            local_embed_device: self.local_embed_device.clone(),
         }
     }
 
@@ -154,6 +158,8 @@ impl ServerConfig {
             app_env: "development".to_string(),
             data_file: PathBuf::from(".ancilla/state.json"),
             database_url: None,
+            embedder_base_url: None,
+            embedder_timeout_seconds: 30,
             aws_region: "us-west-2".to_string(),
             aws_profile: None,
             aws_config_file: None,
@@ -166,7 +172,6 @@ impl ServerConfig {
             accept_client_transcripts: true,
             local_embed_model: "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
             local_context_embed_model: "perplexity-ai/pplx-embed-context-v1-0.6b".to_string(),
-            local_embed_device: "auto".to_string(),
         }
     }
 
@@ -182,6 +187,11 @@ impl ServerConfig {
         }
         self.database_url =
             merge_optional_string(self.database_url.take(), file_config.database_url);
+        self.embedder_base_url =
+            merge_optional_string(self.embedder_base_url.take(), file_config.embedder_base_url);
+        if let Some(value) = file_config.embedder_timeout_seconds {
+            self.embedder_timeout_seconds = value.max(1);
+        }
         if let Some(value) = crate::config::normalize_string(file_config.aws_region) {
             self.aws_region = value;
         }
@@ -219,9 +229,6 @@ impl ServerConfig {
         {
             self.local_context_embed_model = value;
         }
-        if let Some(value) = crate::config::normalize_string(file_config.local_embed_device) {
-            self.local_embed_device = value;
-        }
     }
 
     fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
@@ -240,6 +247,19 @@ impl ServerConfig {
         {
             self.database_url = Some(value);
         }
+        if let Some(value) = env_var("ANCILLA_SERVER_EMBEDDER_BASE_URL")
+            .or_else(|| env_var("ANCILLA_EMBEDDER_BASE_URL"))
+        {
+            self.embedder_base_url = Some(value);
+        }
+        self.embedder_timeout_seconds = env_i32(
+            "ANCILLA_SERVER_EMBEDDER_TIMEOUT_SECONDS",
+            env_i32(
+                "ANCILLA_EMBEDDER_TIMEOUT_SECONDS",
+                self.embedder_timeout_seconds,
+            ),
+        )
+        .max(1);
         if let Some(value) = env_var("ANCILLA_SERVER_AWS_REGION")
             .or_else(|| env_var("AWS_REGION"))
             .or_else(|| env_var("AWS_DEFAULT_REGION"))
@@ -306,11 +326,6 @@ impl ServerConfig {
             .or_else(|| env_var("ANCILLA_LOCAL_CONTEXT_EMBED_MODEL"))
         {
             self.local_context_embed_model = value;
-        }
-        if let Some(value) = env_var("ANCILLA_SERVER_LOCAL_EMBED_DEVICE")
-            .or_else(|| env_var("ANCILLA_LOCAL_EMBED_DEVICE"))
-        {
-            self.local_embed_device = value;
         }
         Ok(())
     }
@@ -431,6 +446,8 @@ fn default_user_config_contents() -> &'static str {
 app_env = "development"
 data_file = ".ancilla/state.json"
 # database_url = "postgres://user:password@host:5432/ancilla?sslmode=require"
+# embedder_base_url = "http://10.42.0.50:4000"
+# embedder_timeout_seconds = 30
 aws_region = "us-west-2"
 # aws_profile = "ancilla-dev"
 # aws_config_file = "~/path/to/ancilla/.aws/config"
@@ -459,7 +476,6 @@ accept_client_embeddings = true
 accept_client_transcripts = true
 local_embed_model = "perplexity-ai/pplx-embed-v1-0.6b"
 local_context_embed_model = "perplexity-ai/pplx-embed-context-v1-0.6b"
-local_embed_device = "auto"
 "#
 }
 
@@ -482,10 +498,10 @@ mod tests {
         let config = ServerConfig::from_env().unwrap();
         assert_eq!(config.app_env, "development");
         assert_eq!(config.data_file, PathBuf::from(".ancilla/state.json"));
+        assert_eq!(config.embedder_timeout_seconds, 30);
         assert_eq!(config.aws_region, "us-west-2");
         assert!(config.accept_client_embeddings);
         assert!(config.accept_client_transcripts);
-        assert_eq!(config.local_embed_device, "auto");
     }
 
     #[test]
@@ -494,6 +510,8 @@ mod tests {
         clear_env();
         unsafe {
             env::set_var("ANCILLA_SERVER_DATA_FILE", "/tmp/custom.json");
+            env::set_var("ANCILLA_SERVER_EMBEDDER_BASE_URL", "http://10.42.0.50:4000");
+            env::set_var("ANCILLA_SERVER_EMBEDDER_TIMEOUT_SECONDS", "45");
             env::set_var("ANCILLA_SERVER_AWS_REGION", "eu-west-1");
             env::set_var("ANCILLA_SERVER_AWS_PROFILE", "ancilla-dev");
             env::set_var("ANCILLA_SERVER_AWS_CONFIG_FILE", "/tmp/project/.aws/config");
@@ -504,11 +522,15 @@ mod tests {
             env::set_var("ANCILLA_SERVER_BEDROCK_CHAT_MAX_TOKENS", "512");
             env::set_var("ANCILLA_SERVER_BEDROCK_CHAT_TEMPERATURE", "0.1");
             env::set_var("ANCILLA_SERVER_ACCEPT_CLIENT_EMBEDDINGS", "false");
-            env::set_var("ANCILLA_SERVER_LOCAL_EMBED_DEVICE", "mps");
         }
 
         let config = ServerConfig::from_env().unwrap();
         assert_eq!(config.data_file, PathBuf::from("/tmp/custom.json"));
+        assert_eq!(
+            config.embedder_base_url.as_deref(),
+            Some("http://10.42.0.50:4000")
+        );
+        assert_eq!(config.embedder_timeout_seconds, 45);
         assert_eq!(config.aws_region, "eu-west-1");
         assert_eq!(config.aws_profile.as_deref(), Some("ancilla-dev"));
         assert_eq!(
@@ -522,7 +544,6 @@ mod tests {
         assert_eq!(config.bedrock_chat_max_tokens, 512);
         assert_eq!(config.bedrock_chat_temperature, 0.1);
         assert!(!config.accept_client_embeddings);
-        assert_eq!(config.local_embed_device, "mps");
     }
 
     #[test]
@@ -537,11 +558,12 @@ mod tests {
             r#"
 database_url = "postgres://file"
 data_file = "/tmp/from-file.json"
+embedder_base_url = "http://10.42.0.77:4000"
+embedder_timeout_seconds = 55
 aws_profile = "ancilla-dev"
 aws_config_file = "~/workspace/ancilla/.aws/config"
 aws_shared_credentials_file = "~/workspace/ancilla/.aws/credentials"
 bedrock_chat_temperature = 0.6
-local_embed_device = "cpu"
 "#,
         )
         .unwrap();
@@ -552,9 +574,13 @@ local_embed_device = "cpu"
         let config = ServerConfig::load().unwrap();
         assert_eq!(config.database_url.as_deref(), Some("postgres://file"));
         assert_eq!(config.data_file, PathBuf::from("/tmp/from-file.json"));
+        assert_eq!(
+            config.embedder_base_url.as_deref(),
+            Some("http://10.42.0.77:4000")
+        );
+        assert_eq!(config.embedder_timeout_seconds, 55);
         assert_eq!(config.aws_profile.as_deref(), Some("ancilla-dev"));
         assert_eq!(config.bedrock_chat_temperature, 0.6);
-        assert_eq!(config.local_embed_device, "cpu");
     }
 
     #[test]
@@ -583,6 +609,8 @@ local_embed_device = "cpu"
                 "postgres://ancilla:supersecret@example.com:5432/ancilla?sslmode=require"
                     .to_string(),
             ),
+            embedder_base_url: Some("http://10.42.0.50:4000".to_string()),
+            embedder_timeout_seconds: 30,
             aws_region: "us-west-2".to_string(),
             aws_profile: Some("ancilla-dev".to_string()),
             aws_config_file: Some(PathBuf::from("/tmp/project/.aws/config")),
@@ -602,13 +630,16 @@ local_embed_device = "cpu"
             accept_client_transcripts: true,
             local_embed_model: "embed".to_string(),
             local_context_embed_model: "context".to_string(),
-            local_embed_device: "auto".to_string(),
         };
 
         let view = config.to_view(false);
         assert_eq!(view.data_backend, "postgres");
         assert_eq!(view.chat_backend, "bedrock");
         assert_eq!(view.chat_models.len(), 1);
+        assert_eq!(
+            view.embedder_base_url.as_deref(),
+            Some("http://10.42.0.50:4000")
+        );
         assert_eq!(
             view.database_url.as_deref(),
             Some("postgres://ancilla:***@example.com:5432/ancilla?sslmode=require")
@@ -640,6 +671,8 @@ local_embed_device = "cpu"
             "ANCILLA_SERVER_APP_ENV",
             "ANCILLA_SERVER_DATA_FILE",
             "ANCILLA_SERVER_DATABASE_URL",
+            "ANCILLA_SERVER_EMBEDDER_BASE_URL",
+            "ANCILLA_SERVER_EMBEDDER_TIMEOUT_SECONDS",
             "ANCILLA_SERVER_AWS_REGION",
             "ANCILLA_SERVER_AWS_PROFILE",
             "ANCILLA_SERVER_AWS_CONFIG_FILE",
@@ -652,10 +685,11 @@ local_embed_device = "cpu"
             "ANCILLA_SERVER_ACCEPT_CLIENT_TRANSCRIPTS",
             "ANCILLA_SERVER_LOCAL_EMBED_MODEL",
             "ANCILLA_SERVER_LOCAL_CONTEXT_EMBED_MODEL",
-            "ANCILLA_SERVER_LOCAL_EMBED_DEVICE",
             "ANCILLA_APP_ENV",
             "ANCILLA_DATA_FILE",
             "DATABASE_URL",
+            "ANCILLA_EMBEDDER_BASE_URL",
+            "ANCILLA_EMBEDDER_TIMEOUT_SECONDS",
             "AWS_REGION",
             "AWS_DEFAULT_REGION",
             "AWS_PROFILE",
@@ -669,7 +703,6 @@ local_embed_device = "cpu"
             "ANCILLA_ACCEPT_CLIENT_TRANSCRIPTS",
             "ANCILLA_LOCAL_EMBED_MODEL",
             "ANCILLA_LOCAL_CONTEXT_EMBED_MODEL",
-            "ANCILLA_LOCAL_EMBED_DEVICE",
             "XDG_CONFIG_HOME",
         ] {
             unsafe { env::remove_var(key) };

@@ -4,6 +4,7 @@ pub mod client;
 pub mod client_cli;
 pub mod client_config;
 pub mod config;
+pub mod embedder_client;
 pub mod model;
 pub mod retrieval;
 pub mod server_cli;

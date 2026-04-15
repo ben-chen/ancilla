@@ -23,8 +23,8 @@ pub fn now_utc() -> DateTime<Utc> {
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     #[default]
-    TextJournal,
-    AudioDictation,
+    #[serde(alias = "text_journal", alias = "audio_dictation")]
+    Text,
     ChatTurn,
     Import,
 }
@@ -42,7 +42,18 @@ pub enum ArtifactKind {
 }
 
 #[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
@@ -53,11 +64,23 @@ pub enum MemoryKind {
 }
 
 #[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum MemorySubtype {
     #[default]
+    Fact,
     Preference,
     Project,
     Habit,
@@ -272,6 +295,7 @@ pub struct RetrievalTrace {
     pub id: Uuid,
     pub query: String,
     pub recent_context: Option<String>,
+    pub conversation_id: Option<Uuid>,
     pub active_thread_id: Option<Uuid>,
     pub gate_decision: GateDecision,
     pub gate_confidence: f32,
@@ -395,9 +419,31 @@ pub struct CreateAudioEntryRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CreateMemoryRequest {
+    pub display_text: String,
+    pub retrieval_text: Option<String>,
+    pub kind: MemoryKind,
+    pub subtype: MemorySubtype,
+    pub captured_at: Option<DateTime<Utc>>,
+    pub timezone: Option<String>,
+    pub source_app: Option<String>,
+    #[serde(default = "empty_object")]
+    pub attrs: Metadata,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub confidence: Option<f32>,
+    pub salience: Option<f32>,
+    pub thread_title: Option<String>,
+    #[serde(default = "empty_object")]
+    pub metadata: Metadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SearchMemoriesRequest {
     pub query: String,
     pub recent_context: Option<String>,
+    pub conversation_id: Option<Uuid>,
     pub focus_from: Option<DateTime<Utc>>,
     pub focus_to: Option<DateTime<Utc>>,
     pub active_thread_id: Option<Uuid>,
@@ -413,6 +459,7 @@ pub struct AssembleContextRequest {
     #[serde(default)]
     pub recent_turns: Vec<ConversationTurn>,
     pub recent_context: Option<String>,
+    pub conversation_id: Option<Uuid>,
     pub active_thread_id: Option<Uuid>,
     pub focus_from: Option<DateTime<Utc>>,
     pub focus_to: Option<DateTime<Utc>>,
@@ -441,6 +488,7 @@ pub struct ChatRespondRequest {
     #[serde(default)]
     pub recent_turns: Vec<ConversationTurn>,
     pub recent_context: Option<String>,
+    pub conversation_id: Option<Uuid>,
     pub active_thread_id: Option<Uuid>,
     pub focus_from: Option<DateTime<Utc>>,
     pub focus_to: Option<DateTime<Utc>>,
@@ -501,5 +549,26 @@ impl Default for PersistedState {
             profile_blocks,
             retrieval_traces: BTreeMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EntryKind;
+
+    #[test]
+    fn entry_kind_accepts_legacy_text_aliases() {
+        assert_eq!(
+            serde_json::from_str::<EntryKind>("\"text_journal\"").unwrap(),
+            EntryKind::Text
+        );
+        assert_eq!(
+            serde_json::from_str::<EntryKind>("\"audio_dictation\"").unwrap(),
+            EntryKind::Text
+        );
+        assert_eq!(
+            serde_json::from_str::<EntryKind>("\"text\"").unwrap(),
+            EntryKind::Text
+        );
     }
 }

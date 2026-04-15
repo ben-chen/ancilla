@@ -11,6 +11,7 @@ It prefers devices in this order when `--device auto` is used:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import sys
 from typing import Iterable, Sequence
@@ -90,11 +91,7 @@ def embed_texts(
     torch = _import_torch()
     transformers = _import_transformers()
     device = select_device(requested_device, torch)
-
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = transformers.AutoModel.from_pretrained(model_id, trust_remote_code=True)
-    model.to(device)
-    model.eval()
+    tokenizer, model = load_model_bundle(model_id, device)
 
     embeddings = []
     for batch in batched(texts, batch_size):
@@ -127,7 +124,27 @@ def embed_texts(
         "count": len(texts),
         "dims": len(embeddings[0]) if embeddings else 0,
         "embeddings": embeddings,
+}
+
+
+@functools.lru_cache(maxsize=4)
+def load_model_bundle(model_id: str, device: str):
+    torch_module = _import_torch()
+    transformers_module = _import_transformers()
+    model_kwargs = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
     }
+    if device == "cuda" and hasattr(torch_module, "float16"):
+        model_kwargs["torch_dtype"] = torch_module.float16
+    model = transformers_module.AutoModel.from_pretrained(model_id, **model_kwargs)
+    model.to(device)
+    model.eval()
+    tokenizer = transformers_module.AutoTokenizer.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+    )
+    return tokenizer, model
 
 
 def mean_pool(last_hidden_state, attention_mask, torch_module):

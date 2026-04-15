@@ -1,0 +1,74 @@
+#!/bin/bash
+set -euxo pipefail
+
+yum update -y
+yum install -y awscli curl
+
+systemctl enable docker
+systemctl start docker
+
+mkdir -p /var/lib/ancilla-embedder/huggingface
+
+cat >/usr/local/bin/start-ancilla-embedder.sh <<'SCRIPT'
+#!/bin/bash
+set -euxo pipefail
+
+aws ecr get-login-password --region ${aws_region} | docker login --username AWS --password-stdin ${registry_host}
+docker pull ${embedder_image}
+docker rm -f ancilla-embedder || true
+docker run -d \
+  --name ancilla-embedder \
+  --restart unless-stopped \
+  --gpus all \
+  -p ${embedder_port}:${embedder_port} \
+  -e ANCILLA_EMBEDDER_HOST=0.0.0.0 \
+  -e ANCILLA_EMBEDDER_PORT=${embedder_port} \
+  -e ANCILLA_EMBEDDER_DEVICE=${embedder_device} \
+  -e ANCILLA_EMBEDDER_BATCH_SIZE=${batch_size} \
+  -e ANCILLA_EMBEDDER_MAX_LENGTH=${max_length} \
+  -e ANCILLA_EMBEDDER_DEFAULT_MODEL_ID=${default_model_id} \
+  -e HF_ALLOW_CODE_EVAL=1 \
+  -e HF_HOME=/var/lib/ancilla-embedder/huggingface \
+  -e TRANSFORMERS_CACHE=/var/lib/ancilla-embedder/huggingface \
+  -v /var/lib/ancilla-embedder/huggingface:/var/lib/ancilla-embedder/huggingface \
+  --log-driver awslogs \
+  --log-opt awslogs-region=${aws_region} \
+  --log-opt awslogs-group=${log_group_name} \
+  --log-opt awslogs-stream=embedder \
+  ${embedder_image}
+SCRIPT
+
+chmod +x /usr/local/bin/start-ancilla-embedder.sh
+
+cat >/etc/systemd/system/ancilla-embedder.service <<'UNIT'
+[Unit]
+Description=Ancilla embedder container
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/start-ancilla-embedder.sh
+ExecStop=/usr/bin/docker rm -f ancilla-embedder
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable ancilla-embedder
+systemctl start ancilla-embedder
+
+for attempt in $(seq 1 60); do
+  if curl -fsS http://127.0.0.1:${embedder_port}/healthz >/dev/null; then
+    break
+  fi
+  sleep 5
+done
+
+curl -fsS \
+  -X POST \
+  http://127.0.0.1:${embedder_port}/v1/embed \
+  -H 'content-type: application/json' \
+  --data '{"model_id":"${default_model_id}","texts":["warmup"],"normalize":false}' || true

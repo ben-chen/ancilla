@@ -2,24 +2,24 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use regex::Regex;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     bedrock::{ChatCompletionBackend, ChatCompletionRequest, SyntheticChatBackend},
+    embedder_client::Embedder,
     model::{
         Artifact, ArtifactKind, AssembleContextRequest, AssembleContextResponse,
         CaptureEntryResponse, ChatModelsResponse, ChatRespondRequest, ChatResponse,
-        ConversationRole, CreateAudioEntryRequest, CreateTextEntryRequest, EmbeddingVector, Entry,
-        EntryKind, MemoryKind, MemoryRecord, MemoryState, MemorySubtype, PatchMemoryRequest,
-        PersistedState, PreparedArtifactInput, PreparedMemoryInput, ProfileBlock, RetrievalTrace,
-        ScoredMemory, SearchMemoriesRequest, Thread, ThreadKind, ThreadStatus, empty_object,
-        now_utc,
+        ConversationRole, CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest,
+        EmbeddingVector, Entry, EntryKind, MemoryKind, MemoryRecord, MemoryState, MemorySubtype,
+        PatchMemoryRequest, PersistedState, PreparedArtifactInput, PreparedMemoryInput,
+        ProfileBlock, RetrievalTrace, ScoredMemory, SearchMemoriesRequest, Thread, ThreadKind,
+        ThreadStatus, empty_object, now_utc,
     },
     retrieval::{
-        SearchEnvironment, build_context_bundle, build_trace, gate_candidates,
-        rebuild_profile_blocks, score_memories,
+        SearchEnvironment, build_context_bundle, build_trace, gate_candidates, rank_memories,
+        rebuild_profile_blocks,
     },
     store::SharedStore,
 };
@@ -28,6 +28,8 @@ use crate::{
 pub struct AppService {
     store: SharedStore,
     chat_backend: Arc<dyn ChatCompletionBackend>,
+    embedder: Option<Arc<dyn Embedder>>,
+    embedding_model: String,
 }
 
 #[derive(Clone, Debug)]
@@ -53,8 +55,14 @@ impl AppService {
         snapshot_path: Option<PathBuf>,
         database_url: Option<String>,
     ) -> anyhow::Result<Self> {
-        Self::load_with_chat_backend(snapshot_path, database_url, Arc::new(SyntheticChatBackend))
-            .await
+        Self::load_with_chat_backend_and_embedder(
+            snapshot_path,
+            database_url,
+            Arc::new(SyntheticChatBackend),
+            None,
+            "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
+        )
+        .await
     }
 
     pub async fn load_with_chat_backend(
@@ -62,10 +70,29 @@ impl AppService {
         database_url: Option<String>,
         chat_backend: Arc<dyn ChatCompletionBackend>,
     ) -> anyhow::Result<Self> {
+        Self::load_with_chat_backend_and_embedder(
+            snapshot_path,
+            database_url,
+            chat_backend,
+            None,
+            "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
+        )
+        .await
+    }
+
+    pub async fn load_with_chat_backend_and_embedder(
+        snapshot_path: Option<PathBuf>,
+        database_url: Option<String>,
+        chat_backend: Arc<dyn ChatCompletionBackend>,
+        embedder: Option<Arc<dyn Embedder>>,
+        embedding_model: String,
+    ) -> anyhow::Result<Self> {
         let store = SharedStore::load(snapshot_path, database_url).await?;
         Ok(Self {
             store,
             chat_backend,
+            embedder,
+            embedding_model,
         })
     }
 
@@ -77,6 +104,8 @@ impl AppService {
         Self {
             store: SharedStore::new_in_memory(),
             chat_backend,
+            embedder: None,
+            embedding_model: "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
         }
     }
 
@@ -85,21 +114,25 @@ impl AppService {
         request: CreateTextEntryRequest,
     ) -> anyhow::Result<CaptureEntryResponse> {
         let prepared_artifacts = request.prepared_artifacts.clone();
-        let prepared_memories = request.prepared_memories.clone();
+        let prepared_memories = self
+            .hydrate_prepared_memories(request.prepared_memories.clone())
+            .await?;
         let captured_at = request.captured_at.unwrap_or_else(now_utc);
         let entry = Entry {
             id: Uuid::new_v4(),
-            kind: EntryKind::TextJournal,
+            kind: EntryKind::Text,
             raw_text: Some(request.raw_text.clone()),
             asset_ref: None,
             captured_at,
             timezone: request.timezone.unwrap_or_else(|| "UTC".to_string()),
             source_app: request.source_app,
-            metadata: request.metadata,
+            metadata: merge_attrs(request.metadata, json!({ "source_modality": "text" })),
             created_at: now_utc(),
         };
-        self.capture_entry(entry, prepared_artifacts, prepared_memories)
-            .await
+        let response = self
+            .capture_entry(entry, prepared_artifacts, prepared_memories)
+            .await?;
+        Ok(response)
     }
 
     pub async fn create_audio_entry(
@@ -107,21 +140,69 @@ impl AppService {
         request: CreateAudioEntryRequest,
     ) -> anyhow::Result<CaptureEntryResponse> {
         let prepared_artifacts = request.prepared_artifacts.clone();
-        let prepared_memories = request.prepared_memories.clone();
+        let prepared_memories = self
+            .hydrate_prepared_memories(request.prepared_memories.clone())
+            .await?;
         let captured_at = request.captured_at.unwrap_or_else(now_utc);
         let entry = Entry {
             id: Uuid::new_v4(),
-            kind: EntryKind::AudioDictation,
+            kind: EntryKind::Text,
             raw_text: request.transcript_text.clone(),
             asset_ref: Some(request.asset_ref),
             captured_at,
             timezone: request.timezone.unwrap_or_else(|| "UTC".to_string()),
             source_app: request.source_app,
-            metadata: request.metadata,
+            metadata: merge_attrs(request.metadata, json!({ "source_modality": "audio" })),
             created_at: now_utc(),
         };
-        self.capture_entry(entry, prepared_artifacts, prepared_memories)
-            .await
+        let response = self
+            .capture_entry(entry, prepared_artifacts, prepared_memories)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn create_memory(
+        &self,
+        request: CreateMemoryRequest,
+    ) -> anyhow::Result<CaptureEntryResponse> {
+        let display_text = request.display_text.trim().to_string();
+        if display_text.is_empty() {
+            bail!("memory display_text cannot be empty");
+        }
+
+        let memory = PreparedMemoryInput {
+            kind: request.kind,
+            subtype: request.subtype,
+            display_text: display_text.clone(),
+            retrieval_text: request
+                .retrieval_text
+                .clone()
+                .unwrap_or_else(|| display_text.clone()),
+            attrs: request.attrs,
+            observed_at: request.observed_at,
+            valid_from: request.valid_from,
+            valid_to: request.valid_to,
+            confidence: request.confidence,
+            salience: request.salience,
+            state: Some(MemoryState::Accepted),
+            embedding: None,
+            thread_title: request.thread_title,
+            source_artifact_ordinals: vec![0],
+        };
+
+        self.create_text_entry(CreateTextEntryRequest {
+            raw_text: display_text,
+            captured_at: request.captured_at,
+            timezone: request.timezone,
+            source_app: request.source_app,
+            prepared_artifacts: Vec::new(),
+            prepared_memories: vec![memory],
+            metadata: merge_attrs(
+                request.metadata,
+                json!({ "capture_type": "explicit_memory" }),
+            ),
+        })
+        .await
     }
 
     pub async fn list_timeline(&self) -> Vec<Entry> {
@@ -144,10 +225,11 @@ impl AppService {
     ) -> anyhow::Result<Vec<ScoredMemory>> {
         let state = self.store.read_clone().await;
         let now = now_utc();
-        let assemble_request = AssembleContextRequest {
+        let mut assemble_request = AssembleContextRequest {
             query: request.query,
             recent_turns: Vec::new(),
             recent_context: request.recent_context,
+            conversation_id: request.conversation_id,
             active_thread_id: request.active_thread_id,
             focus_from: request.focus_from,
             focus_to: request.focus_to,
@@ -155,25 +237,22 @@ impl AppService {
             max_candidates: request.limit,
             max_injected: None,
         };
+        assemble_request.query_embedding = self
+            .hydrate_query_embedding(&assemble_request)
+            .await?
+            .or(assemble_request.query_embedding);
 
         let search_limit = request.limit.unwrap_or(20);
-        let mut candidates = match self
-            .store
-            .search_candidates(&assemble_request, search_limit, now, &state)
-            .await?
-        {
-            Some(candidates) => candidates,
-            None => score_memories(
-                SearchEnvironment {
-                    memories: &state.memories,
-                    threads: &state.threads,
-                    retrieval_traces: &state.retrieval_traces,
-                },
-                &assemble_request,
-                search_limit,
-                now,
-            ),
-        };
+        let mut candidates = rank_memories(
+            SearchEnvironment {
+                memories: &state.memories,
+                threads: &state.threads,
+                retrieval_traces: &state.retrieval_traces,
+            },
+            &assemble_request,
+            search_limit,
+            now,
+        );
 
         if let Some(kind) = request.kind {
             candidates.retain(|candidate| candidate.memory.kind == kind);
@@ -192,23 +271,21 @@ impl AppService {
         let now = now_utc();
         let max_candidates = request.max_candidates.unwrap_or(20);
         let max_injected = request.max_injected.unwrap_or(3);
-        let candidates = match self
-            .store
-            .search_candidates(&request, max_candidates, now, &state)
+        let mut request = request;
+        request.query_embedding = self
+            .hydrate_query_embedding(&request)
             .await?
-        {
-            Some(candidates) => candidates,
-            None => score_memories(
-                SearchEnvironment {
-                    memories: &state.memories,
-                    threads: &state.threads,
-                    retrieval_traces: &state.retrieval_traces,
-                },
-                &request,
-                max_candidates,
-                now,
-            ),
-        };
+            .or(request.query_embedding);
+        let candidates = rank_memories(
+            SearchEnvironment {
+                memories: &state.memories,
+                threads: &state.threads,
+                retrieval_traces: &state.retrieval_traces,
+            },
+            &request,
+            max_candidates,
+            now,
+        );
         let gate = gate_candidates(&candidates, max_injected);
         let context = build_context_bundle(&gate.selected, &state.entries, &state.artifacts);
         let recent_context =
@@ -216,6 +293,7 @@ impl AppService {
         let trace = build_trace(
             request.query.clone(),
             recent_context,
+            request.conversation_id,
             request.active_thread_id,
             &gate,
             context.clone(),
@@ -332,6 +410,7 @@ impl AppService {
                 query: request.message.clone(),
                 recent_turns,
                 recent_context: recent_context.clone(),
+                conversation_id: request.conversation_id,
                 active_thread_id: request.active_thread_id,
                 focus_from: request.focus_from,
                 focus_to: request.focus_to,
@@ -391,6 +470,61 @@ impl AppService {
         self.store.read_clone().await
     }
 
+    async fn hydrate_prepared_memories(
+        &self,
+        prepared_memories: Vec<PreparedMemoryInput>,
+    ) -> anyhow::Result<Vec<PreparedMemoryInput>> {
+        let Some(embedder) = &self.embedder else {
+            return Ok(prepared_memories);
+        };
+
+        let mut missing_indexes = Vec::new();
+        let mut texts = Vec::new();
+        for (index, memory) in prepared_memories.iter().enumerate() {
+            if memory.embedding.is_none() && !memory.retrieval_text.trim().is_empty() {
+                missing_indexes.push(index);
+                texts.push(memory.retrieval_text.clone());
+            }
+        }
+        if missing_indexes.is_empty() {
+            return Ok(prepared_memories);
+        }
+
+        let embeddings = embedder
+            .embed_texts(&self.embedding_model, &texts, false)
+            .await
+            .with_context(|| "failed to embed prepared memories")?;
+
+        let mut hydrated = prepared_memories;
+        for (index, embedding) in missing_indexes.into_iter().zip(embeddings.into_iter()) {
+            hydrated[index].embedding = Some(embedding);
+        }
+        Ok(hydrated)
+    }
+
+    async fn hydrate_query_embedding(
+        &self,
+        request: &AssembleContextRequest,
+    ) -> anyhow::Result<Option<EmbeddingVector>> {
+        if request.query_embedding.is_some() {
+            return Ok(request.query_embedding.clone());
+        }
+        let Some(embedder) = &self.embedder else {
+            return Ok(None);
+        };
+
+        let text = build_query_embedding_text(request);
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let mut embeddings = embedder
+            .embed_texts(&self.embedding_model, &[text], false)
+            .await
+            .with_context(|| "failed to embed retrieval query")?;
+        Ok(embeddings.pop())
+    }
+
     async fn capture_entry(
         &self,
         entry: Entry,
@@ -399,7 +533,10 @@ impl AppService {
     ) -> anyhow::Result<CaptureEntryResponse> {
         let text = entry.raw_text.clone().unwrap_or_default();
         let artifacts = build_artifacts(&entry, &text, prepared_artifacts);
-        let memory_drafts = extract_memory_drafts(&text, prepared_memories);
+        let memory_drafts = prepared_memories
+            .into_iter()
+            .map(memory_draft_from_prepared)
+            .collect::<Vec<_>>();
 
         let result = self
             .store
@@ -434,7 +571,7 @@ fn build_artifacts(
             .map(|(index, chunk)| Artifact {
                 id: Uuid::new_v4(),
                 entry_id: entry.id,
-                kind: if entry.kind == EntryKind::AudioDictation && index == 0 {
+                kind: if entry_source_modality(entry) == Some("audio") && index == 0 {
                     ArtifactKind::Transcript
                 } else {
                     ArtifactKind::Chunk
@@ -613,7 +750,7 @@ fn resolve_thread(state: &mut PersistedState, title: &str, now: DateTime<Utc>) -
         id: Uuid::new_v4(),
         kind: ThreadKind::Project,
         title: title.to_string(),
-        summary: format!("Thread derived from extracted memory: {title}"),
+        summary: format!("Thread derived from explicit memory: {title}"),
         status: ThreadStatus::Active,
         metadata: empty_object(),
         created_at: now,
@@ -667,114 +804,48 @@ fn reflect_text(text: &str) -> String {
     )
 }
 
-fn extract_memory_drafts(
-    text: &str,
-    prepared_memories: Vec<PreparedMemoryInput>,
-) -> Vec<MemoryDraft> {
-    let patterns = [
-        (
-            Regex::new(r"(?i)\bI(?:'m| am) (?:building|developing)\s+([^.;]+)").unwrap(),
-            MemoryKind::Semantic,
-            MemorySubtype::Project,
-            0.93,
-            0.92,
-            Some("building"),
-        ),
-        (
-            Regex::new(r"(?i)\bI(?:'m| am) working on\s+([^.;]+)").unwrap(),
-            MemoryKind::Semantic,
-            MemorySubtype::Project,
-            0.9,
-            0.88,
-            Some("working on"),
-        ),
-        (
-            Regex::new(r"(?i)\bI(?:'d| would)?\s*(?:really\s+)?(?:prefer|like|love)\s+([^.;]+)")
-                .unwrap(),
-            MemoryKind::Semantic,
-            MemorySubtype::Preference,
-            0.91,
-            0.8,
-            None,
-        ),
-        (
-            Regex::new(r"(?i)\bI want to\s+([^.;]+)").unwrap(),
-            MemoryKind::Semantic,
-            MemorySubtype::Goal,
-            0.86,
-            0.82,
-            None,
-        ),
-        (
-            Regex::new(r"(?i)\bI need to\s+([^.;]+)").unwrap(),
-            MemoryKind::Semantic,
-            MemorySubtype::Goal,
-            0.85,
-            0.78,
-            None,
-        ),
-        (
-            Regex::new(r"(?i)\bI (?:want to|need to|should) change\s+([^.;]+)").unwrap(),
-            MemoryKind::Procedural,
-            MemorySubtype::Habit,
-            0.84,
-            0.76,
-            None,
-        ),
-    ];
+fn memory_draft_from_prepared(prepared: PreparedMemoryInput) -> MemoryDraft {
+    MemoryDraft {
+        kind: prepared.kind,
+        subtype: prepared.subtype,
+        display_text: prepared.display_text,
+        retrieval_text: prepared.retrieval_text,
+        attrs: prepared.attrs,
+        observed_at: prepared.observed_at,
+        valid_from: prepared.valid_from,
+        valid_to: prepared.valid_to,
+        confidence: prepared.confidence.unwrap_or(0.8).clamp(0.0, 1.0),
+        salience: prepared.salience.unwrap_or(0.8).clamp(0.0, 1.0),
+        state: prepared.state.unwrap_or(MemoryState::Accepted),
+        embedding: prepared.embedding,
+        thread_title: prepared.thread_title,
+        source_artifact_ordinals: prepared.source_artifact_ordinals,
+    }
+}
 
-    let mut drafts = Vec::new();
-    for (regex, kind, subtype, confidence, salience, thread_hint) in patterns {
-        for capture in regex.captures_iter(text) {
-            let Some(raw_value) = capture.get(1) else {
-                continue;
-            };
-            let value = clean_memory_value(raw_value.as_str());
-            if value.is_empty() {
-                continue;
-            }
-            let (display_text, retrieval_text, thread_title) =
-                memory_texts(kind, subtype, &value, thread_hint);
-            drafts.push(MemoryDraft {
-                kind,
-                subtype,
-                display_text,
-                retrieval_text,
-                attrs: empty_object(),
-                observed_at: None,
-                valid_from: None,
-                valid_to: None,
-                confidence,
-                salience,
-                state: MemoryState::Accepted,
-                embedding: None,
-                thread_title,
-                source_artifact_ordinals: Vec::new(),
-            });
+fn build_query_embedding_text(request: &AssembleContextRequest) -> String {
+    let mut parts = Vec::new();
+    if let Some(recent_context) = request.recent_context.as_deref()
+        && !recent_context.trim().is_empty()
+    {
+        parts.push(recent_context.trim().to_string());
+    }
+    for turn in &request.recent_turns {
+        if !turn.text.trim().is_empty() {
+            parts.push(format!("{:?}: {}", turn.role, turn.text.trim()));
         }
     }
-
-    for prepared in prepared_memories {
-        drafts.push(MemoryDraft {
-            kind: prepared.kind,
-            subtype: prepared.subtype,
-            display_text: prepared.display_text,
-            retrieval_text: prepared.retrieval_text,
-            attrs: prepared.attrs,
-            observed_at: prepared.observed_at,
-            valid_from: prepared.valid_from,
-            valid_to: prepared.valid_to,
-            confidence: prepared.confidence.unwrap_or(0.8).clamp(0.0, 1.0),
-            salience: prepared.salience.unwrap_or(0.8).clamp(0.0, 1.0),
-            state: prepared.state.unwrap_or(MemoryState::Accepted),
-            embedding: prepared.embedding,
-            thread_title: prepared.thread_title,
-            source_artifact_ordinals: prepared.source_artifact_ordinals,
-        });
+    if !request.query.trim().is_empty() {
+        parts.push(format!("User: {}", request.query.trim()));
     }
 
-    drafts.dedup_by(|left, right| left.display_text == right.display_text);
-    drafts
+    let tokens = parts
+        .join("\n")
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let start = tokens.len().saturating_sub(500);
+    tokens[start..].join(" ")
 }
 
 fn merge_attrs(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
@@ -789,61 +860,8 @@ fn merge_attrs(base: serde_json::Value, extra: serde_json::Value) -> serde_json:
     }
 }
 
-fn memory_texts(
-    kind: MemoryKind,
-    subtype: MemorySubtype,
-    value: &str,
-    thread_hint: Option<&str>,
-) -> (String, String, Option<String>) {
-    match subtype {
-        MemorySubtype::Preference => (
-            format!("You prefer {value}."),
-            format!("preference {value}"),
-            None,
-        ),
-        MemorySubtype::Project => {
-            let title = title_case(value);
-            (
-                format!("You are building {value}."),
-                format!("project {value}"),
-                Some(title),
-            )
-        }
-        MemorySubtype::Goal => (
-            format!("You want to {value}."),
-            format!("goal {value}"),
-            thread_hint.map(|_| title_case(value)),
-        ),
-        MemorySubtype::Habit if kind == MemoryKind::Procedural => (
-            format!("You want to change {value}."),
-            format!("habit change {value}"),
-            None,
-        ),
-        _ => (value.to_string(), value.to_string(), None),
-    }
-}
-
-fn clean_memory_value(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == ' ')
-        .trim_end_matches("today")
-        .trim()
-        .to_string()
-}
-
-fn title_case(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn entry_source_modality(entry: &Entry) -> Option<&str> {
+    entry.metadata.get("source_modality")?.as_str()
 }
 
 fn intervals_overlap(
@@ -924,25 +942,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_capture_creates_artifacts_memories_and_profile_blocks() {
+    async fn explicit_memory_capture_creates_artifacts_memories_and_profile_blocks() {
         let service = AppService::new_in_memory();
         let response = service
-            .create_text_entry(CreateTextEntryRequest {
-                raw_text:
-                    "I prefer Rust for backend services. I'm building a personal memory system."
-                        .to_string(),
+            .create_memory(CreateMemoryRequest {
+                display_text: "You prefer Rust for backend services.".to_string(),
+                retrieval_text: None,
+                kind: MemoryKind::Semantic,
+                subtype: MemorySubtype::Preference,
                 captured_at: Some(Utc.with_ymd_and_hms(2026, 4, 13, 18, 0, 0).unwrap()),
                 timezone: Some("America/Los_Angeles".to_string()),
                 source_app: Some("test".to_string()),
-                prepared_artifacts: Vec::new(),
-                prepared_memories: Vec::new(),
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: None,
                 metadata: json!({}),
             })
             .await
             .unwrap();
 
-        assert_eq!(response.artifacts.len(), 4);
-        assert_eq!(response.memories.len(), 2);
+        assert_eq!(response.artifacts.len(), 3);
+        assert_eq!(response.memories.len(), 1);
 
         let blocks = service.profile_blocks().await;
         let preferences = blocks
@@ -954,6 +978,31 @@ mod tests {
                 .text
                 .contains("You prefer Rust for backend services.")
         );
+    }
+
+    #[tokio::test]
+    async fn audio_capture_is_normalized_to_text_with_audio_metadata() {
+        let service = AppService::new_in_memory();
+        let response = service
+            .create_audio_entry(CreateAudioEntryRequest {
+                asset_ref: "s3://bucket/clip.m4a".to_string(),
+                transcript_text: Some("I prefer voice notes for capture.".to_string()),
+                captured_at: Some(Utc.with_ymd_and_hms(2026, 4, 13, 19, 0, 0).unwrap()),
+                timezone: Some("UTC".to_string()),
+                source_app: Some("test".to_string()),
+                prepared_artifacts: Vec::new(),
+                prepared_memories: Vec::new(),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.entry.kind, EntryKind::Text);
+        assert_eq!(
+            response.entry.metadata["source_modality"].as_str(),
+            Some("audio")
+        );
+        assert_eq!(response.artifacts[0].kind, ArtifactKind::Transcript);
     }
 
     #[tokio::test]
@@ -983,13 +1032,41 @@ mod tests {
     async fn search_and_context_assembly_return_traceable_memory() {
         let service = AppService::new_in_memory();
         service
-            .create_text_entry(CreateTextEntryRequest {
-                raw_text: "I prefer Rust for backend services. I'm building a personal memory system on AWS.".to_string(),
+            .create_memory(CreateMemoryRequest {
+                display_text: "You prefer Rust for backend services.".to_string(),
+                retrieval_text: Some("backend language rust".to_string()),
+                kind: MemoryKind::Semantic,
+                subtype: MemorySubtype::Preference,
                 captured_at: Some(now_utc() - Duration::days(1)),
                 timezone: None,
                 source_app: None,
-                prepared_artifacts: Vec::new(),
-                prepared_memories: Vec::new(),
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        service
+            .create_memory(CreateMemoryRequest {
+                display_text: "You are building a personal memory system on AWS.".to_string(),
+                retrieval_text: Some("building personal memory system aws".to_string()),
+                kind: MemoryKind::Semantic,
+                subtype: MemorySubtype::Project,
+                captured_at: Some(now_utc() - Duration::days(1)),
+                timezone: None,
+                source_app: None,
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: Some("Ancilla".to_string()),
                 metadata: json!({}),
             })
             .await
@@ -999,6 +1076,7 @@ mod tests {
             .search_memories(SearchMemoriesRequest {
                 query: "What backend language should I use?".to_string(),
                 recent_context: None,
+                conversation_id: None,
                 focus_from: None,
                 focus_to: None,
                 active_thread_id: None,
@@ -1017,6 +1095,7 @@ mod tests {
                 query: "What am I building?".to_string(),
                 recent_turns: Vec::new(),
                 recent_context: None,
+                conversation_id: None,
                 active_thread_id: None,
                 focus_from: None,
                 focus_to: None,
@@ -1042,13 +1121,21 @@ mod tests {
     async fn patch_and_delete_memory_update_visibility() {
         let service = AppService::new_in_memory();
         let created = service
-            .create_text_entry(CreateTextEntryRequest {
-                raw_text: "I prefer Rust.".to_string(),
+            .create_memory(CreateMemoryRequest {
+                display_text: "You prefer Rust.".to_string(),
+                retrieval_text: None,
+                kind: MemoryKind::Semantic,
+                subtype: MemorySubtype::Preference,
                 captured_at: None,
                 timezone: None,
                 source_app: None,
-                prepared_artifacts: Vec::new(),
-                prepared_memories: Vec::new(),
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: None,
                 metadata: json!({}),
             })
             .await
@@ -1082,13 +1169,21 @@ mod tests {
         let backend = RecordingBackend::default();
         let service = AppService::new_in_memory_with_chat_backend(Arc::new(backend.clone()));
         service
-            .create_text_entry(CreateTextEntryRequest {
-                raw_text: "I'm building a personal memory system.".to_string(),
+            .create_memory(CreateMemoryRequest {
+                display_text: "You are building a personal memory system.".to_string(),
+                retrieval_text: Some("building personal memory system".to_string()),
+                kind: MemoryKind::Semantic,
+                subtype: MemorySubtype::Project,
                 captured_at: None,
                 timezone: None,
                 source_app: None,
-                prepared_artifacts: Vec::new(),
-                prepared_memories: Vec::new(),
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: Some("Ancilla".to_string()),
                 metadata: json!({}),
             })
             .await
@@ -1100,6 +1195,7 @@ mod tests {
                 model_id: Some("anthropic.claude-opus-4-6-v1".to_string()),
                 recent_turns: Vec::new(),
                 recent_context: None,
+                conversation_id: None,
                 active_thread_id: None,
                 focus_from: None,
                 focus_to: None,
@@ -1206,6 +1302,7 @@ mod tests {
             .search_memories(SearchMemoriesRequest {
                 query: "Which backend language?".to_string(),
                 recent_context: None,
+                conversation_id: None,
                 focus_from: None,
                 focus_to: None,
                 active_thread_id: None,
@@ -1302,6 +1399,7 @@ mod tests {
             .search_memories(SearchMemoriesRequest {
                 query: format!("Which preference matches {unique_tag}?"),
                 recent_context: None,
+                conversation_id: None,
                 focus_from: None,
                 focus_to: None,
                 active_thread_id: None,

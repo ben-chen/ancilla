@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     model::{
         ApiErrorBody, AssembleContextRequest, ChatRespondRequest, CreateAudioEntryRequest,
-        CreateTextEntryRequest, PatchMemoryRequest, SearchMemoriesRequest,
+        CreateMemoryRequest, CreateTextEntryRequest, PatchMemoryRequest, SearchMemoriesRequest,
     },
     service::AppService,
 };
@@ -32,6 +32,7 @@ pub fn router(service: AppService) -> Router {
         .route("/healthz", get(health))
         .route("/v1/entries/text", post(create_text_entry))
         .route("/v1/entries/audio", post(create_audio_entry))
+        .route("/v1/memories", post(create_memory))
         .route("/v1/timeline", get(get_timeline))
         .route("/v1/chat/models", get(get_chat_models))
         .route("/v1/context/assemble", post(assemble_context))
@@ -62,6 +63,13 @@ async fn create_audio_entry(
     Json(request): Json<CreateAudioEntryRequest>,
 ) -> Result<Json<crate::model::CaptureEntryResponse>, ApiError> {
     Ok(Json(state.service.create_audio_entry(request).await?))
+}
+
+async fn create_memory(
+    State(state): State<ApiState>,
+    Json(request): Json<CreateMemoryRequest>,
+) -> Result<Json<crate::model::CaptureEntryResponse>, ApiError> {
+    Ok(Json(state.service.create_memory(request).await?))
 }
 
 async fn get_timeline(State(state): State<ApiState>) -> Json<Vec<crate::model::Entry>> {
@@ -169,11 +177,13 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::post("/v1/entries/text")
+                Request::post("/v1/memories")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "raw_text": "I prefer Rust. I'm building a personal memory system.",
+                            "display_text": "You are building a personal memory system.",
+                            "kind": "semantic",
+                            "subtype": "project",
                             "timezone": "UTC"
                         })
                         .to_string(),
@@ -217,13 +227,21 @@ mod tests {
     async fn api_patch_and_delete_routes_work() {
         let service = AppService::new_in_memory();
         let created = service
-            .create_text_entry(CreateTextEntryRequest {
-                raw_text: "I prefer Rust.".to_string(),
+            .create_memory(CreateMemoryRequest {
+                display_text: "You prefer Rust.".to_string(),
+                retrieval_text: None,
+                kind: crate::model::MemoryKind::Semantic,
+                subtype: crate::model::MemorySubtype::Preference,
                 captured_at: None,
                 timezone: Some("UTC".to_string()),
                 source_app: None,
-                prepared_artifacts: Vec::new(),
-                prepared_memories: Vec::new(),
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: None,
                 metadata: json!({}),
             })
             .await

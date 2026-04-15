@@ -1,0 +1,31 @@
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/var/lib/ancilla-embedder/huggingface
+ENV TRANSFORMERS_CACHE=/var/lib/ancilla-embedder/huggingface
+ENV HF_ALLOW_CODE_EVAL=1
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+  && ln -s /root/.local/bin/uv /usr/local/bin/uv
+
+COPY scripts/embedder_service.py /app/scripts/embedder_service.py
+COPY scripts/pplx_embed.py /app/scripts/pplx_embed.py
+
+RUN mkdir -p /var/lib/ancilla-embedder/huggingface \
+  && uv pip install --system --python python --index-url https://download.pytorch.org/whl/cu124 torch \
+  && uv pip install --system --python python \
+    fastapi \
+    transformers \
+    uvicorn[standard]
+
+EXPOSE 4000
+
+ENTRYPOINT ["python3", "/app/scripts/embedder_service.py"]

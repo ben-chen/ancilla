@@ -5,6 +5,12 @@ description = "Developer utilities for local Ancilla workflows"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "boto3",
+    "fastapi",
+    "httpx",
+    "psycopg[binary]",
+    "sentence-transformers",
     "torch",
     "transformers",
+    "uvicorn",
 ]

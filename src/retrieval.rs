@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 use crate::model::{
     AssembleContextRequest, GateDecision, MemoryKind, MemoryRecord, MemoryState, ProfileBlock,
@@ -8,7 +8,6 @@ use crate::model::{
 };
 
 const EMBEDDING_DIMS: usize = 1024;
-const RRF_K: f32 = 60.0;
 const GATE_THRESHOLD: f32 = 0.18;
 
 #[derive(Clone, Debug)]
@@ -53,7 +52,7 @@ pub fn build_query_material(
     .to_string()
 }
 
-pub fn score_memories(
+pub fn rank_memories(
     env: SearchEnvironment<'_>,
     request: &AssembleContextRequest,
     limit: usize,
@@ -61,17 +60,23 @@ pub fn score_memories(
 ) -> Vec<ScoredMemory> {
     let query_material = build_query_material(request, env.threads);
 
-    let mut eligible = env
+    let banned_memory_ids = request
+        .conversation_id
+        .map(|conversation_id| {
+            env.retrieval_traces
+                .values()
+                .filter(|trace| trace.conversation_id == Some(conversation_id))
+                .flat_map(|trace| trace.selected_memory_ids.iter().copied())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let eligible = env
         .memories
         .values()
         .filter(|memory| memory.state == MemoryState::Accepted)
+        .filter(|memory| !banned_memory_ids.contains(&memory.id))
         .filter(|memory| {
-            if let Some(active_kind) = request.active_thread_id {
-                if memory.thread_id == Some(active_kind) {
-                    return true;
-                }
-            }
-
             if let Some(focus_from) = request.focus_from {
                 let focus_to = request.focus_to.unwrap_or(now);
                 let valid_overlap = overlaps(
@@ -96,76 +101,76 @@ pub fn score_memories(
         .cloned()
         .collect::<Vec<_>>();
 
-    if let Some(kind) = request.active_thread_id {
-        eligible.sort_by_key(|memory| memory.thread_id != Some(kind));
-    }
-
     let lexical_scores = lexical_rankings(&query_material, &eligible);
     let semantic_scores =
         semantic_rankings(&query_material, request.query_embedding.as_ref(), &eligible);
+    let lexical_score_map = lexical_scores.iter().copied().collect::<HashMap<_, _>>();
+    let semantic_score_map = semantic_scores.iter().copied().collect::<HashMap<_, _>>();
 
-    let lexical_map = lexical_scores
+    let semantic_top = semantic_scores
         .iter()
-        .enumerate()
-        .map(|(rank, (id, score))| (*id, (rank + 1, *score)))
-        .collect::<BTreeMap<_, _>>();
-    let semantic_map = semantic_scores
-        .iter()
-        .enumerate()
-        .map(|(rank, (id, score))| (*id, (rank + 1, *score)))
-        .collect::<BTreeMap<_, _>>();
+        .take(5)
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    let semantic_top_ids = semantic_top.iter().copied().collect::<HashSet<_>>();
 
-    let mut candidate_ids = HashSet::new();
-    let top_lexical = lexical_scores.iter().take(limit).map(|(id, _)| *id);
-    let top_semantic = semantic_scores.iter().take(limit).map(|(id, _)| *id);
-    candidate_ids.extend(top_lexical);
-    candidate_ids.extend(top_semantic);
+    let mut lexical_reranked = lexical_scores
+        .iter()
+        .take(50)
+        .filter(|(id, _)| !semantic_top_ids.contains(id))
+        .map(|(id, lexical_score)| {
+            let semantic_score = semantic_score_map.get(id).copied().unwrap_or(0.0);
+            (*id, semantic_score, *lexical_score)
+        })
+        .collect::<Vec<_>>();
+    lexical_reranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .2
+                    .partial_cmp(&left.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let lexical_top = lexical_reranked
+        .into_iter()
+        .take(5)
+        .map(|(id, _, _)| id)
+        .collect::<Vec<_>>();
+
+    let mut candidate_ids = semantic_top;
+    candidate_ids.extend(lexical_top);
+    let candidate_ids = candidate_ids.into_iter().collect::<HashSet<_>>();
 
     let mut results = eligible
         .into_iter()
         .filter(|memory| candidate_ids.contains(&memory.id))
         .map(|memory| {
-            let (semantic_rank, semantic_score) = semantic_map
-                .get(&memory.id)
-                .copied()
-                .unwrap_or((usize::MAX, 0.0));
-            let (lexical_rank, lexical_score) = lexical_map
-                .get(&memory.id)
-                .copied()
-                .unwrap_or((usize::MAX, 0.0));
-            let fusion_score = rrf(semantic_rank) + rrf(lexical_rank);
-            let temporal_bonus = temporal_bonus(&memory, request, now);
-            let thread_bonus = if memory.thread_id == request.active_thread_id {
-                0.10
+            let semantic_score = semantic_score_map.get(&memory.id).copied().unwrap_or(0.0);
+            let lexical_score = lexical_score_map.get(&memory.id).copied().unwrap_or(0.0);
+            let final_score = if semantic_score > 0.0 {
+                semantic_score
             } else {
-                0.0
+                lexical_score
             };
-            let salience_bonus = (memory.salience * 0.12).min(0.12);
-            let confidence_bonus = (memory.confidence * 0.10).min(0.10);
-            let reinjection_penalty = reinjection_penalty(memory.id, env.retrieval_traces, now);
-            let stale_penalty = stale_penalty(&memory, request, now);
-            let final_score =
-                fusion_score + temporal_bonus + thread_bonus + salience_bonus + confidence_bonus
-                    - reinjection_penalty
-                    - stale_penalty;
-            let prior_injected = env.retrieval_traces.values().any(|trace| {
-                trace.selected_memory_ids.contains(&memory.id)
-                    && trace.created_at >= now - Duration::days(7)
-            });
 
             ScoredMemory {
                 memory,
                 semantic_score,
                 lexical_score,
-                fusion_score,
-                temporal_bonus,
-                thread_bonus,
-                salience_bonus,
-                confidence_bonus,
-                reinjection_penalty,
-                stale_penalty,
+                fusion_score: final_score,
+                temporal_bonus: 0.0,
+                thread_bonus: 0.0,
+                salience_bonus: 0.0,
+                confidence_bonus: 0.0,
+                reinjection_penalty: 0.0,
+                stale_penalty: 0.0,
                 final_score,
-                prior_injected,
+                prior_injected: false,
                 candidate_rank: 0,
             }
         })
@@ -307,6 +312,7 @@ pub fn build_context_bundle(
 pub fn build_trace(
     query: String,
     recent_context: Option<String>,
+    conversation_id: Option<uuid::Uuid>,
     active_thread_id: Option<uuid::Uuid>,
     gate: &GateResult,
     context: Option<String>,
@@ -352,6 +358,7 @@ pub fn build_trace(
         id,
         query,
         recent_context,
+        conversation_id,
         active_thread_id,
         gate_decision: gate.decision,
         gate_confidence: gate.confidence,
@@ -543,74 +550,6 @@ fn overlaps(
     left_start <= right_end && right_start <= left_end
 }
 
-fn temporal_bonus(
-    memory: &MemoryRecord,
-    request: &AssembleContextRequest,
-    now: DateTime<Utc>,
-) -> f32 {
-    if let Some(focus_from) = request.focus_from {
-        let focus_to = request.focus_to.unwrap_or(now);
-        let valid_overlap = overlaps(
-            memory.valid_from,
-            memory.valid_to.unwrap_or(DateTime::<Utc>::MAX_UTC),
-            focus_from,
-            focus_to,
-        );
-        if valid_overlap { 0.12 } else { 0.0 }
-    } else if memory
-        .valid_to
-        .map(|valid_to| valid_to > now)
-        .unwrap_or(true)
-    {
-        0.08
-    } else {
-        0.0
-    }
-}
-
-fn reinjection_penalty(
-    memory_id: uuid::Uuid,
-    traces: &BTreeMap<uuid::Uuid, RetrievalTrace>,
-    now: DateTime<Utc>,
-) -> f32 {
-    let last = traces
-        .values()
-        .filter(|trace| trace.selected_memory_ids.contains(&memory_id))
-        .map(|trace| trace.created_at)
-        .max();
-    match last {
-        Some(timestamp) if timestamp >= now - Duration::days(1) => 0.18,
-        Some(timestamp) if timestamp >= now - Duration::days(7) => 0.08,
-        _ => 0.0,
-    }
-}
-
-fn stale_penalty(
-    memory: &MemoryRecord,
-    request: &AssembleContextRequest,
-    now: DateTime<Utc>,
-) -> f32 {
-    if request.focus_from.is_none()
-        && matches!(memory.kind, MemoryKind::Semantic | MemoryKind::Procedural)
-        && memory
-            .valid_to
-            .map(|valid_to| valid_to <= now)
-            .unwrap_or(false)
-    {
-        0.25
-    } else {
-        0.0
-    }
-}
-
-fn rrf(rank: usize) -> f32 {
-    if rank == usize::MAX {
-        0.0
-    } else {
-        1.0 / (RRF_K + rank as f32)
-    }
-}
-
 fn fnv1a(value: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in value.as_bytes() {
@@ -706,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn scoring_penalizes_stale_current_fact() {
+    fn ranking_filters_stale_current_fact_without_focus_window() {
         let now = now_utc();
         let mut memories = BTreeMap::new();
         let stale = MemoryRecord {
@@ -733,7 +672,7 @@ mod tests {
         };
         memories.insert(stale.id, stale.clone());
 
-        let scored = score_memories(
+        let scored = rank_memories(
             SearchEnvironment {
                 memories: &memories,
                 threads: &BTreeMap::new(),
@@ -743,6 +682,7 @@ mod tests {
                 query: "What stack am I using now?".to_string(),
                 recent_turns: Vec::new(),
                 recent_context: None,
+                conversation_id: None,
                 active_thread_id: None,
                 focus_from: None,
                 focus_to: None,

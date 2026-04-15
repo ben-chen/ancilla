@@ -225,3 +225,70 @@ variable "backup_retention_period" {
   type        = number
   default     = 1
 }
+
+variable "embedding_memory_model_id" {
+  description = "Embedding model used for memory_records."
+  type        = string
+  default     = "perplexity-ai/pplx-embed-v1-0.6b"
+}
+
+variable "embedder_enabled" {
+  description = "When true, create the always-on Ancilla embedder instance and point the server at it."
+  type        = bool
+  default     = true
+}
+
+variable "embedder_image" {
+  description = "Optional full container image URI for the Ancilla embedder service."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
+variable "embedder_image_tag" {
+  description = "Container image tag for the managed Ancilla embedder ECR repository."
+  type        = string
+  default     = "latest"
+}
+
+variable "embedder_instance_type" {
+  description = "EC2 instance type for the always-on embedder host."
+  type        = string
+  default     = "g6f.large"
+}
+
+variable "embedder_root_volume_size_gb" {
+  description = "Root volume size in GB for the embedder instance."
+  type        = number
+  default     = 80
+}
+
+variable "embedder_port" {
+  description = "HTTP port exposed by the embedder service."
+  type        = number
+  default     = 4000
+}
+
+variable "embedder_timeout_seconds" {
+  description = "Timeout in seconds for the server's embedder HTTP client."
+  type        = number
+  default     = 120
+}
+
+variable "embedder_device" {
+  description = "Device preference passed into the embedder service."
+  type        = string
+  default     = "auto"
+}
+
+variable "embedder_batch_size" {
+  description = "Batch size used by the embedder service."
+  type        = number
+  default     = 2
+}
+
+variable "embedder_max_length" {
+  description = "Maximum tokenized input length passed to the embedder model."
+  type        = number
+  default     = 8192
+}

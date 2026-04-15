@@ -26,8 +26,8 @@ Reference docs:
 Current embedding choice:
 
 - `perplexity-ai/pplx-embed-v1-0.6b` for query and memory embeddings
-- `perplexity-ai/pplx-embed-context-v1-0.6b` for artifact and chunk embeddings
 - clients may precompute embeddings and send them to the server
+- the server can also call a separate `ancilla-embedder` service synchronously for both stored memories and live query embeddings
 - the local embedding helper defaults to `cuda -> mps -> cpu`
 
 ## Local AWS Setup
@@ -76,6 +76,8 @@ Relevant server settings:
 - `app_env`
 - `data_file`
 - `database_url`
+- `embedder_base_url`
+- `embedder_timeout_seconds`
 - `aws_region`
 - `aws_profile`
 - `aws_config_file`
@@ -88,7 +90,6 @@ Relevant server settings:
 - `accept_client_transcripts`
 - `local_embed_model`
 - `local_context_embed_model`
-- `local_embed_device`
 
 Server-specific env vars use the `ANCILLA_SERVER_...` prefix. The server also accepts the standard deploy/runtime env vars already used elsewhere, including:
 
@@ -106,6 +107,9 @@ Example `~/.config/ancilla-server/config.toml`:
 app_env = "development"
 data_file = ".ancilla/state.json"
 # database_url = "postgres://user:password@host:5432/ancilla?sslmode=require"
+# embedder_base_url = "http://10.42.0.50:4000"
+# embedder_timeout_seconds = 120
+#
 aws_region = "us-west-2"
 aws_profile = "ancilla-dev"
 aws_config_file = "~/workspace/ancilla/.aws/config"
@@ -135,7 +139,6 @@ accept_client_embeddings = true
 accept_client_transcripts = true
 local_embed_model = "perplexity-ai/pplx-embed-v1-0.6b"
 local_context_embed_model = "perplexity-ai/pplx-embed-context-v1-0.6b"
-local_embed_device = "auto"
 ```
 
 Inspect the effective server config:
@@ -148,6 +151,8 @@ cargo run --bin ancilla-server -- show-config --show-secrets
 If `database_url` is set, the server uses Postgres. If it is unset, the server falls back to the local JSON state file.
 
 If `bedrock_chat_model_id` is set, `POST /v1/chat/respond` uses Bedrock `Converse`. If it is unset, the server uses the deterministic synthetic backend.
+
+If `embedder_base_url` is set, the server asks the embedder service for live query embeddings and for memory embeddings during explicit capture. If it is unset, retrieval falls back to the built-in lexical path and the placeholder semantic scorer used by local tests.
 
 `bedrock_chat_model_id` is the default selection. `chat_models` is the short curated catalog returned by `GET /v1/chat/models` for the TUI model picker. Keep this list small. The intended deploy shape is only the latest model in each line:
 
@@ -215,10 +220,18 @@ cargo run --bin ancilla-server -- serve --bind 127.0.0.1:3000
 
 Common admin commands:
 
-- `capture`: ingest a new text or audio-origin entry and materialize its artifacts and memories
+- `capture`: store an explicit memory from text or audio, recording the original source modality in entry metadata
 
   ```bash
   cargo run --bin ancilla-server -- capture --text "I prefer Rust for backend services." --timezone UTC
+  ```
+
+- `remember`: store an explicit memory with explicit kind and subtype controls
+
+  ```bash
+  cargo run --bin ancilla-server -- remember "You prefer Rust for backend services." \
+    --kind semantic \
+    --subtype preference
   ```
 
 - `ask`: run context assembly plus the configured chat backend for one question
@@ -293,8 +306,9 @@ The client UI supports:
 - timeline browsing
 - entry inspection
 - model selection from the server-advertised catalog with `m`
+- retrieval/context preview with `s`, calling `POST /v1/context/assemble` without invoking the model
 - sending chat questions to the live server
-- capturing new text entries on the live server
+- capturing new memories on the live server
 
 The client does not define its own model list. It fetches the catalog from `GET /v1/chat/models` and sends the selected `model_id` with each ask request.
 
@@ -316,9 +330,9 @@ cargo run --bin ancilla-client --
 
 curl http://127.0.0.1:3000/healthz
 curl http://127.0.0.1:3000/v1/timeline
-curl -X POST http://127.0.0.1:3000/v1/entries/text \
+curl -X POST http://127.0.0.1:3000/v1/memories \
   -H 'content-type: application/json' \
-  --data '{"raw_text":"I prefer Rust.","timezone":"UTC"}'
+  --data '{"display_text":"You prefer Rust.","kind":"semantic","subtype":"preference","timezone":"UTC"}'
 ```
 
 Deployed service example:
@@ -358,19 +372,21 @@ aws ecs execute-command \
 
 ## Ingest Contract
 
-The backend does not assume it owns transcription or embedding generation.
+The backend does not assume it owns transcription.
 
-`POST /v1/entries/text`, `POST /v1/entries/audio`, `POST /v1/context/assemble`, and `POST /v1/chat/respond` all accept client-prepared fields like transcripts, artifacts, memories, and query embeddings.
+`POST /v1/memories` is now the primary explicit capture path. It stores a text entry plus one durable memory record. `POST /v1/entries/text` and `POST /v1/entries/audio` remain lower-level ingest endpoints for clients that want to manage artifacts or prepared memories explicitly.
+
+`POST /v1/context/assemble` and `POST /v1/chat/respond` accept either a client-supplied `query_embedding` or recent conversation turns. When the client omits `query_embedding` and the server has `embedder_base_url` configured, the server asks the embedder for a query embedding directly.
 
 If the client supplies embeddings:
 
 - the server stores them
 - retrieval uses them directly
-- the local placeholder scorer is bypassed for semantic ranking where possible
 
 If the client does not supply embeddings:
 
-- the server falls back to the local placeholder semantic scorer used for current tests
+- the server can call the configured embedder service synchronously
+- if no embedder is configured, retrieval falls back to the built-in lexical path and placeholder semantic scorer
 
 ## Local Embed Helper
 
@@ -389,6 +405,15 @@ See [`scripts/README.md`](scripts/README.md) for the helper workflow and tests.
 
 The first real model run may download model code and weights from Hugging Face, so expect the initial invocation to take longer.
 
+## Embedder Service
+
+The embedder path is now synchronous:
+
+- `ancilla-server` stores explicit memories directly
+- if `embedder_base_url` is configured, the server calls `ancilla-embedder` over HTTP to embed those memories immediately
+- retrieval queries use the same embedder service for live query embeddings
+- the embedder is intentionally separate from the API server so the heavy model runtime does not live inside the Fargate task
+
 ## Runtime Notes
 
 Postgres-ready schema scaffolding is in:
@@ -400,7 +425,8 @@ When `DATABASE_URL` is set, the app runs these migrations automatically at start
 Current runtime notes:
 
 - the Postgres path reads and writes the normalized tables directly
-- candidate retrieval in Postgres uses [`sql/hybrid_memory_candidates.sql`](sql/hybrid_memory_candidates.sql)
+- `entries.kind` is normalized to `text`, `chat_turn`, or `import`; source modality like `text` vs `audio` lives in `entries.metadata.source_modality`
+- candidate retrieval currently runs from the in-memory state view built from Postgres, using hybrid lexical plus cosine similarity ranking
 - when `BEDROCK_CHAT_MODEL_ID` is configured, `POST /v1/chat/respond` calls Bedrock `Converse`
 - the JSON file path remains available as a fallback when `DATABASE_URL` is unset
 - the Postgres path expects `pgvector` to be available in the target database
@@ -412,6 +438,7 @@ Terraform/OpenTofu scaffolding for the deployed server is in [`infra/tofu/README
 The default side-project shape uses:
 
 - a small public ECS Fargate service for `ancilla-server`
+- an optional always-on `ancilla-embedder` EC2 host for query and memory embeddings
 - a single-instance RDS PostgreSQL database
 - S3 for assets
 - ECR for images
@@ -425,7 +452,7 @@ Fast path:
 scripts/redeploy.sh
 ```
 
-That script builds a new immutable ARM64 image, pushes it to ECR, updates `infra/tofu/terraform.tfvars`, runs `tofu apply`, waits for ECS to stabilize, prints the current task IP, and runs `/healthz`.
+That script builds a new immutable ARM64 server image plus an AMD64 embedder image, pushes both to ECR, updates `infra/tofu/terraform.tfvars`, runs `tofu apply`, waits for ECS to stabilize, prints the current task IP, and runs `/healthz`.
 
 The deploy script stays separate from app runtime config:
 
@@ -464,6 +491,15 @@ export AWS_DEFAULT_REGION=us-west-2
 - `psql`
 - `session-manager-plugin` if you want `aws ecs execute-command`
 
+Also verify the AWS account has non-zero EC2 GPU quota in `us-west-2` if you want to enable the dedicated embedder host:
+
+- `Running On-Demand G and VT instances`
+- `All G and VT Spot Instance Requests`
+
+If either is still `0`, a dedicated GPU embedder instance cannot launch in this account. The checked-in `terraform.tfvars` therefore leaves `embedder_enabled = false` until quota is raised.
+
+When quota is available, the intended low-cost embedder default is `g6f.large` in `us-west-2`. That is currently the smallest Linux GPU instance in the region and is materially cheaper than `g4dn.xlarge`, so the embedder defaults also use a conservative `batch_size = 2` and `max_length = 8192`.
+
 3. Create deploy inputs.
 
 ```bash
@@ -477,15 +513,19 @@ Edit `infra/tofu/terraform.tfvars` and set at least:
 - `bedrock_chat_model_id`
 - `db_instance_class`
 - `container_image_tag`
+- `embedder_image_tag`
 
 Use a new immutable `container_image_tag` on every deploy. Do not reuse `latest`.
 
-4. Initialize OpenTofu and create ECR if needed.
+4. Initialize OpenTofu and create ECR repositories if needed.
 
 ```bash
 cd infra/tofu
 tofu init
-tofu apply -target=aws_ecr_repository.app -auto-approve
+tofu apply \
+  -target=aws_ecr_repository.app \
+  -target=aws_ecr_repository.embedder \
+  -auto-approve
 ```
 
 5. Build and push the server image.
@@ -506,14 +546,36 @@ Then set:
 container_image_tag = "<the same TAG you just pushed>"
 ```
 
-6. Apply the full stack.
+6. Build and push the embedder image.
+
+```bash
+cd infra/tofu
+EMBEDDER_ECR_URL=$(tofu output -raw embedder_ecr_repository_url)
+TAG=deploy-$(date +%Y%m%d-%H%M)
+cd ../..
+
+docker buildx build \
+  --platform linux/amd64 \
+  --load \
+  -f Dockerfile.embedder \
+  -t "$EMBEDDER_ECR_URL:$TAG" .
+docker push "$EMBEDDER_ECR_URL:$TAG"
+```
+
+Then set:
+
+```toml
+embedder_image_tag = "<the same TAG you just pushed>"
+```
+
+7. Apply the full stack.
 
 ```bash
 cd infra/tofu
 tofu apply -auto-approve
 ```
 
-7. Enable `pgvector` once from a VPC-connected shell.
+8. Enable `pgvector` once from a VPC-connected shell.
 
 ```bash
 cd infra/tofu
@@ -526,7 +588,7 @@ DATABASE_URL=$(aws secretsmanager get-secret-value \
 psql "$DATABASE_URL" -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 ```
 
-8. Find the live task public IP.
+9. Find the live task public IP.
 
 ```bash
 cd infra/tofu
@@ -549,14 +611,14 @@ APP_IP=$(aws ec2 describe-network-interfaces \
 echo "$APP_IP"
 ```
 
-9. Smoke-test the deployed API.
+10. Smoke-test the deployed API.
 
 ```bash
 curl "http://$APP_IP:3000/healthz"
 
-curl -X POST "http://$APP_IP:3000/v1/entries/text" \
+curl -X POST "http://$APP_IP:3000/v1/memories" \
   -H 'content-type: application/json' \
-  --data '{"raw_text":"I prefer Rust for backend services.","timezone":"UTC"}'
+  --data '{"display_text":"You prefer Rust for backend services.","kind":"semantic","subtype":"preference","timezone":"UTC"}'
 
 curl "http://$APP_IP:3000/v1/timeline"
 ```

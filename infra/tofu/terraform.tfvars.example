@@ -29,6 +29,11 @@ bedrock_chat_models = [
   },
 ]
 container_image_tag      = "latest"
+embedder_enabled         = true
+embedder_image_tag       = "latest"
+embedder_instance_type   = "g6f.large"
+embedder_port            = 4000
+embedder_timeout_seconds = 120
 desired_count            = 1
 task_cpu                 = 256
 task_memory              = 1024

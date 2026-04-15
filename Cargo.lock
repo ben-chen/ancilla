@@ -34,7 +34,6 @@ dependencies = [
  "http 1.4.0",
  "pgvector",
  "ratatui",
- "regex",
  "reqwest",
  "serde",
  "serde_json",

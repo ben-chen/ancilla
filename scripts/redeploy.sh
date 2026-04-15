@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/redeploy.sh [--tag TAG] [--skip-healthcheck]
 
-Builds a new linux/arm64 image, pushes it to ECR, updates
+Builds new app and embedder images, pushes them to ECR, updates
 infra/tofu/terraform.tfvars, applies the stack, waits for ECS to stabilize,
 prints the current task public IP, and optionally runs /healthz.
 
@@ -39,12 +39,13 @@ read_tfvar_string() {
   fi
 }
 
-update_tfvar_tag() {
-  local tag="$1"
-  if grep -qE '^[[:space:]]*container_image_tag[[:space:]]*=' "$TFVARS"; then
-    perl -0pi -e 's/^(\s*container_image_tag\s*=\s*)".*"$/\1"'"$tag"'"/m' "$TFVARS"
+update_tfvar_string() {
+  local key="$1"
+  local value="$2"
+  if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$TFVARS"; then
+    perl -0pi -e 's/^(\s*'"$key"'\s*=\s*)".*"$/\1"'"$value"'"/m' "$TFVARS"
   else
-    printf '\ncontainer_image_tag = "%s"\n' "$tag" >>"$TFVARS"
+    printf '\n%s = "%s"\n' "$key" "$value" >>"$TFVARS"
   fi
 }
 
@@ -112,7 +113,13 @@ log "using image tag: $tag"
 aws sts get-caller-identity >/dev/null
 
 pushd "$INFRA_DIR" >/dev/null
+log "bootstrapping ECR repositories"
+tofu apply -auto-approve \
+  -target=aws_ecr_repository.app \
+  -target=aws_ecr_repository.embedder >/dev/null
+
 ECR_URL="$(tofu output -raw ecr_repository_url)"
+EMBEDDER_ECR_URL="$(tofu output -raw embedder_ecr_repository_url)"
 CLUSTER="$(tofu output -raw ecs_cluster_name)"
 SERVICE="$(tofu output -raw ecs_service_name)"
 popd >/dev/null
@@ -122,14 +129,18 @@ REGISTRY_HOST="${ECR_URL%/*}"
 log "logging into ECR: $REGISTRY_HOST"
 aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY_HOST" >/dev/null
 
-log "building image: $ECR_URL:$tag"
+log "building app image: $ECR_URL:$tag"
 pushd "$REPO_ROOT" >/dev/null
 docker buildx build --platform linux/arm64 --load -t "$ECR_URL:$tag" .
 docker push "$ECR_URL:$tag"
+log "building embedder image: $EMBEDDER_ECR_URL:$tag"
+docker buildx build --platform linux/amd64 --load -f Dockerfile.embedder -t "$EMBEDDER_ECR_URL:$tag" .
+docker push "$EMBEDDER_ECR_URL:$tag"
 popd >/dev/null
 
-log "updating terraform.tfvars container_image_tag"
-update_tfvar_tag "$tag"
+log "updating terraform.tfvars image tags"
+update_tfvar_string "container_image_tag" "$tag"
+update_tfvar_string "embedder_image_tag" "$tag"
 
 log "applying infrastructure"
 pushd "$INFRA_DIR" >/dev/null
@@ -141,10 +152,15 @@ aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
 TASK_ARN="$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --query 'taskArns[0]' --output text)"
 ENI="$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" --query "tasks[0].attachments[0].details[?name==\`networkInterfaceId\`].value | [0]" --output text)"
 APP_IP="$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" --query 'NetworkInterfaces[0].Association.PublicIp' --output text)"
+EMBEDDER_URL="$(tofu output -raw embedder_private_url 2>/dev/null || true)"
+EMBEDDER_PUBLIC_IP="$(tofu output -raw embedder_public_ip 2>/dev/null || true)"
 popd >/dev/null
 
 log "task ARN: $TASK_ARN"
 log "app IP: $APP_IP"
+if [[ -n "$EMBEDDER_URL" && "$EMBEDDER_URL" != "null" ]]; then
+  log "embedder URL: $EMBEDDER_URL"
+fi
 
 if [[ "$skip_healthcheck" -eq 0 ]]; then
   log "running healthcheck"
@@ -154,9 +170,12 @@ fi
 cat <<EOF
 
 Redeploy complete.
-Image: $ECR_URL:$tag
-Task:  $TASK_ARN
-IP:    $APP_IP
+App image:      $ECR_URL:$tag
+Embedder image: $EMBEDDER_ECR_URL:$tag
+Task:           $TASK_ARN
+App IP:         $APP_IP
+Embedder URL:   ${EMBEDDER_URL:-disabled}
+Embedder IP:    ${EMBEDDER_PUBLIC_IP:-disabled}
 
 Try:
   curl "http://$APP_IP:3000/healthz"

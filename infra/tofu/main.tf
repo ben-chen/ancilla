@@ -1,5 +1,8 @@
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
+data "aws_ssm_parameter" "ecs_gpu_ami" {
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended/image_id"
+}
 
 module "network" {
   source = "./modules/network"
@@ -19,6 +22,8 @@ locals {
   service_name           = "${var.name_prefix}-mvp"
   ecr_image              = "${aws_ecr_repository.app.repository_url}:${var.container_image_tag}"
   container_image        = coalesce(var.container_image, local.ecr_image)
+  embedder_ecr_image     = "${aws_ecr_repository.embedder.repository_url}:${var.embedder_image_tag}"
+  embedder_image         = coalesce(var.embedder_image, local.embedder_ecr_image)
   vpc_id                 = var.create_network ? module.network[0].vpc_id : var.vpc_id
   public_subnet_ids      = var.create_network ? module.network[0].public_subnet_ids : var.public_subnet_ids
   private_app_subnet_ids = var.create_network ? module.network[0].private_app_subnet_ids : var.private_app_subnet_ids
@@ -27,6 +32,7 @@ locals {
   db_instance_class      = coalesce(var.db_instance_class, var.aurora_instance_class, "db.t4g.micro")
   database_url           = "postgres://${var.db_username}:${random_password.db_password.result}@${aws_db_instance.postgres.address}:${aws_db_instance.postgres.port}/${var.db_name}?sslmode=require"
   bucket_name            = "${var.name_prefix}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-memory-assets"
+  embedder_private_url   = var.embedder_enabled ? "http://${aws_instance.embedder[0].private_ip}:${var.embedder_port}" : null
   tags = {
     Project     = "ancilla"
     Environment = var.app_env
@@ -48,8 +54,22 @@ resource "aws_ecr_repository" "app" {
   }
 }
 
+resource "aws_ecr_repository" "embedder" {
+  name                 = "${local.service_name}-embedder"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/ecs/${local.service_name}"
+  retention_in_days = var.log_retention_days
+}
+
+resource "aws_cloudwatch_log_group" "embedder" {
+  name              = "/ec2/${local.service_name}-embedder"
   retention_in_days = var.log_retention_days
 }
 
@@ -93,6 +113,27 @@ resource "aws_security_group" "ecs_service" {
     to_port     = var.app_port
     protocol    = "tcp"
     cidr_blocks = var.allowed_ingress_cidr_blocks
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "embedder" {
+  count       = var.embedder_enabled ? 1 : 0
+  name        = "${local.service_name}-embedder"
+  description = "Ancilla embedder service"
+  vpc_id      = local.vpc_id
+
+  ingress {
+    from_port       = var.embedder_port
+    to_port         = var.embedder_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_service.id]
   }
 
   egress {
@@ -196,6 +237,60 @@ resource "aws_iam_role_policy" "ecs_execution_extra" {
   policy = data.aws_iam_policy_document.ecs_execution_extra.json
 }
 
+data "aws_iam_policy_document" "embedder_instance_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "embedder_instance" {
+  count              = var.embedder_enabled ? 1 : 0
+  name               = "${local.service_name}-embedder-instance"
+  assume_role_policy = data.aws_iam_policy_document.embedder_instance_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "embedder_instance_ssm" {
+  count      = var.embedder_enabled ? 1 : 0
+  role       = aws_iam_role.embedder_instance[0].name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "embedder_instance_ecr" {
+  count      = var.embedder_enabled ? 1 : 0
+  role       = aws_iam_role.embedder_instance[0].name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+data "aws_iam_policy_document" "embedder_instance" {
+  statement {
+    sid = "WriteEmbedderLogs"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:DescribeLogStreams",
+      "logs:PutLogEvents",
+    ]
+    resources = ["${aws_cloudwatch_log_group.embedder.arn}:*"]
+  }
+}
+
+resource "aws_iam_role_policy" "embedder_instance" {
+  count  = var.embedder_enabled ? 1 : 0
+  name   = "${local.service_name}-embedder-instance"
+  role   = aws_iam_role.embedder_instance[0].id
+  policy = data.aws_iam_policy_document.embedder_instance.json
+}
+
+resource "aws_iam_instance_profile" "embedder_instance" {
+  count = var.embedder_enabled ? 1 : 0
+  name  = "${local.service_name}-embedder-instance"
+  role  = aws_iam_role.embedder_instance[0].name
+}
+
 resource "aws_iam_role" "ecs_task" {
   name               = "${local.service_name}-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_task_assume_role.json
@@ -238,6 +333,43 @@ resource "aws_ecs_cluster" "app" {
   name = local.service_name
 }
 
+resource "aws_instance" "embedder" {
+  count                       = var.embedder_enabled ? 1 : 0
+  ami                         = data.aws_ssm_parameter.ecs_gpu_ami.value
+  instance_type               = var.embedder_instance_type
+  subnet_id                   = local.public_subnet_ids[0]
+  vpc_security_group_ids      = [aws_security_group.embedder[0].id]
+  iam_instance_profile        = aws_iam_instance_profile.embedder_instance[0].name
+  associate_public_ip_address = true
+  user_data_replace_on_change = true
+  user_data = templatefile("${path.module}/templates/embedder-user-data.sh.tftpl", {
+    aws_region       = var.aws_region
+    embedder_image   = local.embedder_image
+    embedder_port    = var.embedder_port
+    embedder_device  = var.embedder_device
+    batch_size       = var.embedder_batch_size
+    max_length       = var.embedder_max_length
+    default_model_id = var.embedding_memory_model_id
+    log_group_name   = aws_cloudwatch_log_group.embedder.name
+    registry_host    = split("/", aws_ecr_repository.embedder.repository_url)[0]
+  })
+
+  root_block_device {
+    encrypted   = true
+    volume_size = var.embedder_root_volume_size_gb
+    volume_type = "gp3"
+  }
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  tags = merge(local.tags, {
+    Name = "${local.service_name}-embedder"
+  })
+}
+
 resource "aws_ecs_task_definition" "app" {
   family                   = local.service_name
   requires_compatibilities = ["FARGATE"]
@@ -264,15 +396,22 @@ resource "aws_ecs_task_definition" "app" {
           protocol      = "tcp"
         }
       ]
-      environment = [
-        { name = "ANCILLA_APP_ENV", value = var.app_env },
-        { name = "AWS_REGION", value = var.aws_region },
-        { name = "AWS_DEFAULT_REGION", value = var.aws_region },
-        { name = "BEDROCK_CHAT_MODEL_ID", value = var.bedrock_chat_model_id },
-        { name = "BEDROCK_CHAT_MODELS_JSON", value = jsonencode(var.bedrock_chat_models) },
-        { name = "BEDROCK_CHAT_MAX_TOKENS", value = tostring(var.bedrock_chat_max_tokens) },
-        { name = "BEDROCK_CHAT_TEMPERATURE", value = tostring(var.bedrock_chat_temperature) }
-      ]
+      environment = concat(
+        [
+          { name = "ANCILLA_APP_ENV", value = var.app_env },
+          { name = "AWS_REGION", value = var.aws_region },
+          { name = "AWS_DEFAULT_REGION", value = var.aws_region },
+          { name = "BEDROCK_CHAT_MODEL_ID", value = var.bedrock_chat_model_id },
+          { name = "BEDROCK_CHAT_MODELS_JSON", value = jsonencode(var.bedrock_chat_models) },
+          { name = "BEDROCK_CHAT_MAX_TOKENS", value = tostring(var.bedrock_chat_max_tokens) },
+          { name = "BEDROCK_CHAT_TEMPERATURE", value = tostring(var.bedrock_chat_temperature) },
+          { name = "ANCILLA_SERVER_LOCAL_EMBED_MODEL", value = var.embedding_memory_model_id },
+          { name = "ANCILLA_SERVER_EMBEDDER_TIMEOUT_SECONDS", value = tostring(var.embedder_timeout_seconds) }
+        ],
+        var.embedder_enabled ? [
+          { name = "ANCILLA_SERVER_EMBEDDER_BASE_URL", value = local.embedder_private_url }
+        ] : []
+      )
       secrets = [
         {
           name      = "DATABASE_URL"

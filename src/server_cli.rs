@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use axum::serve;
@@ -9,9 +9,10 @@ use uuid::Uuid;
 use crate::{
     api,
     bedrock::build_chat_backend,
+    embedder_client::HttpEmbedder,
     model::{
-        ChatRespondRequest, CreateAudioEntryRequest, CreateTextEntryRequest, PatchMemoryRequest,
-        SearchMemoriesRequest, empty_object,
+        ChatRespondRequest, CreateAudioEntryRequest, CreateMemoryRequest, MemoryKind,
+        MemorySubtype, PatchMemoryRequest, SearchMemoriesRequest, empty_object,
     },
     server_config::ServerConfig,
     service::AppService,
@@ -40,6 +41,17 @@ pub enum Command {
         audio_asset: Option<String>,
         #[arg(long)]
         transcript: Option<String>,
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        #[arg(long, default_value = "cli")]
+        source_app: String,
+    },
+    Remember {
+        text: String,
+        #[arg(long, default_value = "semantic")]
+        kind: MemoryKind,
+        #[arg(long, default_value = "fact")]
+        subtype: MemorySubtype,
         #[arg(long, default_value = "UTC")]
         timezone: String,
         #[arg(long, default_value = "cli")]
@@ -86,6 +98,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Serve { .. }
         | Command::Capture { .. }
+        | Command::Remember { .. }
         | Command::Ask { .. }
         | Command::Timeline
         | Command::Review
@@ -103,10 +116,23 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let chat_backend: Arc<dyn crate::bedrock::ChatCompletionBackend> =
         build_chat_backend(&config).await?;
-    let service = AppService::load_with_chat_backend(
+    let embedder = if let Some(base_url) = config.embedder_base_url.clone() {
+        Some(Arc::new(
+            HttpEmbedder::new(
+                base_url,
+                Duration::from_secs(config.embedder_timeout_seconds as u64),
+            )
+            .context("failed to configure embedder client")?,
+        ) as Arc<dyn crate::embedder_client::Embedder>)
+    } else {
+        None
+    };
+    let service = AppService::load_with_chat_backend_and_embedder(
         snapshot_path,
         config.database_url.clone(),
         chat_backend,
+        embedder,
+        config.local_embed_model.clone(),
     )
     .await?;
 
@@ -122,18 +148,48 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             if let Some(text) = text {
                 print_json(
                     &service
-                        .create_text_entry(CreateTextEntryRequest {
-                            raw_text: text,
+                        .create_memory(CreateMemoryRequest {
+                            display_text: text,
+                            retrieval_text: None,
+                            kind: MemoryKind::Semantic,
+                            subtype: MemorySubtype::Fact,
                             captured_at: None,
                             timezone: Some(timezone),
                             source_app: Some(source_app),
-                            prepared_artifacts: Vec::new(),
-                            prepared_memories: Vec::new(),
+                            attrs: empty_object(),
+                            observed_at: None,
+                            valid_from: None,
+                            valid_to: None,
+                            confidence: None,
+                            salience: None,
+                            thread_title: None,
                             metadata: empty_object(),
                         })
                         .await?,
                 )
             } else if let Some(audio_asset) = audio_asset {
+                let prepared_memories = transcript
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| {
+                        vec![crate::model::PreparedMemoryInput {
+                            kind: MemoryKind::Semantic,
+                            subtype: MemorySubtype::Fact,
+                            display_text: value.trim().to_string(),
+                            retrieval_text: value.trim().to_string(),
+                            attrs: empty_object(),
+                            observed_at: None,
+                            valid_from: None,
+                            valid_to: None,
+                            confidence: None,
+                            salience: None,
+                            state: None,
+                            embedding: None,
+                            thread_title: None,
+                            source_artifact_ordinals: vec![0],
+                        }]
+                    })
+                    .unwrap_or_default();
                 print_json(
                     &service
                         .create_audio_entry(CreateAudioEntryRequest {
@@ -143,7 +199,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             timezone: Some(timezone),
                             source_app: Some(source_app),
                             prepared_artifacts: Vec::new(),
-                            prepared_memories: Vec::new(),
+                            prepared_memories,
                             metadata: empty_object(),
                         })
                         .await?,
@@ -152,6 +208,33 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 bail!("either --text or --audio-asset is required");
             }
         }
+        Command::Remember {
+            text,
+            kind,
+            subtype,
+            timezone,
+            source_app,
+        } => print_json(
+            &service
+                .create_memory(CreateMemoryRequest {
+                    display_text: text,
+                    retrieval_text: None,
+                    kind,
+                    subtype,
+                    captured_at: None,
+                    timezone: Some(timezone),
+                    source_app: Some(source_app),
+                    attrs: empty_object(),
+                    observed_at: None,
+                    valid_from: None,
+                    valid_to: None,
+                    confidence: None,
+                    salience: None,
+                    thread_title: None,
+                    metadata: empty_object(),
+                })
+                .await?,
+        ),
         Command::Ask { message } => print_json(
             &service
                 .chat_respond(ChatRespondRequest {
@@ -159,6 +242,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     model_id: None,
                     recent_turns: Vec::new(),
                     recent_context: None,
+                    conversation_id: None,
                     active_thread_id: None,
                     focus_from: None,
                     focus_to: None,
@@ -173,6 +257,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .search_memories(SearchMemoriesRequest {
                     query,
                     recent_context: None,
+                    conversation_id: None,
                     focus_from: None,
                     focus_to: None,
                     active_thread_id: None,

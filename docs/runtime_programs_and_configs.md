@@ -11,8 +11,9 @@ Responsibilities:
 - host the HTTP API
 - own persistence and retrieval logic
 - talk to Postgres, AWS, and Bedrock
+- optionally call a separate embedder service for live query and memory embeddings
 - own the curated chat model catalog and default model
-- provide local admin commands like `capture`, `timeline`, `review`, and `search`
+- provide local admin commands like `capture`, `remember`, `timeline`, `review`, and `search`
 
 Config file:
 
@@ -26,6 +27,7 @@ Responsibilities:
 
 - render the ratatui terminal UI
 - talk to a running server over HTTP
+- preview retrieval/context assembly without invoking the chat model
 - fetch the server-advertised model catalog and let the user pick from it
 - never read the database directly
 - never require AWS credentials or Bedrock settings
@@ -41,6 +43,7 @@ This program is local-only and points at either a local server or the deployed E
 The split is intentional:
 
 - server config owns storage, AWS, Bedrock, and embedding/runtime knobs
+- server config includes the optional `embedder_base_url` used for synchronous embeddings
 - server config also owns which chat models are available
 - client config owns only the remote server address
 
@@ -53,6 +56,7 @@ The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be ext
 - redeploying the server does not mutate client config
 - the deploy script prints the live task IP and leaves it to the operator to update `ancilla-client` if needed
 - ECS only needs the `ancilla-server` binary in the container image
+- the optional `ancilla-embedder` runtime is a separate service with its own image
 - local TUI testing only needs `base_url`
 
 ## Recommended Local Setup

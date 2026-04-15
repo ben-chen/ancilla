@@ -278,7 +278,7 @@ impl PostgresStore {
         );
 
         for trace in sqlx::query_as::<_, RetrievalTraceRow>(
-            "SELECT id, query_text, recent_context, active_thread_id, gate_decision, gate_confidence, gate_reason, final_context, created_at FROM retrieval_traces ORDER BY created_at",
+            "SELECT id, query_text, recent_context, active_thread_id, gate_decision, gate_confidence, gate_reason, final_context, request_metadata, created_at FROM retrieval_traces ORDER BY created_at",
         )
         .fetch_all(&self.pool)
         .await
@@ -710,7 +710,7 @@ async fn replace_artifact_embedding(
           active,
           created_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW())
         "#,
     )
     .bind(artifact.id)
@@ -728,7 +728,6 @@ async fn replace_artifact_embedding(
     .bind(Vector::from(canonicalize_embedding_values(
         &embedding.values,
     )))
-    .bind(artifact.created_at)
     .execute(tx.as_mut())
     .await
     .with_context(|| format!("failed to insert artifact embedding for {}", artifact.id))?;
@@ -890,7 +889,7 @@ async fn replace_memory_embedding(
           active,
           created_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW())
         "#,
     )
     .bind(memory.id)
@@ -908,7 +907,6 @@ async fn replace_memory_embedding(
     .bind(Vector::from(canonicalize_embedding_values(
         &embedding.values,
     )))
-    .bind(memory.created_at)
     .execute(tx.as_mut())
     .await
     .with_context(|| format!("failed to insert memory embedding for {}", memory.id))?;
@@ -1383,6 +1381,7 @@ struct RetrievalTraceRow {
     gate_confidence: Option<f64>,
     gate_reason: Option<String>,
     final_context: Option<String>,
+    request_metadata: Json<serde_json::Value>,
     created_at: DateTime<Utc>,
 }
 
@@ -1394,6 +1393,12 @@ impl TryFrom<RetrievalTraceRow> for RetrievalTrace {
             id: row.id,
             query: row.query_text,
             recent_context: row.recent_context,
+            conversation_id: row
+                .request_metadata
+                .0
+                .get("conversation_id")
+                .and_then(|value| value.as_str())
+                .and_then(|value| Uuid::parse_str(value).ok()),
             active_thread_id: row.active_thread_id,
             gate_decision: row
                 .gate_decision
@@ -1478,7 +1483,7 @@ mod tests {
             .write_with(|state| {
                 let entry = crate::model::Entry {
                     id: uuid::Uuid::new_v4(),
-                    kind: crate::model::EntryKind::TextJournal,
+                    kind: crate::model::EntryKind::Text,
                     raw_text: Some("hello".to_string()),
                     asset_ref: None,
                     captured_at: crate::model::now_utc(),
