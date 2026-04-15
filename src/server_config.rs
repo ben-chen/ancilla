@@ -587,26 +587,29 @@ pub(crate) fn pricing_for_chat_model_id(model_id: &str) -> Option<ChatModelPrici
             cache_write_1h_input_usd_per_million_tokens: None,
             cache_read_input_usd_per_million_tokens: None,
         }),
-        "us.anthropic.claude-sonnet-4-6" | "global.anthropic.claude-sonnet-4-6" => {
-            Some(anthropic_pricing(3.00, 15.00, 1.50, 7.50, 3.75, Some(6.00), 0.30))
-        }
-        "us.anthropic.claude-opus-4-6-v1" | "global.anthropic.claude-opus-4-6-v1" => {
-            Some(anthropic_pricing(5.00, 25.00, 2.50, 12.50, 6.25, Some(10.00), 0.50))
-        }
+        "us.anthropic.claude-sonnet-4-6" | "global.anthropic.claude-sonnet-4-6" => Some(
+            anthropic_pricing(3.00, 15.00, 1.50, 7.50, 3.75, Some(6.00), 0.30),
+        ),
+        "us.anthropic.claude-opus-4-6-v1" | "global.anthropic.claude-opus-4-6-v1" => Some(
+            anthropic_pricing(5.00, 25.00, 2.50, 12.50, 6.25, Some(10.00), 0.50),
+        ),
         "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        | "global.anthropic.claude-haiku-4-5-20251001-v1:0" => {
-            Some(anthropic_pricing(1.00, 5.00, 0.50, 2.50, 1.25, Some(2.00), 0.10))
-        }
-        "us.anthropic.claude-opus-4-5"
-        | "global.anthropic.claude-opus-4-5" => {
-            Some(anthropic_pricing(5.00, 25.00, 2.50, 12.50, 6.25, Some(10.00), 0.50))
-        }
-        "us.anthropic.claude-sonnet-4-5"
-        | "global.anthropic.claude-sonnet-4-5" => {
-            Some(anthropic_pricing(3.00, 15.00, 1.50, 7.50, 3.75, Some(6.00), 0.30))
-        }
-        "us.anthropic.claude-sonnet-4"
-        | "global.anthropic.claude-sonnet-4" => {
+        | "global.anthropic.claude-haiku-4-5-20251001-v1:0" => Some(anthropic_pricing(
+            1.00,
+            5.00,
+            0.50,
+            2.50,
+            1.25,
+            Some(2.00),
+            0.10,
+        )),
+        "us.anthropic.claude-opus-4-5" | "global.anthropic.claude-opus-4-5" => Some(
+            anthropic_pricing(5.00, 25.00, 2.50, 12.50, 6.25, Some(10.00), 0.50),
+        ),
+        "us.anthropic.claude-sonnet-4-5" | "global.anthropic.claude-sonnet-4-5" => Some(
+            anthropic_pricing(3.00, 15.00, 1.50, 7.50, 3.75, Some(6.00), 0.30),
+        ),
+        "us.anthropic.claude-sonnet-4" | "global.anthropic.claude-sonnet-4" => {
             Some(anthropic_pricing(3.00, 15.00, 1.50, 7.50, 3.75, None, 0.30))
         }
         _ => None,

@@ -17,8 +17,8 @@ use aws_sdk_bedrockruntime::{
     config::Token,
     types::{
         AutoToolChoice, ContentBlock, ConversationRole, InferenceConfiguration, Message,
-        SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-        ToolResultContentBlock, ToolSpecification, TokenUsage,
+        SystemContentBlock, TokenUsage, Tool, ToolChoice, ToolConfiguration, ToolInputSchema,
+        ToolResultBlock, ToolResultContentBlock, ToolSpecification,
     },
 };
 use aws_smithy_types::{Document, Number};
@@ -648,10 +648,8 @@ impl ChatCompletionBackend for BedrockChatBackend {
                     request.trace_id,
                 )
                 .await?;
-            metrics = LlmCallMetrics::merged(
-                metrics,
-                usage_metrics_for_model(model, response.usage()),
-            );
+            metrics =
+                LlmCallMetrics::merged(metrics, usage_metrics_for_model(model, response.usage()));
 
             let Some(output) = response.output() else {
                 bail!("bedrock converse response had no output")
@@ -1153,11 +1151,7 @@ fn usage_metrics_for_model(
     model: &ChatModelOption,
     usage: Option<&TokenUsage>,
 ) -> Option<LlmCallMetrics> {
-    usage_metrics_for_model_id(
-        &model.model_id,
-        model.pricing,
-        usage,
-    )
+    usage_metrics_for_model_id(&model.model_id, model.pricing, usage)
 }
 
 fn usage_metrics_for_model_id(
