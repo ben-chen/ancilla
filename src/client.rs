@@ -1,6 +1,5 @@
 use std::{
-    env, fs,
-    io,
+    env, fs, io,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -11,8 +10,8 @@ use crate::{
     model::{
         ApiErrorBody, AssembleContextRequest, AssembleContextResponse, CaptureEntryResponse,
         ChatModelOption, ChatModelsResponse, ChatRespondRequest, ChatResponse, ChatStreamEvent,
-        ConversationRole, ConversationTurn, Entry, EntryKind, GateDecision, LlmCallMetrics,
-        GenerateMemoriesRequest, MemoryKind, MemoryRecord, empty_object,
+        ConversationRole, ConversationTurn, Entry, EntryKind, GateDecision,
+        GenerateMemoriesRequest, LlmCallMetrics, MemoryKind, MemoryRecord, empty_object,
     },
 };
 use anyhow::{Context, bail};
@@ -45,9 +44,10 @@ const COLOR_SUCCESS: Color = Color::Rgb(125, 208, 138);
 const COLOR_ERROR: Color = Color::Rgb(255, 115, 115);
 
 pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> anyhow::Result<()> {
+    let mut persisted_config = config.clone();
     let base_url = resolve_base_url(base_url_override, config)?;
     let api = RemoteApi::new(base_url.clone(), config)?;
-    let mut app = ClientApp::new(base_url);
+    let mut app = ClientApp::new(base_url, config);
 
     app.refresh_remote_state(&api).await?;
 
@@ -93,6 +93,7 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                 let receiver = api.start_ask_stream(
                     &message,
                     model_id.as_deref(),
+                    app.selected_gate_model_id.as_deref(),
                     app.conversation_id,
                     &app.recent_turns,
                 );
@@ -101,11 +102,16 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
             ClientAction::SubmitAssemble(message) => {
                 app.set_info("Assembling retrieval context on remote service...");
                 let model_label = app
-                    .selected_model_label()
+                    .selected_gate_model_label()
                     .unwrap_or("server default")
                     .to_string();
                 match api
-                    .assemble_context(&message, None, None, &app.recent_turns)
+                    .assemble_context(
+                        &message,
+                        app.selected_gate_model_id.as_deref(),
+                        None,
+                        &app.recent_turns,
+                    )
                     .await
                 {
                     Ok(response) => {
@@ -145,7 +151,8 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
             }
             ClientAction::EditMemory(memory) => {
                 app.set_info(format!("Opening editor for \"{}\"...", memory.title));
-                if let Err(error) = edit_memory_in_editor(&mut terminal, &api, &mut app, memory).await
+                if let Err(error) =
+                    edit_memory_in_editor(&mut terminal, &api, &mut app, memory).await
                 {
                     app.set_request_error("Memory edit failed.", "Edit Error", error.to_string());
                 }
@@ -159,6 +166,19 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                         error.to_string(),
                     );
                 }
+            }
+        }
+
+        if app.needs_config_save {
+            app.needs_config_save = false;
+            persisted_config.selected_chat_model_id = app.selected_chat_model_id.clone();
+            persisted_config.selected_gate_model_id = app.selected_gate_model_id.clone();
+            if let Err(error) = persisted_config.save() {
+                app.set_request_error(
+                    "Updated model selection locally, but saving config failed.",
+                    "Config Save Error",
+                    error.to_string(),
+                );
             }
         }
     }
@@ -288,13 +308,14 @@ impl RemoteApi {
         &self,
         message: &str,
         model_id: Option<&str>,
+        gate_model_id: Option<&str>,
         conversation_id: Uuid,
         recent_turns: &[ConversationTurn],
     ) -> mpsc::Receiver<RemoteChatUpdate> {
         let request = ChatRespondRequest {
             message: message.to_string(),
             model_id: model_id.map(ToOwned::to_owned),
-            gate_model_id: None,
+            gate_model_id: gate_model_id.map(ToOwned::to_owned),
             recent_turns: recent_turns.to_vec(),
             recent_context: None,
             conversation_id: Some(conversation_id),
@@ -619,6 +640,12 @@ enum InputMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelPickerTarget {
+    Chat,
+    Gate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowseTab {
     Memories,
     Timeline,
@@ -668,17 +695,21 @@ struct ClientApp {
     chat_backend: String,
     chat_models: Vec<ChatModelOption>,
     model_state: ListState,
-    selected_model_id: Option<String>,
+    selected_chat_model_id: Option<String>,
+    selected_gate_model_id: Option<String>,
+    model_picker_target: ModelPickerTarget,
     running_gate_cost_usd: f64,
     running_chat_cost_usd: f64,
     pending_delete_memory_id: Option<Uuid>,
+    pending_quit_confirmation: bool,
     needs_browse_refresh: bool,
+    needs_config_save: bool,
     stream_receiver: Option<mpsc::Receiver<RemoteChatUpdate>>,
     active_stream: Option<ActiveChatStream>,
 }
 
 impl ClientApp {
-    fn new(base_url: String) -> Self {
+    fn new(base_url: String, config: &ClientConfig) -> Self {
         let mut memory_state = ListState::default();
         memory_state.select(Some(0));
         let mut timeline_state = ListState::default();
@@ -696,7 +727,7 @@ impl ClientApp {
             input: String::new(),
             response_title: "Response".to_string(),
             response_body:
-                "Press 's' to preview retrieval context, 'a' to ask the live service, or 'c' to capture a new memory. The memory browser is the default view; press Tab to switch to the raw timeline."
+                "Press 's' to preview retrieval context, 'a' to ask the live service, or 'c' to capture a new memory. Use 'm' for the chat model and 'g' for the gate model. The memory browser is the default view; press Tab to switch to the raw timeline."
                     .to_string(),
             status: StatusLine {
                 kind: StatusKind::Info,
@@ -706,11 +737,15 @@ impl ClientApp {
             chat_backend: "unknown".to_string(),
             chat_models: Vec::new(),
             model_state: ListState::default(),
-            selected_model_id: None,
+            selected_chat_model_id: config.selected_chat_model_id.clone(),
+            selected_gate_model_id: config.selected_gate_model_id.clone(),
+            model_picker_target: ModelPickerTarget::Chat,
             running_gate_cost_usd: 0.0,
             running_chat_cost_usd: 0.0,
             pending_delete_memory_id: None,
+            pending_quit_confirmation: false,
             needs_browse_refresh: false,
+            needs_config_save: false,
             stream_receiver: None,
             active_stream: None,
         }
@@ -775,16 +810,18 @@ impl ClientApp {
             self.chat_backend = "legacy".to_string();
             self.chat_models.clear();
             self.model_state.select(None);
-            self.selected_model_id = None;
+            self.selected_chat_model_id = None;
+            self.selected_gate_model_id = None;
         }
         Ok(())
     }
 
     fn apply_chat_models(&mut self, response: ChatModelsResponse) {
-        let current = self.selected_model_id.clone();
+        let current_chat = self.selected_chat_model_id.clone();
+        let current_gate = self.selected_gate_model_id.clone();
         self.chat_backend = response.backend;
         self.chat_models = response.models;
-        self.selected_model_id = current
+        self.selected_chat_model_id = current_chat
             .filter(|model_id| {
                 self.chat_models
                     .iter()
@@ -792,6 +829,11 @@ impl ClientApp {
             })
             .or(response.default_model_id)
             .or_else(|| self.chat_models.first().map(|model| model.model_id.clone()));
+        self.selected_gate_model_id = current_gate.filter(|model_id| {
+            self.chat_models
+                .iter()
+                .any(|model| &model.model_id == model_id)
+        });
         self.model_state.select(self.selected_model_index());
     }
 
@@ -894,7 +936,7 @@ impl ClientApp {
                                 .map(ToOwned::to_owned)
                                 .or(model_id)
                                 .unwrap_or_else(|| {
-                                    self.selected_model_label()
+                                    self.selected_chat_model_label()
                                         .unwrap_or("server default")
                                         .to_string()
                                 });
@@ -930,7 +972,7 @@ impl ClientApp {
                             format!("Q: {prompt}\n\n{error}")
                         };
                         let model_label = self
-                            .selected_model_label()
+                            .selected_chat_model_label()
                             .unwrap_or("server default")
                             .to_string();
                         self.set_request_error(
@@ -1006,8 +1048,20 @@ impl ClientApp {
         if key.code != KeyCode::Char('x') {
             self.pending_delete_memory_id = None;
         }
+        if key.code != KeyCode::Char('q') {
+            self.pending_quit_confirmation = false;
+        }
         match key.code {
-            KeyCode::Char('q') => ClientAction::Quit,
+            KeyCode::Char('q') => {
+                if self.pending_quit_confirmation {
+                    self.pending_quit_confirmation = false;
+                    ClientAction::Quit
+                } else {
+                    self.pending_quit_confirmation = true;
+                    self.set_info("Press 'q' again to quit.");
+                    ClientAction::None
+                }
+            }
             KeyCode::Char('r') => ClientAction::Refresh,
             KeyCode::Tab | KeyCode::Char('v') => {
                 self.toggle_browse_tab();
@@ -1036,9 +1090,22 @@ impl ClientApp {
                     self.set_error("No remote model catalog is available on this server.");
                 } else {
                     self.mode = InputMode::ModelPicker;
+                    self.model_picker_target = ModelPickerTarget::Chat;
                     self.model_state
                         .select(self.selected_model_index().or(Some(0)));
-                    self.set_info("Model picker. Use j/k and Enter.");
+                    self.set_info("Chat model picker. Use j/k and Enter.");
+                }
+                ClientAction::None
+            }
+            KeyCode::Char('g') => {
+                if self.chat_models.is_empty() {
+                    self.set_error("No remote model catalog is available on this server.");
+                } else {
+                    self.mode = InputMode::ModelPicker;
+                    self.model_picker_target = ModelPickerTarget::Gate;
+                    self.model_state
+                        .select(self.selected_model_index().or(Some(0)));
+                    self.set_info("Gate model picker. Use j/k and Enter.");
                 }
                 ClientAction::None
             }
@@ -1082,7 +1149,7 @@ impl ClientApp {
                 self.select_previous();
                 ClientAction::None
             }
-            KeyCode::Home | KeyCode::Char('g') => {
+            KeyCode::Home => {
                 self.select_first();
                 ClientAction::None
             }
@@ -1113,12 +1180,12 @@ impl ClientApp {
                     match submit_mode {
                         InputMode::Ask => ClientAction::SubmitAsk {
                             message: input,
-                            model_id: self.selected_model_id.clone(),
+                            model_id: self.selected_chat_model_id.clone(),
                         },
                         InputMode::ContextPreview => ClientAction::SubmitAssemble(input),
                         InputMode::Capture => ClientAction::SubmitCapture {
                             text: input,
-                            model_id: self.selected_model_id.clone(),
+                            model_id: self.selected_chat_model_id.clone(),
                         },
                         InputMode::Normal | InputMode::ModelPicker => ClientAction::None,
                     }
@@ -1150,9 +1217,18 @@ impl ClientApp {
                 if let Some(index) = self.model_state.selected()
                     && let Some(model) = self.chat_models.get(index)
                 {
-                    self.selected_model_id = Some(model.model_id.clone());
+                    match self.model_picker_target {
+                        ModelPickerTarget::Chat => {
+                            self.selected_chat_model_id = Some(model.model_id.clone());
+                            self.set_success(format!("Selected chat model {}.", model.label));
+                        }
+                        ModelPickerTarget::Gate => {
+                            self.selected_gate_model_id = Some(model.model_id.clone());
+                            self.set_success(format!("Selected gate model {}.", model.label));
+                        }
+                    }
+                    self.needs_config_save = true;
                     self.mode = InputMode::Normal;
-                    self.set_success(format!("Selected {}.", model.label));
                 }
                 ClientAction::None
             }
@@ -1317,15 +1393,25 @@ impl ClientApp {
     }
 
     fn selected_model_index(&self) -> Option<usize> {
-        self.selected_model_id.as_deref().and_then(|selected| {
+        let selected = match self.model_picker_target {
+            ModelPickerTarget::Chat => self.selected_chat_model_id.as_deref(),
+            ModelPickerTarget::Gate => self.selected_gate_model_id.as_deref(),
+        };
+        selected.and_then(|selected| {
             self.chat_models
                 .iter()
                 .position(|model| model.model_id == selected)
         })
     }
 
-    fn selected_model_label(&self) -> Option<&str> {
-        self.selected_model_id
+    fn selected_chat_model_label(&self) -> Option<&str> {
+        self.selected_chat_model_id
+            .as_deref()
+            .and_then(|selected| self.model_label(selected))
+    }
+
+    fn selected_gate_model_label(&self) -> Option<&str> {
+        self.selected_gate_model_id
             .as_deref()
             .and_then(|selected| self.model_label(selected))
     }
@@ -1543,8 +1629,14 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
             Span::raw("  "),
             Span::styled(
                 format!(
-                    "model {}",
-                    app.selected_model_label()
+                    "chat {}  gate {}",
+                    app.selected_chat_model_label()
+                        .unwrap_or(match app.chat_backend.as_str() {
+                            "synthetic" => "synthetic",
+                            "legacy" => "server default",
+                            _ => "server default",
+                        }),
+                    app.selected_gate_model_label()
                         .unwrap_or(match app.chat_backend.as_str() {
                             "synthetic" => "synthetic",
                             "legacy" => "server default",
@@ -1555,7 +1647,7 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
             ),
         ]),
         Line::from(vec![Span::styled(
-            "Browse durable memories by default, switch to the raw timeline with Tab, preview retrieval, ask live questions, capture entries, and switch models.",
+            "Browse durable memories by default, switch to the raw timeline with Tab, preview retrieval, ask live questions, capture entries, and switch chat/gate models.",
             Style::default().fg(COLOR_MUTED),
         )]),
     ])
@@ -1864,12 +1956,25 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
         ]),
         InputMode::ModelPicker => Text::from(vec![
             Line::from(Span::styled(
-                "Choose the model for future ask requests. Press Enter to confirm.",
+                match app.model_picker_target {
+                    ModelPickerTarget::Chat => {
+                        "Choose the model for future ask requests. Press Enter to confirm."
+                    }
+                    ModelPickerTarget::Gate => {
+                        "Choose the model used for memory gating and retrieval decisions. Press Enter to confirm."
+                    }
+                },
                 Style::default().fg(COLOR_TEXT),
             )),
             Line::from(Span::styled(
-                app.selected_model_label()
-                    .unwrap_or("No model selected yet."),
+                match app.model_picker_target {
+                    ModelPickerTarget::Chat => app
+                        .selected_chat_model_label()
+                        .unwrap_or("No chat model selected yet."),
+                    ModelPickerTarget::Gate => app
+                        .selected_gate_model_label()
+                        .unwrap_or("No gate model selected yet."),
+                },
                 Style::default().fg(COLOR_ACCENT),
             )),
         ]),
@@ -1905,11 +2010,17 @@ fn draw_model_picker(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut Clien
                 model.label.clone(),
                 Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
             )];
-            if app
-                .selected_model_id
-                .as_deref()
-                .is_some_and(|selected| selected == model.model_id)
-            {
+            let is_active = match app.model_picker_target {
+                ModelPickerTarget::Chat => app
+                    .selected_chat_model_id
+                    .as_deref()
+                    .is_some_and(|selected| selected == model.model_id),
+                ModelPickerTarget::Gate => app
+                    .selected_gate_model_id
+                    .as_deref()
+                    .is_some_and(|selected| selected == model.model_id),
+            };
+            if is_active {
                 first_line.push(Span::raw("  "));
                 first_line.push(Span::styled(
                     "ACTIVE",
@@ -1970,7 +2081,10 @@ fn draw_model_picker(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut Clien
     let list = List::new(items)
         .block(
             Block::bordered()
-                .title(" Model Picker ")
+                .title(match app.model_picker_target {
+                    ModelPickerTarget::Chat => " Chat Model Picker ",
+                    ModelPickerTarget::Gate => " Gate Model Picker ",
+                })
                 .title_style(
                     Style::default()
                         .fg(COLOR_ACCENT)
@@ -2264,7 +2378,11 @@ fn resolve_editor() -> String {
     env::var("VISUAL")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| env::var("EDITOR").ok().filter(|value| !value.trim().is_empty()))
+        .or_else(|| {
+            env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .unwrap_or_else(|| "vi".to_string())
 }
 
@@ -2274,11 +2392,7 @@ fn temp_memory_edit_path(memory_id: Uuid) -> PathBuf {
 
 fn editor_command(path: &Path) -> Command {
     let editor = resolve_editor();
-    let command = format!(
-        "{} {}",
-        editor,
-        shell_single_quote(&path.to_string_lossy())
-    );
+    let command = format!("{} {}", editor, shell_single_quote(&path.to_string_lossy()));
     let mut child = Command::new("sh");
     child.arg("-lc").arg(command);
     child
@@ -2287,6 +2401,7 @@ fn editor_command(path: &Path) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_config::ClientConfig;
     use crate::memory_markdown::markdown_from_plain_text;
     use crate::model::{ChatThinkingMode, GateDecision, MemoryState, ScoredMemory, now_utc};
     use ratatui::{Terminal, backend::TestBackend};
@@ -2302,21 +2417,57 @@ mod tests {
     fn ctrl_c_quits_from_any_mode() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         assert!(matches!(app.handle_key(key), ClientAction::Quit));
 
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         app.mode = InputMode::Ask;
         assert!(matches!(app.handle_key(key), ClientAction::Quit));
 
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         app.mode = InputMode::ModelPicker;
         assert!(matches!(app.handle_key(key), ClientAction::Quit));
     }
 
     #[test]
+    fn q_requires_confirmation_before_quit() {
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let mut app = test_app();
+
+        assert!(matches!(app.handle_key(key), ClientAction::None));
+        assert!(app.pending_quit_confirmation);
+        assert_eq!(app.status.message, "Press 'q' again to quit.");
+
+        assert!(matches!(app.handle_key(key), ClientAction::Quit));
+        assert!(!app.pending_quit_confirmation);
+    }
+
+    #[test]
+    fn non_quit_key_cancels_pending_quit_confirmation() {
+        let mut app = test_app();
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            ClientAction::None
+        ));
+        assert!(app.pending_quit_confirmation);
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            ClientAction::None
+        ));
+        assert!(!app.pending_quit_confirmation);
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            ClientAction::None
+        ));
+        assert!(app.pending_quit_confirmation);
+    }
+
+    #[test]
     fn ask_mode_renders_full_input_line() {
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         app.mode = InputMode::Ask;
         app.input = "what language do i like".to_string();
 
@@ -2327,7 +2478,7 @@ mod tests {
 
     #[test]
     fn capture_mode_renders_full_input_line() {
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         app.mode = InputMode::Capture;
         app.input = "I want to remember this long sentence.".to_string();
 
@@ -2338,7 +2489,7 @@ mod tests {
 
     #[test]
     fn context_mode_renders_full_input_line() {
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         app.mode = InputMode::ContextPreview;
         app.input = "What am I building right now?".to_string();
 
@@ -2349,7 +2500,7 @@ mod tests {
 
     #[test]
     fn memory_browser_is_the_default_view() {
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
 
         let screen = render_screen(&mut app);
 
@@ -2390,7 +2541,7 @@ mod tests {
 
     #[test]
     fn context_preview_formats_selected_memories_and_candidates() {
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         let memory = sample_memory("You are building Ancilla.", &["project"]);
         app.set_context_preview(
             "What am I building?".to_string(),
@@ -2456,7 +2607,7 @@ mod tests {
 
     #[test]
     fn request_error_updates_status_and_response_pane() {
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         app.set_request_error(
             "Chat request failed for Kimi K2.5.",
             "Chat Error [Kimi K2.5]",
@@ -2495,7 +2646,7 @@ mod tests {
     #[test]
     fn draining_stream_events_updates_response_incrementally() {
         let trace_id = Uuid::new_v4();
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         app.apply_chat_models(ChatModelsResponse {
             backend: "bedrock".to_string(),
             default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
@@ -2551,7 +2702,7 @@ mod tests {
     #[test]
     fn stream_events_accumulate_gate_and_chat_costs() {
         let trace_id = Uuid::new_v4();
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         let (tx, rx) = mpsc::channel(8);
         app.begin_chat_stream("What am I building?".to_string(), rx);
 
@@ -2612,7 +2763,7 @@ mod tests {
 
     #[test]
     fn apply_chat_models_preserves_explicit_selection_in_mixed_catalog() {
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let mut app = test_app();
         let models = vec![
             ChatModelOption {
                 label: "Kimi K2.5".to_string(),
@@ -2648,7 +2799,7 @@ mod tests {
             default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
             models: models.clone(),
         });
-        app.selected_model_id = Some("us.anthropic.claude-opus-4-6-v1".to_string());
+        app.selected_chat_model_id = Some("us.anthropic.claude-opus-4-6-v1".to_string());
 
         app.apply_chat_models(ChatModelsResponse {
             backend: "bedrock".to_string(),
@@ -2657,11 +2808,69 @@ mod tests {
         });
 
         assert_eq!(
-            app.selected_model_id.as_deref(),
+            app.selected_chat_model_id.as_deref(),
             Some("us.anthropic.claude-opus-4-6-v1")
         );
-        assert_eq!(app.selected_model_label(), Some("Claude Opus 4.6"));
+        assert_eq!(app.selected_chat_model_label(), Some("Claude Opus 4.6"));
         assert_eq!(app.selected_model_index(), Some(2));
+    }
+
+    #[test]
+    fn apply_chat_models_preserves_explicit_gate_selection() {
+        let mut app = test_app();
+        let models = vec![
+            ChatModelOption {
+                label: "Kimi K2.5".to_string(),
+                model_id: "moonshotai.kimi-k2.5".to_string(),
+                description: None,
+                thinking_mode: None,
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+                pricing: None,
+            },
+            ChatModelOption {
+                label: "Claude Haiku 4.5".to_string(),
+                model_id: "us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+                description: None,
+                thinking_mode: Some(ChatThinkingMode::Adaptive),
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+                pricing: None,
+            },
+        ];
+
+        app.apply_chat_models(ChatModelsResponse {
+            backend: "bedrock".to_string(),
+            default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            models: models.clone(),
+        });
+        app.selected_gate_model_id =
+            Some("us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string());
+
+        app.apply_chat_models(ChatModelsResponse {
+            backend: "bedrock".to_string(),
+            default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            models,
+        });
+
+        assert_eq!(
+            app.selected_gate_model_id.as_deref(),
+            Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+        );
+        assert_eq!(app.selected_gate_model_label(), Some("Claude Haiku 4.5"));
+    }
+
+    fn test_app() -> ClientApp {
+        ClientApp::new(
+            "http://example.test:3000".to_string(),
+            &ClientConfig {
+                base_url: "http://example.test:3000".to_string(),
+                basic_auth_username: None,
+                basic_auth_password: None,
+                selected_chat_model_id: None,
+                selected_gate_model_id: None,
+            },
+        )
     }
 
     fn render_screen(app: &mut ClientApp) -> String {

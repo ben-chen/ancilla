@@ -17,6 +17,9 @@ use crate::model::{
     Artifact, AssembleContextRequest, EmbeddingVector, Entry, GateDecision, MemoryRecord,
     PersistedState, ProfileBlock, RetrievalTrace, RetrievalTraceCandidate, ScoredMemory, Thread,
 };
+use crate::retrieval::build_query_material;
+
+const HYBRID_MEMORY_CANDIDATES_SQL: &str = include_str!("../sql/hybrid_memory_candidates.sql");
 
 #[derive(Clone, Debug)]
 pub struct SharedStore {
@@ -98,8 +101,46 @@ impl SharedStore {
         now: DateTime<Utc>,
         state: &PersistedState,
     ) -> anyhow::Result<Option<Vec<ScoredMemory>>> {
-        let _ = (request, limit, now, state);
-        Ok(None)
+        let PersistBackend::Postgres(store) = &self.backend else {
+            return Ok(None);
+        };
+
+        let banned_memory_ids = request
+            .conversation_id
+            .map(|conversation_id| {
+                state
+                    .retrieval_traces
+                    .values()
+                    .filter(|trace| trace.conversation_id == Some(conversation_id))
+                    .flat_map(|trace| trace.selected_memory_ids.iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let query_material = build_query_material(request, &state.threads);
+        let query_embedding = request
+            .query_embedding
+            .as_ref()
+            .map(|embedding| Vector::from(canonicalize_embedding_values(&embedding.values)));
+
+        let rows = sqlx::query_as::<_, SearchCandidateRow>(HYBRID_MEMORY_CANDIDATES_SQL)
+            .bind(query_material)
+            .bind(query_embedding)
+            .bind(now)
+            .bind(request.focus_from)
+            .bind(request.focus_to)
+            .bind(banned_memory_ids)
+            .bind(i32::try_from(limit).context("search limit exceeds i32")?)
+            .fetch_all(&store.pool)
+            .await
+            .with_context(|| "failed to search memory candidates in postgres")?;
+
+        let candidates = rows
+            .into_iter()
+            .map(ScoredMemory::try_from)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(Some(candidates))
     }
 
     pub async fn write_with<R>(
@@ -1251,6 +1292,89 @@ impl MemoryEmbeddingRow {
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned),
         }
+    }
+}
+
+#[derive(FromRow)]
+struct SearchCandidateRow {
+    id: Uuid,
+    lineage_id: Uuid,
+    kind: String,
+    title: String,
+    tags: Vec<String>,
+    content_markdown: String,
+    search_text: String,
+    attrs: Json<serde_json::Value>,
+    observed_at: Option<DateTime<Utc>>,
+    valid_from: DateTime<Utc>,
+    valid_to: Option<DateTime<Utc>>,
+    state: String,
+    thread_id: Option<Uuid>,
+    parent_id: Option<Uuid>,
+    path: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    source_artifact_ids: Vec<Uuid>,
+    semantic_rank: Option<i64>,
+    lexical_rank: Option<i64>,
+    semantic_score: f64,
+    lexical_score: f64,
+    fusion_score: f64,
+    temporal_bonus: f64,
+    thread_bonus: f64,
+    salience_bonus: f64,
+    confidence_bonus: f64,
+    reinjection_penalty: f64,
+    stale_penalty: f64,
+    final_score: f64,
+    prior_injected: bool,
+    candidate_rank: i64,
+}
+
+impl TryFrom<SearchCandidateRow> for ScoredMemory {
+    type Error = anyhow::Error;
+
+    fn try_from(row: SearchCandidateRow) -> Result<Self, Self::Error> {
+        let memory = MemoryRecord {
+            id: row.id,
+            lineage_id: row.lineage_id,
+            kind: parse_enum(&row.kind)?,
+            title: row.title,
+            tags: row.tags,
+            content_markdown: row.content_markdown,
+            search_text: row.search_text,
+            attrs: row.attrs.0,
+            observed_at: row.observed_at,
+            valid_from: row.valid_from,
+            valid_to: row.valid_to,
+            state: parse_enum(&row.state)?,
+            embedding: None,
+            source_artifact_ids: row.source_artifact_ids,
+            thread_id: row.thread_id,
+            parent_id: row.parent_id,
+            path: row.path,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        };
+
+        let _ = (row.semantic_rank, row.lexical_rank);
+
+        Ok(ScoredMemory {
+            memory,
+            semantic_score: row.semantic_score as f32,
+            lexical_score: row.lexical_score as f32,
+            fusion_score: row.fusion_score as f32,
+            temporal_bonus: row.temporal_bonus as f32,
+            thread_bonus: row.thread_bonus as f32,
+            salience_bonus: row.salience_bonus as f32,
+            confidence_bonus: row.confidence_bonus as f32,
+            reinjection_penalty: row.reinjection_penalty as f32,
+            stale_penalty: row.stale_penalty as f32,
+            final_score: row.final_score as f32,
+            prior_injected: row.prior_injected,
+            candidate_rank: usize::try_from(row.candidate_rank)
+                .context("candidate rank exceeds usize")?,
+        })
     }
 }
 

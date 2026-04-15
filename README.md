@@ -341,7 +341,7 @@ The server and client interact like this:
 - `cargo run --bin ancilla-server -- serve ...` exposes the HTTP API locally
 - `cargo run --bin ancilla-client --` talks to whatever `base_url` points at
 - `curl http://127.0.0.1:3000/...` talks to your local server process
-- `curl http://ancillabot.com/...` talks to the deployed AWS service once the Route 53 domain and ACM validation have propagated
+- `curl https://api.ancillabot.com/...` talks to the deployed AWS service once the Route 53 domain and ACM validation have propagated
 - `curl http://$ALB_DNS/...` talks to the deployed AWS service immediately after ALB creation, before the custom domain resolves everywhere
 
 Local development example:
@@ -360,7 +360,7 @@ curl -X POST http://127.0.0.1:3000/v1/memories \
 Deployed service example:
 
 ```bash
-APP_URL=https://ancillabot.com
+APP_URL=https://api.ancillabot.com
 
 cargo run --bin ancilla-client -- --base-url "$APP_URL"
 curl "$APP_URL/healthz"

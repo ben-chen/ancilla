@@ -412,10 +412,10 @@ impl AppService {
 
         let memories = self
             .persist_memories_without_entry(
-            prepared_memories,
-            &format!("tool/remember_current_conversation/{}", Uuid::new_v4()),
-        )
-        .await?;
+                prepared_memories,
+                &format!("tool/remember_current_conversation/{}", Uuid::new_v4()),
+            )
+            .await?;
         Ok(RememberCurrentConversationResult {
             memories,
             metrics: extraction.metrics,
@@ -461,16 +461,24 @@ impl AppService {
             .or(assemble_request.query_embedding);
 
         let search_limit = request.limit.unwrap_or(20);
-        let mut candidates = rank_memories(
-            SearchEnvironment {
-                memories: &state.memories,
-                threads: &state.threads,
-                retrieval_traces: &state.retrieval_traces,
-            },
-            &assemble_request,
-            search_limit,
-            now,
-        );
+        let mut candidates = if let Some(candidates) = self
+            .store
+            .search_candidates(&assemble_request, search_limit, now, &state)
+            .await?
+        {
+            candidates
+        } else {
+            rank_memories(
+                SearchEnvironment {
+                    memories: &state.memories,
+                    threads: &state.threads,
+                    retrieval_traces: &state.retrieval_traces,
+                },
+                &assemble_request,
+                search_limit,
+                now,
+            )
+        };
 
         if let Some(kind) = request.kind {
             candidates.retain(|candidate| candidate.memory.kind == kind);
@@ -491,21 +499,28 @@ impl AppService {
             .hydrate_query_embedding(&request)
             .await?
             .or(request.query_embedding);
-        let candidates = rank_memories(
-            SearchEnvironment {
-                memories: &state.memories,
-                threads: &state.threads,
-                retrieval_traces: &state.retrieval_traces,
-            },
-            &request,
-            max_candidates,
-            now,
-        );
+        let candidates = if let Some(candidates) = self
+            .store
+            .search_candidates(&request, max_candidates, now, &state)
+            .await?
+        {
+            candidates
+        } else {
+            rank_memories(
+                SearchEnvironment {
+                    memories: &state.memories,
+                    threads: &state.threads,
+                    retrieval_traces: &state.retrieval_traces,
+                },
+                &request,
+                max_candidates,
+                now,
+            )
+        };
         let gate = self
             .gate_candidates(&request, &candidates, max_injected)
             .await?;
-        let context =
-            build_context_bundle(&gate.result.selected, &state.entries, &state.artifacts);
+        let context = build_context_bundle(&gate.result.selected, &state.entries, &state.artifacts);
         let recent_context =
             collapse_recent_context(&request.recent_turns, request.recent_context.clone());
         let trace = build_trace(
@@ -657,10 +672,8 @@ impl AppService {
                 &tool_executor,
             )
             .await?;
-        let chat_metrics = LlmCallMetrics::merged(
-            completion.metrics,
-            tool_executor.take_llm_metrics().await,
-        );
+        let chat_metrics =
+            LlmCallMetrics::merged(completion.metrics, tool_executor.take_llm_metrics().await);
 
         self.store
             .write_with(|state| {

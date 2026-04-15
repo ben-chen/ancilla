@@ -58,6 +58,7 @@ That keeps the fixed AWS baseline much lower than the original NAT + Aurora setu
 Set these variables in `terraform.tfvars` when you want a custom hostname:
 
 - `domain_name = "ancillabot.com"`
+- `create_api_record = true` if you want `api.ancillabot.com` for the API
 - `create_www_record = true` if you also want `www.ancillabot.com`
 - `enable_https_listener = false` for the first apply
 - `basic_auth_enabled = true` if you want simple auth on the public API

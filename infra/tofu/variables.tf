@@ -102,6 +102,12 @@ variable "create_www_record" {
   default     = true
 }
 
+variable "create_api_record" {
+  description = "When true and domain_name is set, also create api.<domain_name> pointing at the ALB."
+  type        = bool
+  default     = true
+}
+
 variable "enable_https_listener" {
   description = "When true, wait for ACM DNS validation and create an HTTPS listener plus HTTP->HTTPS redirect."
   type        = bool

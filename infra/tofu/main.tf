@@ -47,7 +47,12 @@ locals {
   embedder_private_url   = var.embedder_enabled ? "http://${aws_instance.embedder[0].private_ip}:${var.embedder_port}" : null
   domain_enabled         = var.domain_name != null && trimspace(var.domain_name) != ""
   domain_name            = local.domain_enabled ? trimspace(var.domain_name) : null
-  app_hostnames          = local.domain_enabled ? concat([local.domain_name], var.create_www_record ? ["www.${local.domain_name}"] : []) : []
+  api_hostname           = local.domain_enabled && var.create_api_record ? "api.${local.domain_name}" : null
+  app_hostnames = local.domain_enabled ? concat(
+    [local.domain_name],
+    var.create_www_record ? ["www.${local.domain_name}"] : [],
+    var.create_api_record ? ["api.${local.domain_name}"] : [],
+  ) : []
   tags = {
     Project     = "ancilla"
     Environment = var.app_env
@@ -127,7 +132,10 @@ resource "aws_s3_bucket_public_access_block" "assets" {
 resource "aws_acm_certificate" "app" {
   count                     = local.domain_enabled ? 1 : 0
   domain_name               = local.domain_name
-  subject_alternative_names = var.create_www_record ? ["www.${local.domain_name}"] : []
+  subject_alternative_names = concat(
+    var.create_www_record ? ["www.${local.domain_name}"] : [],
+    var.create_api_record ? ["api.${local.domain_name}"] : [],
+  )
   validation_method         = "DNS"
 
   lifecycle {

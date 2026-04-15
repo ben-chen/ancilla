@@ -9,6 +9,7 @@ public_subnet_cidrs     = ["10.42.0.0/24", "10.42.1.0/24"]
 private_app_subnet_cidrs = ["10.42.10.0/24", "10.42.11.0/24"] # reserved for future private services
 private_db_subnet_cidrs  = ["10.42.20.0/24", "10.42.21.0/24"]
 domain_name              = "ancillabot.com"
+create_api_record        = true
 enable_https_listener    = false
 basic_auth_enabled       = false
 basic_auth_username      = "ancilla"

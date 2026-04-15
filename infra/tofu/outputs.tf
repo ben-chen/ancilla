@@ -48,9 +48,14 @@ output "app_hostnames" {
   value       = local.app_hostnames
 }
 
+output "api_hostname" {
+  description = "Preferred API hostname when api.<domain_name> is enabled."
+  value       = local.api_hostname
+}
+
 output "app_url" {
   description = "Primary public URL for Ancilla when a domain is configured."
-  value       = local.domain_enabled ? format("%s://%s", var.enable_https_listener ? "https" : "http", local.domain_name) : null
+  value       = local.domain_enabled ? format("%s://%s", var.enable_https_listener ? "https" : "http", coalesce(local.api_hostname, local.domain_name)) : null
 }
 
 output "basic_auth_enabled" {
