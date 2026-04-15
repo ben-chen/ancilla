@@ -1000,23 +1000,8 @@ fn memory_draft_from_prepared(prepared: PreparedMemoryInput) -> MemoryDraft {
 }
 
 fn build_query_embedding_text(request: &AssembleContextRequest) -> String {
-    let mut parts = Vec::new();
-    if let Some(recent_context) = request.recent_context.as_deref()
-        && !recent_context.trim().is_empty()
-    {
-        parts.push(recent_context.trim().to_string());
-    }
-    for turn in &request.recent_turns {
-        if !turn.text.trim().is_empty() {
-            parts.push(format!("{:?}: {}", turn.role, turn.text.trim()));
-        }
-    }
-    if !request.query.trim().is_empty() {
-        parts.push(format!("User: {}", request.query.trim()));
-    }
-
-    let tokens = parts
-        .join("\n")
+    let tokens = request
+        .query
         .split_whitespace()
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
@@ -1114,7 +1099,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::memory_markdown::markdown_from_plain_text;
-    use crate::model::{GateDecision, ProfileLabel, SearchMemoriesRequest};
+    use crate::model::{ConversationTurn, GateDecision, ProfileLabel, SearchMemoriesRequest};
 
     use super::*;
 
@@ -1126,6 +1111,37 @@ mod tests {
                 .map(|tag| (*tag).to_string())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn query_embedding_text_uses_only_current_query() {
+        let request = AssembleContextRequest {
+            query: "What am I building right now?".to_string(),
+            recent_turns: vec![
+                ConversationTurn {
+                    role: ConversationRole::User,
+                    text: "Tell me about my infrastructure preferences.".to_string(),
+                },
+                ConversationTurn {
+                    role: ConversationRole::Assistant,
+                    text: "You prefer simple AWS building blocks.".to_string(),
+                },
+            ],
+            recent_context: Some("Project: Ancilla".to_string()),
+            gate_model_id: None,
+            conversation_id: Some(Uuid::new_v4()),
+            active_thread_id: None,
+            focus_from: None,
+            focus_to: None,
+            query_embedding: None,
+            max_candidates: Some(10),
+            max_injected: Some(3),
+        };
+
+        assert_eq!(
+            build_query_embedding_text(&request),
+            "What am I building right now?"
+        );
     }
 
     #[derive(Clone, Default)]

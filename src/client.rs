@@ -1810,7 +1810,7 @@ fn selected_memory_text(memory: Option<&MemoryRecord>) -> Text<'static> {
         ]);
     };
 
-    Text::from(vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Kind: ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
@@ -1870,11 +1870,15 @@ fn selected_memory_text(memory: Option<&MemoryRecord>) -> Text<'static> {
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )),
+    ];
+    lines.extend(memory.content_markdown.split('\n').map(|line| {
         Line::from(Span::styled(
-            memory.content_markdown.clone(),
+            line.to_string(),
             Style::default().fg(COLOR_TEXT),
-        )),
-    ])
+        ))
+    }));
+
+    Text::from(lines)
 }
 
 fn selected_entry_text(entry: Option<&Entry>) -> Text<'static> {
@@ -2116,6 +2120,29 @@ mod tests {
                 .contains("semantic [project]: You are building Ancilla.")
         );
         assert!(app.response_body.contains("Top candidates"));
+    }
+
+    #[test]
+    fn selected_memory_text_preserves_markdown_blank_lines() {
+        let memory = sample_memory("Building Ancilla", &["project", "memory"]);
+        let text = selected_memory_text(Some(&memory));
+        let rendered = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        let title_index = rendered
+            .iter()
+            .position(|line| line == "# Building Ancilla")
+            .expect("markdown title should be rendered");
+        assert_eq!(rendered[title_index + 1], "");
+        assert_eq!(rendered[title_index + 2], "Tags: project, memory");
     }
 
     #[test]
