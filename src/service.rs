@@ -6,7 +6,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    bedrock::{ChatCompletionBackend, ChatCompletionRequest, SyntheticChatBackend},
+    bedrock::{
+        ChatCompletionBackend, ChatCompletionRequest, ContextGateBackend, ContextGateRequest,
+        ContextGateResult, SyntheticChatBackend,
+    },
     embedder_client::Embedder,
     model::{
         Artifact, ArtifactKind, AssembleContextRequest, AssembleContextResponse,
@@ -18,8 +21,8 @@ use crate::{
         ThreadStatus, empty_object, now_utc,
     },
     retrieval::{
-        SearchEnvironment, build_context_bundle, build_trace, gate_candidates, rank_memories,
-        rebuild_profile_blocks,
+        SearchEnvironment, build_context_bundle, build_trace,
+        gate_candidates as deterministic_gate_candidates, rank_memories, rebuild_profile_blocks,
     },
     store::SharedStore,
 };
@@ -28,6 +31,7 @@ use crate::{
 pub struct AppService {
     store: SharedStore,
     chat_backend: Arc<dyn ChatCompletionBackend>,
+    gate_backend: Option<Arc<dyn ContextGateBackend>>,
     embedder: Option<Arc<dyn Embedder>>,
     embedding_model: String,
 }
@@ -60,6 +64,7 @@ impl AppService {
             database_url,
             Arc::new(SyntheticChatBackend),
             None,
+            None,
             "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
         )
         .await
@@ -75,6 +80,7 @@ impl AppService {
             database_url,
             chat_backend,
             None,
+            None,
             "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
         )
         .await
@@ -84,6 +90,7 @@ impl AppService {
         snapshot_path: Option<PathBuf>,
         database_url: Option<String>,
         chat_backend: Arc<dyn ChatCompletionBackend>,
+        gate_backend: Option<Arc<dyn ContextGateBackend>>,
         embedder: Option<Arc<dyn Embedder>>,
         embedding_model: String,
     ) -> anyhow::Result<Self> {
@@ -91,6 +98,7 @@ impl AppService {
         Ok(Self {
             store,
             chat_backend,
+            gate_backend,
             embedder,
             embedding_model,
         })
@@ -104,6 +112,7 @@ impl AppService {
         Self {
             store: SharedStore::new_in_memory(),
             chat_backend,
+            gate_backend: None,
             embedder: None,
             embedding_model: "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
         }
@@ -229,6 +238,7 @@ impl AppService {
             query: request.query,
             recent_turns: Vec::new(),
             recent_context: request.recent_context,
+            gate_model_id: None,
             conversation_id: request.conversation_id,
             active_thread_id: request.active_thread_id,
             focus_from: request.focus_from,
@@ -286,7 +296,9 @@ impl AppService {
             max_candidates,
             now,
         );
-        let gate = gate_candidates(&candidates, max_injected);
+        let gate = self
+            .gate_candidates(&request, &candidates, max_injected)
+            .await?;
         let context = build_context_bundle(&gate.selected, &state.entries, &state.artifacts);
         let recent_context =
             collapse_recent_context(&request.recent_turns, request.recent_context.clone());
@@ -410,6 +422,7 @@ impl AppService {
                 query: request.message.clone(),
                 recent_turns,
                 recent_context: recent_context.clone(),
+                gate_model_id: request.gate_model_id.clone(),
                 conversation_id: request.conversation_id,
                 active_thread_id: request.active_thread_id,
                 focus_from: request.focus_from,
@@ -523,6 +536,51 @@ impl AppService {
             .await
             .with_context(|| "failed to embed retrieval query")?;
         Ok(embeddings.pop())
+    }
+
+    async fn gate_candidates(
+        &self,
+        request: &AssembleContextRequest,
+        candidates: &[ScoredMemory],
+        max_injected: usize,
+    ) -> anyhow::Result<crate::retrieval::GateResult> {
+        let fallback = || deterministic_gate_candidates(&request.query, candidates, max_injected);
+
+        let Some(gate_backend) = &self.gate_backend else {
+            return Ok(fallback());
+        };
+
+        let gate_request = ContextGateRequest {
+            query: request.query.clone(),
+            recent_turns: request.recent_turns.clone(),
+            recent_context: request.recent_context.clone(),
+            candidates: candidates.to_vec(),
+            max_injected,
+            model_id: request.gate_model_id.clone(),
+            trace_id: Uuid::new_v4(),
+        };
+
+        match gate_backend.gate(&gate_request).await {
+            Ok(result) => match hydrate_gate_result(candidates, result) {
+                Ok(gate) => Ok(gate),
+                Err(error) => {
+                    eprintln!("{error:#}");
+                    if request.gate_model_id.is_some() {
+                        Err(error.context("gate model returned an invalid decision"))
+                    } else {
+                        Ok(fallback())
+                    }
+                }
+            },
+            Err(error) => {
+                eprintln!("{error:#}");
+                if request.gate_model_id.is_some() {
+                    Err(error.context("gate model request failed"))
+                } else {
+                    Ok(fallback())
+                }
+            }
+        }
     }
 
     async fn capture_entry(
@@ -848,6 +906,33 @@ fn build_query_embedding_text(request: &AssembleContextRequest) -> String {
     tokens[start..].join(" ")
 }
 
+fn hydrate_gate_result(
+    candidates: &[ScoredMemory],
+    result: ContextGateResult,
+) -> anyhow::Result<crate::retrieval::GateResult> {
+    let candidate_map = candidates
+        .iter()
+        .map(|candidate| (candidate.memory.id, candidate.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let selected = result
+        .selected_memory_ids
+        .iter()
+        .map(|memory_id| {
+            candidate_map
+                .get(memory_id)
+                .cloned()
+                .with_context(|| format!("gate selected unknown memory {memory_id}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(crate::retrieval::GateResult {
+        decision: result.decision,
+        confidence: result.confidence,
+        reason: result.reason,
+        selected,
+    })
+}
+
 fn merge_attrs(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
     match (base, extra) {
         (serde_json::Value::Object(mut base_map), serde_json::Value::Object(extra_map)) => {
@@ -1095,6 +1180,7 @@ mod tests {
                 query: "What am I building?".to_string(),
                 recent_turns: Vec::new(),
                 recent_context: None,
+                gate_model_id: None,
                 conversation_id: None,
                 active_thread_id: None,
                 focus_from: None,
@@ -1193,6 +1279,7 @@ mod tests {
             .chat_respond(ChatRespondRequest {
                 message: "What am I building?".to_string(),
                 model_id: Some("anthropic.claude-opus-4-6-v1".to_string()),
+                gate_model_id: None,
                 recent_turns: Vec::new(),
                 recent_context: None,
                 conversation_id: None,

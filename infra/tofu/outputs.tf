@@ -33,6 +33,57 @@ output "app_port" {
   value       = var.app_port
 }
 
+output "alb_dns_name" {
+  description = "Application Load Balancer DNS name when domain support is enabled."
+  value       = local.domain_enabled ? aws_lb.app[0].dns_name : null
+}
+
+output "app_domain_name" {
+  description = "Configured public domain name for Ancilla when enabled."
+  value       = local.domain_name
+}
+
+output "app_hostnames" {
+  description = "Public hostnames routed to the ALB."
+  value       = local.app_hostnames
+}
+
+output "app_url" {
+  description = "Primary public URL for Ancilla when a domain is configured."
+  value       = local.domain_enabled ? format("%s://%s", var.enable_https_listener ? "https" : "http", local.domain_name) : null
+}
+
+output "basic_auth_enabled" {
+  description = "Whether HTTP Basic auth is enabled for the public API."
+  value       = var.basic_auth_enabled
+}
+
+output "basic_auth_username" {
+  description = "HTTP Basic auth username when enabled."
+  value       = var.basic_auth_enabled ? var.basic_auth_username : null
+}
+
+output "basic_auth_password_secret_arn" {
+  description = "Secrets Manager ARN for the generated HTTP Basic auth password."
+  value       = var.basic_auth_enabled ? aws_secretsmanager_secret.basic_auth_password[0].arn : null
+}
+
+output "acm_certificate_arn" {
+  description = "ACM certificate ARN for the Ancilla public domain when enabled."
+  value       = local.domain_enabled ? aws_acm_certificate.app[0].arn : null
+}
+
+output "acm_validation_records" {
+  description = "DNS validation records created in Route 53 for the ACM certificate."
+  value = local.domain_enabled ? {
+    for name, record in aws_route53_record.acm_validation : name => {
+      fqdn    = record.fqdn
+      type    = record.type
+      records = record.records
+    }
+  } : {}
+}
+
 output "ecr_repository_url" {
   description = "Managed ECR repository URL for the Ancilla app image."
   value       = aws_ecr_repository.app.repository_url

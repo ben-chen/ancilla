@@ -1,7 +1,13 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, bail};
 use serde::{Serialize, de::DeserializeOwned};
+
+#[cfg(test)]
+use std::sync::Mutex;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct InitConfigResult {
@@ -80,11 +86,17 @@ where
     if !path.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path)
+    Ok(Some(load_toml_path(&path)?))
+}
+
+pub fn load_toml_path<T>(path: &Path) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
-    let config = toml::from_str::<T>(&contents)
-        .with_context(|| format!("failed to parse config file {}", path.display()))?;
-    Ok(Some(config))
+    toml::from_str::<T>(&contents)
+        .with_context(|| format!("failed to parse config file {}", path.display()))
 }
 
 pub(crate) fn env_var(key: &str) -> Option<String> {
@@ -158,4 +170,20 @@ pub(crate) fn redact_database_url(value: &str) -> String {
     } else {
         format!("{}***{}", &value[..scheme_end], suffix)
     }
+}
+
+pub(crate) fn redact_secret(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= 12 {
+        return "***".to_string();
+    }
+    format!("{}...{}", &trimmed[..12], &trimmed[trimmed.len() - 4..])
+}
+
+#[cfg(test)]
+static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static Mutex<()> {
+    &TEST_ENV_LOCK
 }

@@ -11,10 +11,10 @@ Ancilla now ships as two separate programs:
 
 They use separate config files:
 
-- server config: `~/.config/ancilla-server/config.toml`
-- client config: `~/.config/ancilla-client/config.toml`
+- server config: `~/.config/ancilla/server.toml`
+- client config: `~/.config/ancilla/client.toml`
 
-The old unified `~/.config/ancilla/ancilla.toml` is now legacy and is not used by the new binaries.
+The old unified `~/.config/ancilla/ancilla.toml` is now legacy and is not used by the new binaries. The loaders still fall back to `~/.config/ancilla-server/config.toml` and `~/.config/ancilla-client/config.toml` if the new shared-dir files do not exist yet.
 
 Reference docs:
 
@@ -56,7 +56,7 @@ Do not commit real AWS credentials into this repository.
 `ancilla-server` loads runtime config in this order:
 
 1. built-in defaults
-2. `~/.config/ancilla-server/config.toml`
+2. `~/.config/ancilla/server.toml`
 3. environment variables
 
 Create the starter file:
@@ -82,7 +82,9 @@ Relevant server settings:
 - `aws_profile`
 - `aws_config_file`
 - `aws_shared_credentials_file`
+- `aws_bearer_token_bedrock`
 - `bedrock_chat_model_id` as the default selected model
+- `bedrock_gate_model_id` as the default context-gate model
 - `chat_models` as the curated server-side picker menu
 - `bedrock_chat_max_tokens`
 - `bedrock_chat_temperature`
@@ -98,10 +100,12 @@ Server-specific env vars use the `ANCILLA_SERVER_...` prefix. The server also ac
 - `AWS_PROFILE`
 - `AWS_CONFIG_FILE`
 - `AWS_SHARED_CREDENTIALS_FILE`
+- `AWS_BEARER_TOKEN_BEDROCK`
 - `BEDROCK_CHAT_MODEL_ID`
+- `BEDROCK_GATE_MODEL_ID`
 - `BEDROCK_CHAT_MODELS_JSON`
 
-Example `~/.config/ancilla-server/config.toml`:
+Example `~/.config/ancilla/server.toml`:
 
 ```toml
 app_env = "development"
@@ -110,28 +114,18 @@ data_file = ".ancilla/state.json"
 # embedder_base_url = "http://10.42.0.50:4000"
 # embedder_timeout_seconds = 120
 #
-aws_region = "us-west-2"
+aws_region = "us-east-1"
 aws_profile = "ancilla-dev"
 aws_config_file = "~/workspace/ancilla/.aws/config"
 aws_shared_credentials_file = "~/workspace/ancilla/.aws/credentials"
-bedrock_chat_model_id = "us.anthropic.claude-opus-4-6-v1"
+# aws_bearer_token_bedrock = "bedrock-api-key-..."
+bedrock_chat_model_id = "moonshot.kimi-k2-thinking"
+bedrock_gate_model_id = "moonshot.kimi-k2-thinking"
 
 [[chat_models]]
-label = "Claude Opus 4.6"
-model_id = "us.anthropic.claude-opus-4-6-v1"
-description = "Deepest reasoning"
-thinking_mode = "adaptive"
-
-[[chat_models]]
-label = "Claude Sonnet 4.6"
-model_id = "us.anthropic.claude-sonnet-4-6"
-description = "Balanced reasoning and speed"
-thinking_mode = "adaptive"
-
-[[chat_models]]
-label = "Claude Haiku 4.5"
-model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-description = "Fastest responses"
+label = "Kimi K2 Thinking"
+model_id = "moonshot.kimi-k2-thinking"
+description = "Moonshot reasoning model"
 
 bedrock_chat_max_tokens = 800
 bedrock_chat_temperature = 0.2
@@ -152,13 +146,15 @@ If `database_url` is set, the server uses Postgres. If it is unset, the server f
 
 If `bedrock_chat_model_id` is set, `POST /v1/chat/respond` uses Bedrock `Converse`. If it is unset, the server uses the deterministic synthetic backend.
 
+If a gate model is available, `POST /v1/context/assemble` also uses Bedrock to decide which candidate memories to inject. The server prefers `bedrock_gate_model_id` when set, otherwise it falls back to the latest configured Haiku model, then finally to `bedrock_chat_model_id`. If no Bedrock gate model is available or the Bedrock call fails, the server falls back to the deterministic gate.
+
 If `embedder_base_url` is set, the server asks the embedder service for live query embeddings and for memory embeddings during explicit capture. If it is unset, retrieval falls back to the built-in lexical path and the placeholder semantic scorer used by local tests.
 
-`bedrock_chat_model_id` is the default selection. `chat_models` is the short curated catalog returned by `GET /v1/chat/models` for the TUI model picker. Keep this list small. The intended deploy shape is only the latest model in each line:
+`bedrock_chat_model_id` is the default selection. `chat_models` is the short curated catalog returned by `GET /v1/chat/models` for the TUI model picker. Keep this list small.
 
-- Claude Opus 4.6
-- Claude Sonnet 4.6
-- Claude Haiku 4.5
+While Anthropic approval is pending, the recommended temporary config is:
+
+- Kimi K2 Thinking
 
 For the deployed AWS service, the live `DATABASE_URL` is not stored in this repo. OpenTofu builds it in [`infra/tofu/main.tf`](infra/tofu/main.tf), stores it in AWS Secrets Manager, and ECS injects it into the container as `DATABASE_URL`.
 
@@ -178,7 +174,7 @@ aws secretsmanager get-secret-value \
 `ancilla-client` loads runtime config in this order:
 
 1. built-in defaults
-2. `~/.config/ancilla-client/config.toml`
+2. `~/.config/ancilla/client.toml`
 3. environment variables
 
 Create the starter file:
@@ -195,11 +191,15 @@ cargo run --bin ancilla-client -- show-config
 
 The client config is intentionally small. Its job is to know which server to call.
 
-Example `~/.config/ancilla-client/config.toml`:
+Example `~/.config/ancilla/client.toml`:
 
 ```toml
 base_url = "http://127.0.0.1:3000"
+# basic_auth_username = "ancilla"
+# basic_auth_password = "replace-me"
 ```
+
+When the deployed server has HTTP Basic auth enabled, put the same username/password in `client.toml`. `ancilla-client` will send the `Authorization` header automatically.
 
 Client env override:
 
@@ -306,7 +306,7 @@ The client UI supports:
 - timeline browsing
 - entry inspection
 - model selection from the server-advertised catalog with `m`
-- retrieval/context preview with `s`, calling `POST /v1/context/assemble` without invoking the model
+- retrieval/context preview with `s`, calling `POST /v1/context/assemble`; when the server has a gate model configured this still uses the Bedrock gate, but it does not generate a final chat answer
 - sending chat questions to the live server
 - capturing new memories on the live server
 
@@ -320,7 +320,8 @@ The server and client interact like this:
 - `cargo run --bin ancilla-server -- serve ...` exposes the HTTP API locally
 - `cargo run --bin ancilla-client --` talks to whatever `base_url` points at
 - `curl http://127.0.0.1:3000/...` talks to your local server process
-- `curl http://$APP_IP:3000/...` talks to the deployed AWS service
+- `curl http://ancillabot.com/...` talks to the deployed AWS service once the Route 53 domain and ACM validation have propagated
+- `curl http://$ALB_DNS/...` talks to the deployed AWS service immediately after ALB creation, before the custom domain resolves everywhere
 
 Local development example:
 
@@ -338,15 +339,26 @@ curl -X POST http://127.0.0.1:3000/v1/memories \
 Deployed service example:
 
 ```bash
-APP_IP=16.146.111.110
+APP_URL=https://ancillabot.com
 
-cargo run --bin ancilla-client -- --base-url "http://$APP_IP:3000"
-curl "http://$APP_IP:3000/healthz"
-curl "http://$APP_IP:3000/v1/timeline"
-curl -X POST "http://$APP_IP:3000/v1/context/assemble" \
+cargo run --bin ancilla-client -- --base-url "$APP_URL"
+curl "$APP_URL/healthz"
+curl -u ancilla:REPLACE_ME "$APP_URL/v1/timeline"
+curl -u ancilla:REPLACE_ME -X POST "$APP_URL/v1/context/assemble" \
   -H 'content-type: application/json' \
   --data '{"query":"What am I building?"}'
 ```
+
+If the custom domain is still propagating, use the ALB DNS name from OpenTofu instead:
+
+```bash
+ALB_DNS=$(cd infra/tofu && tofu output -raw alb_dns_name)
+
+cargo run --bin ancilla-client -- --base-url "http://$ALB_DNS"
+curl "http://$ALB_DNS/healthz"
+```
+
+When Basic auth is enabled, `/healthz` stays public for the ALB health check, but API routes require credentials.
 
 The default deploy places Postgres in private DB subnets, so your laptop cannot reach the database directly unless you add your own network path into the VPC.
 
@@ -413,6 +425,7 @@ The embedder path is now synchronous:
 - if `embedder_base_url` is configured, the server calls `ancilla-embedder` over HTTP to embed those memories immediately
 - retrieval queries use the same embedder service for live query embeddings
 - the embedder is intentionally separate from the API server so the heavy model runtime does not live inside the Fargate task
+- the checked-in deploy uses a cheap CPU embedder host by default; switch to GPU only when you actually need it
 
 ## Runtime Notes
 
@@ -452,7 +465,8 @@ Fast path:
 scripts/redeploy.sh
 ```
 
-That script builds a new immutable ARM64 server image plus an AMD64 embedder image, pushes both to ECR, updates `infra/tofu/terraform.tfvars`, runs `tofu apply`, waits for ECS to stabilize, prints the current task IP, and runs `/healthz`.
+That script builds a new immutable ARM64 server image and, when enabled, an AMD64 embedder image, pushes the needed images to ECR, updates `infra/tofu/terraform.tfvars`, runs `tofu apply`, waits for ECS to stabilize, prints the current task IP, and runs `/healthz`.
+If `embedder_enabled = false`, the script skips the embedder image entirely. If the embedder is enabled, the script builds the embedder image for the selected accelerator mode.
 
 The deploy script stays separate from app runtime config:
 
@@ -460,7 +474,7 @@ The deploy script stays separate from app runtime config:
 - `AWS_PROFILE` and `AWS_REGION` come from env if set, otherwise `infra/tofu/terraform.tfvars`
 - it does not read or modify either program’s config file
 
-If you want the client to target the new deploy, copy the printed IP into `~/.config/ancilla-client/config.toml`:
+If you want the client to target the new deploy, copy the printed IP into `~/.config/ancilla/client.toml`:
 
 ```toml
 base_url = "http://<app-ip>:3000"
@@ -496,9 +510,15 @@ Also verify the AWS account has non-zero EC2 GPU quota in `us-west-2` if you wan
 - `Running On-Demand G and VT instances`
 - `All G and VT Spot Instance Requests`
 
-If either is still `0`, a dedicated GPU embedder instance cannot launch in this account. The checked-in `terraform.tfvars` therefore leaves `embedder_enabled = false` until quota is raised.
+GPU quota is only required when `embedder_accelerator = "gpu"`. The checked-in `terraform.tfvars` now uses a CPU embedder host so online query embeddings work in this account without waiting for quota.
 
-When quota is available, the intended low-cost embedder default is `g6f.large` in `us-west-2`. That is currently the smallest Linux GPU instance in the region and is materially cheaper than `g4dn.xlarge`, so the embedder defaults also use a conservative `batch_size = 2` and `max_length = 8192`.
+The checked-in low-cost default is:
+
+- `embedder_enabled = true`
+- `embedder_accelerator = "cpu"`
+- `embedder_instance_type = "t3.large"`
+
+When GPU quota is available, the intended low-cost GPU upgrade is `g6f.large` in `us-west-2`. That is currently the smallest Linux GPU instance in the region and is materially cheaper than `g4dn.xlarge`, so the embedder defaults also use a conservative `batch_size = 2` and `max_length = 8192`.
 
 3. Create deploy inputs.
 
@@ -513,7 +533,12 @@ Edit `infra/tofu/terraform.tfvars` and set at least:
 - `bedrock_chat_model_id`
 - `db_instance_class`
 - `container_image_tag`
-- `embedder_image_tag`
+- `embedder_enabled`
+- `embedder_accelerator`
+- `embedder_image_tag` if the embedder is enabled
+- `domain_name` if you want a stable Route 53 hostname
+- `enable_https_listener = false` for the first custom-domain apply, then `true` after ACM shows `ISSUED`
+- `basic_auth_enabled = true` if you want HTTP Basic auth on all API routes except `/healthz`
 
 Use a new immutable `container_image_tag` on every deploy. Do not reuse `latest`.
 
@@ -524,6 +549,14 @@ cd infra/tofu
 tofu init
 tofu apply \
   -target=aws_ecr_repository.app \
+  -auto-approve
+```
+
+If the embedder is enabled, bootstrap its repository too:
+
+```bash
+cd infra/tofu
+tofu apply \
   -target=aws_ecr_repository.embedder \
   -auto-approve
 ```
@@ -546,7 +579,7 @@ Then set:
 container_image_tag = "<the same TAG you just pushed>"
 ```
 
-6. Build and push the embedder image.
+6. If the embedder is enabled, build and push the embedder image.
 
 ```bash
 cd infra/tofu
@@ -557,6 +590,7 @@ cd ../..
 docker buildx build \
   --platform linux/amd64 \
   --load \
+  --build-arg TORCH_VARIANT=cpu \
   -f Dockerfile.embedder \
   -t "$EMBEDDER_ECR_URL:$TAG" .
 docker push "$EMBEDDER_ECR_URL:$TAG"
@@ -567,6 +601,8 @@ Then set:
 ```toml
 embedder_image_tag = "<the same TAG you just pushed>"
 ```
+
+If you want a GPU embedder instead, change the build arg to `TORCH_VARIANT=cu124` and set `embedder_accelerator = "gpu"` plus a GPU-capable instance type.
 
 7. Apply the full stack.
 

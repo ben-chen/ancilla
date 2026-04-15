@@ -198,25 +198,41 @@ pub fn rank_memories(
     results
 }
 
-pub fn gate_candidates(candidates: &[ScoredMemory], max_injected: usize) -> GateResult {
+pub fn gate_candidates(
+    query: &str,
+    candidates: &[ScoredMemory],
+    max_injected: usize,
+) -> GateResult {
+    let preferred_subtype = preferred_subtype_for_query(query);
+    let ordered_candidates = reorder_candidates_for_gate(candidates, preferred_subtype);
     let mut selected = Vec::new();
     let mut seen_lineages = HashSet::new();
-    for candidate in candidates {
-        if candidate.final_score < GATE_THRESHOLD {
+    for candidate in &ordered_candidates {
+        let threshold = match preferred_subtype {
+            Some(subtype) if candidate.memory.subtype == subtype => 0.12,
+            _ => GATE_THRESHOLD,
+        };
+        if candidate.final_score < threshold {
             continue;
         }
         if !seen_lineages.insert(candidate.memory.lineage_id) {
             continue;
         }
-        selected.push(candidate.clone());
+        selected.push((*candidate).clone());
+        if preferred_subtype.is_some() && !selected.is_empty() {
+            break;
+        }
         if selected.len() >= max_injected {
             break;
         }
     }
 
     if selected.is_empty() {
-        let top_score = candidates
+        let top_candidate = ordered_candidates
             .first()
+            .copied()
+            .or_else(|| candidates.first());
+        let top_score = top_candidate
             .map(|candidate| candidate.final_score)
             .unwrap_or(0.0);
         let decision = if top_score >= 0.12 {
@@ -232,11 +248,11 @@ pub fn gate_candidates(candidates: &[ScoredMemory], max_injected: usize) -> Gate
         };
     }
 
-    let margin = candidates
+    let margin = ordered_candidates
         .get(1)
         .map(|next| selected[0].final_score - next.final_score)
         .unwrap_or(selected[0].final_score);
-    if margin < 0.025 && selected.len() == 1 {
+    if preferred_subtype.is_none() && margin < 0.025 && selected.len() == 1 {
         return GateResult {
             decision: GateDecision::DeferToTool,
             confidence: selected[0].final_score.clamp(0.0, 1.0),
@@ -259,6 +275,81 @@ pub fn gate_candidates(candidates: &[ScoredMemory], max_injected: usize) -> Gate
         reason: reason.to_string(),
         selected,
     }
+}
+
+fn preferred_subtype_for_query(query: &str) -> Option<crate::model::MemorySubtype> {
+    let normalized = query.to_ascii_lowercase();
+    let query = normalized.as_str();
+
+    if contains_any(
+        query,
+        &[
+            "prefer",
+            "favorite",
+            "favourite",
+            "like",
+            "rather than",
+            "instead of",
+            "better than",
+            "do i use",
+            "do i choose",
+        ],
+    ) {
+        return Some(crate::model::MemorySubtype::Preference);
+    }
+
+    if contains_any(
+        query,
+        &[
+            "what am i building",
+            "what are i building",
+            "what are we building",
+            "building",
+            "working on",
+            "project",
+            "ship",
+        ],
+    ) {
+        return Some(crate::model::MemorySubtype::Project);
+    }
+
+    if contains_any(
+        query,
+        &["goal", "trying to", "want to", "plan to", "aiming to"],
+    ) {
+        return Some(crate::model::MemorySubtype::Goal);
+    }
+
+    None
+}
+
+fn reorder_candidates_for_gate<'a>(
+    candidates: &'a [ScoredMemory],
+    preferred_subtype: Option<crate::model::MemorySubtype>,
+) -> Vec<&'a ScoredMemory> {
+    let Some(preferred_subtype) = preferred_subtype else {
+        return candidates.iter().collect();
+    };
+
+    let mut matching = Vec::new();
+    let mut remainder = Vec::new();
+    for candidate in candidates {
+        if candidate.memory.subtype == preferred_subtype {
+            matching.push(candidate);
+        } else {
+            remainder.push(candidate);
+        }
+    }
+
+    if matching.is_empty() {
+        return candidates.iter().collect();
+    }
+
+    matching.into_iter().chain(remainder).collect()
+}
+
+fn contains_any(query: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| query.contains(needle))
 }
 
 pub fn build_context_bundle(
@@ -636,12 +727,62 @@ mod tests {
             candidate_rank: 3,
         };
 
-        let gate = gate_candidates(&[first.clone(), duplicate, second.clone()], 3);
+        let gate = gate_candidates(
+            "Tell me about relevant personal context.",
+            &[first.clone(), duplicate, second.clone()],
+            3,
+        );
         assert_eq!(gate.decision, GateDecision::InjectCompact);
         assert_eq!(gate.selected.len(), 2);
         assert_eq!(gate.reason, "preference_match");
         assert_eq!(gate.selected[0].memory.id, first.memory.id);
         assert_eq!(gate.selected[1].memory.id, second.memory.id);
+    }
+
+    #[test]
+    fn gate_prefers_project_memories_for_building_questions() {
+        let preference = ScoredMemory {
+            memory: memory(
+                "You prefer small reliable AWS building blocks.",
+                MemorySubtype::Preference,
+            ),
+            semantic_score: 0.25,
+            lexical_score: 0.20,
+            fusion_score: 0.25,
+            temporal_bonus: 0.0,
+            thread_bonus: 0.0,
+            salience_bonus: 0.0,
+            confidence_bonus: 0.0,
+            reinjection_penalty: 0.0,
+            stale_penalty: 0.0,
+            final_score: 0.25,
+            prior_injected: false,
+            candidate_rank: 1,
+        };
+        let project = ScoredMemory {
+            memory: memory(
+                "You are building Ancilla, a personal memory system.",
+                MemorySubtype::Project,
+            ),
+            semantic_score: 0.13,
+            lexical_score: 0.0,
+            fusion_score: 0.13,
+            temporal_bonus: 0.0,
+            thread_bonus: 0.0,
+            salience_bonus: 0.0,
+            confidence_bonus: 0.0,
+            reinjection_penalty: 0.0,
+            stale_penalty: 0.0,
+            final_score: 0.13,
+            prior_injected: false,
+            candidate_rank: 2,
+        };
+
+        let gate = gate_candidates("What am I building?", &[preference, project.clone()], 3);
+
+        assert_eq!(gate.reason, "project_match");
+        assert_eq!(gate.selected.len(), 1);
+        assert_eq!(gate.selected[0].memory.id, project.memory.id);
     }
 
     #[test]
@@ -682,6 +823,7 @@ mod tests {
                 query: "What stack am I using now?".to_string(),
                 recent_turns: Vec::new(),
                 recent_context: None,
+                gate_model_id: None,
                 conversation_id: None,
                 active_thread_id: None,
                 focus_from: None,

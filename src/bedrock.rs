@@ -14,20 +14,24 @@ use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_bedrockruntime::{
     Client,
+    config::Token,
     types::{ContentBlock, ConversationRole, InferenceConfiguration, Message, SystemContentBlock},
 };
 use aws_smithy_types::{Document, Number};
 use aws_types::region::Region;
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
     model::{
-        ChatModelOption, ChatModelsResponse, ChatThinkingMode, ConversationTurn, MemoryRecord,
+        ChatModelOption, ChatModelsResponse, ChatThinkingMode, ConversationTurn, GateDecision,
+        MemoryRecord, ScoredMemory,
     },
     server_config::ServerConfig,
 };
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are Ancilla, a personal memory assistant. Use injected personal context when it is present, do not invent private facts, and answer directly.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are Ancilla, a personal AI assistant. You are speaking with a specific user over a harness that may provide background memories about that user when they seem relevant. Treat injected memory context as potentially helpful user background, not as guaranteed ground truth about every question. Use it when it is relevant, ignore it when it is not, and never invent personalized facts that were not provided. Answer directly, naturally, and helpfully. In the future this harness may let you search the memory bank or create new explicit memories, but those tools are not available in this turn.";
+const DEFAULT_GATE_SYSTEM_PROMPT: &str = "You are Ancilla's memory gate. Your job is to decide whether candidate stored memories are actually relevant to the user's latest query and recent conversation context. Prefer the smallest useful subset, and prefer no memories when the candidates are weak, redundant, or off-topic. Only select memories that would materially help the assistant answer better. Return strict JSON only with keys decision, confidence, reason, and selected_ids.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatCompletionRequest {
@@ -55,6 +59,31 @@ pub trait ChatCompletionBackend: Send + Sync {
     fn models(&self) -> ChatModelsResponse;
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextGateRequest {
+    pub query: String,
+    pub recent_turns: Vec<ConversationTurn>,
+    pub recent_context: Option<String>,
+    pub candidates: Vec<ScoredMemory>,
+    pub max_injected: usize,
+    pub model_id: Option<String>,
+    pub trace_id: Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextGateResult {
+    pub decision: GateDecision,
+    pub confidence: f32,
+    pub reason: String,
+    pub selected_memory_ids: Vec<Uuid>,
+    pub model_id: Option<String>,
+}
+
+#[async_trait]
+pub trait ContextGateBackend: Send + Sync {
+    async fn gate(&self, request: &ContextGateRequest) -> anyhow::Result<ContextGateResult>;
+}
+
 pub async fn build_chat_backend(
     config: &ServerConfig,
 ) -> anyhow::Result<Arc<dyn ChatCompletionBackend>> {
@@ -65,6 +94,7 @@ pub async fn build_chat_backend(
             profile: config.aws_profile.clone(),
             config_file: config.aws_config_file.clone(),
             shared_credentials_file: config.aws_shared_credentials_file.clone(),
+            bearer_token: config.aws_bearer_token_bedrock.clone(),
             default_model_id,
             models: catalog.models.clone(),
             max_tokens: config.bedrock_chat_max_tokens,
@@ -76,14 +106,48 @@ pub async fn build_chat_backend(
     }
 }
 
+pub async fn build_context_gate_backend(
+    config: &ServerConfig,
+) -> anyhow::Result<Option<Arc<dyn ContextGateBackend>>> {
+    let Some(default_model_id) = config.default_gate_model_id() else {
+        return Ok(None);
+    };
+    let settings = BedrockGateSettings {
+        region: config.aws_region.clone(),
+        profile: config.aws_profile.clone(),
+        config_file: config.aws_config_file.clone(),
+        shared_credentials_file: config.aws_shared_credentials_file.clone(),
+        bearer_token: config.aws_bearer_token_bedrock.clone(),
+        default_model_id,
+        max_tokens: config.bedrock_chat_max_tokens.max(1200),
+        temperature: 0.0,
+    };
+    Ok(Some(Arc::new(
+        BedrockContextGateBackend::new(settings).await?,
+    )))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BedrockChatSettings {
     pub region: String,
     pub profile: Option<String>,
     pub config_file: Option<PathBuf>,
     pub shared_credentials_file: Option<PathBuf>,
+    pub bearer_token: Option<String>,
     pub default_model_id: String,
     pub models: Vec<ChatModelOption>,
+    pub max_tokens: i32,
+    pub temperature: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BedrockGateSettings {
+    pub region: String,
+    pub profile: Option<String>,
+    pub config_file: Option<PathBuf>,
+    pub shared_credentials_file: Option<PathBuf>,
+    pub bearer_token: Option<String>,
+    pub default_model_id: String,
     pub max_tokens: i32,
     pub temperature: f32,
 }
@@ -93,6 +157,12 @@ pub struct BedrockChatBackend {
     client: Client,
     settings: BedrockChatSettings,
     catalog: ChatModelsResponse,
+}
+
+#[derive(Clone, Debug)]
+pub struct BedrockContextGateBackend {
+    client: Client,
+    settings: BedrockGateSettings,
 }
 
 impl BedrockChatBackend {
@@ -114,7 +184,7 @@ impl BedrockChatBackend {
         }
 
         let sdk_config = loader.load().await;
-        let client = Client::new(&sdk_config);
+        let client = build_bedrock_client(&sdk_config, settings.bearer_token.as_deref());
         let catalog = ChatModelsResponse {
             backend: "bedrock".to_string(),
             default_model_id: Some(settings.default_model_id.clone()),
@@ -137,9 +207,96 @@ impl BedrockChatBackend {
     }
 }
 
+impl BedrockContextGateBackend {
+    pub async fn new(settings: BedrockGateSettings) -> anyhow::Result<Self> {
+        let mut loader = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(settings.region.clone()))
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .read_timeout(Duration::from_secs(60))
+                    .operation_timeout(Duration::from_secs(60))
+                    .operation_attempt_timeout(Duration::from_secs(60))
+                    .build(),
+            );
+        if let Some(profile_files) = build_gate_profile_files(&settings)? {
+            loader = loader.profile_files(profile_files);
+        }
+        if let Some(profile) = settings.profile.clone() {
+            loader = loader.profile_name(profile);
+        }
+
+        let sdk_config = loader.load().await;
+        let client = build_bedrock_client(&sdk_config, settings.bearer_token.as_deref());
+        Ok(Self { client, settings })
+    }
+
+    fn resolve_model_id(&self, requested_model_id: Option<&str>) -> String {
+        requested_model_id
+            .unwrap_or(&self.settings.default_model_id)
+            .to_string()
+    }
+}
+
+fn build_bedrock_client(
+    shared_config: &aws_types::SdkConfig,
+    bearer_token: Option<&str>,
+) -> Client {
+    if let Some(bearer_token) = bearer_token {
+        let config = aws_sdk_bedrockruntime::config::Builder::from(shared_config)
+            .token_provider(Token::new(bearer_token, None))
+            .build();
+        Client::from_conf(config)
+    } else {
+        Client::new(shared_config)
+    }
+}
+
+fn bedrock_request_error(
+    operation: &str,
+    model_id: &str,
+    error: &impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!("bedrock {operation} request failed for model `{model_id}`: {error}")
+}
+
 #[allow(deprecated)]
 pub(crate) fn build_profile_files(
     settings: &BedrockChatSettings,
+) -> anyhow::Result<Option<ProfileFiles>> {
+    let config_file = settings
+        .config_file
+        .as_deref()
+        .map(expand_home_path)
+        .transpose()?;
+    let shared_credentials_file = settings
+        .shared_credentials_file
+        .as_deref()
+        .map(expand_home_path)
+        .transpose()?;
+
+    if config_file.is_none() && shared_credentials_file.is_none() {
+        return Ok(None);
+    }
+
+    let mut builder = ProfileFiles::builder();
+    if let Some(path) = config_file {
+        builder = builder.with_file(ProfileFileKind::Config, path);
+    } else {
+        builder = builder.include_default_config_file(true);
+    }
+
+    if let Some(path) = shared_credentials_file {
+        builder = builder.with_file(ProfileFileKind::Credentials, path);
+    } else {
+        builder = builder.include_default_credentials_file(true);
+    }
+
+    Ok(Some(builder.build()))
+}
+
+#[allow(deprecated)]
+pub(crate) fn build_gate_profile_files(
+    settings: &BedrockGateSettings,
 ) -> anyhow::Result<Option<ProfileFiles>> {
     let config_file = settings
         .config_file
@@ -224,7 +381,7 @@ impl ChatCompletionBackend for BedrockChatBackend {
         let response = converse
             .send()
             .await
-            .with_context(|| format!("bedrock converse request failed for {}", model.model_id))?;
+            .map_err(|error| bedrock_request_error("chat", &model.model_id, &error))?;
 
         Ok(ChatCompletionResult {
             answer: extract_text_response(&response)?,
@@ -234,6 +391,44 @@ impl ChatCompletionBackend for BedrockChatBackend {
 
     fn models(&self) -> ChatModelsResponse {
         self.catalog.clone()
+    }
+}
+
+#[async_trait]
+impl ContextGateBackend for BedrockContextGateBackend {
+    async fn gate(&self, request: &ContextGateRequest) -> anyhow::Result<ContextGateResult> {
+        let model_id = self.resolve_model_id(request.model_id.as_deref());
+        let prompt = build_gate_prompt(request)?;
+        let response = self
+            .client
+            .converse()
+            .model_id(&model_id)
+            .set_system(Some(vec![SystemContentBlock::Text(
+                DEFAULT_GATE_SYSTEM_PROMPT.to_string(),
+            )]))
+            .set_messages(Some(vec![
+                Message::builder()
+                    .role(ConversationRole::User)
+                    .content(ContentBlock::Text(prompt))
+                    .build()
+                    .expect("gate message build should not fail"),
+            ]))
+            .inference_config(
+                InferenceConfiguration::builder()
+                    .max_tokens(self.settings.max_tokens)
+                    .temperature(self.settings.temperature)
+                    .build(),
+            )
+            .set_request_metadata(Some(HashMap::from([(
+                "trace_id".to_string(),
+                request.trace_id.to_string(),
+            )])))
+            .send()
+            .await
+            .map_err(|error| bedrock_request_error("gate", &model_id, &error))?;
+
+        let raw = extract_text_response(&response)?;
+        parse_gate_response(&raw, request, &model_id)
     }
 }
 
@@ -299,6 +494,44 @@ fn compose_system_prompt(
     }
 
     prompt
+}
+
+fn build_gate_prompt(request: &ContextGateRequest) -> anyhow::Result<String> {
+    let payload = serde_json::json!({
+        "query": request.query,
+        "recent_context": request.recent_context,
+        "recent_turns": request.recent_turns,
+        "max_injected": request.max_injected,
+        "candidates": request
+            .candidates
+            .iter()
+            .map(|candidate| serde_json::json!({
+                "id": candidate.memory.id,
+                "kind": candidate.memory.kind,
+                "subtype": candidate.memory.subtype,
+                "display_text": candidate.memory.display_text,
+                "retrieval_text_preview": truncate_for_gate(&candidate.memory.retrieval_text, 280),
+                "semantic_score": candidate.semantic_score,
+                "lexical_score": candidate.lexical_score,
+                "final_score": candidate.final_score,
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    Ok(format!(
+        "Evaluate whether these candidate memories are relevant to the latest user query and recent conversation context. Prefer the single best memory when one clearly answers the question. Select no memories when they do not help.\nReturn strict JSON only in this shape: {{\"decision\":\"inject_compact|no_inject|defer_to_tool\",\"confidence\":0.0,\"reason\":\"short_reason\",\"selected_ids\":[\"uuid\"]}}\n\n{}",
+        serde_json::to_string_pretty(&payload)?
+    ))
+}
+
+fn truncate_for_gate(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let truncated = trimmed.chars().take(max_chars).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn build_bedrock_messages(recent_turns: &[ConversationTurn], message: &str) -> Vec<Message> {
@@ -387,10 +620,111 @@ fn extract_text_response(
         .to_string();
 
     if text.is_empty() {
-        bail!("bedrock converse response had no text content")
+        let block_kinds = message
+            .content
+            .iter()
+            .map(content_block_kind)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "bedrock converse response had no text content (stop_reason={}, content_blocks=[{}])",
+            response.stop_reason().as_str(),
+            block_kinds
+        )
     } else {
         Ok(text)
     }
+}
+
+fn content_block_kind(block: &ContentBlock) -> &'static str {
+    match block {
+        ContentBlock::Audio(_) => "audio",
+        ContentBlock::CachePoint(_) => "cache_point",
+        ContentBlock::CitationsContent(_) => "citations_content",
+        ContentBlock::Document(_) => "document",
+        ContentBlock::GuardContent(_) => "guard_content",
+        ContentBlock::Image(_) => "image",
+        ContentBlock::ReasoningContent(_) => "reasoning_content",
+        ContentBlock::SearchResult(_) => "search_result",
+        ContentBlock::Text(_) => "text",
+        ContentBlock::ToolResult(_) => "tool_result",
+        ContentBlock::ToolUse(_) => "tool_use",
+        ContentBlock::Video(_) => "video",
+        _ => "unknown",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGateResponse {
+    decision: String,
+    #[serde(default)]
+    confidence: Option<f32>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    selected_ids: Vec<Uuid>,
+}
+
+fn parse_gate_response(
+    raw: &str,
+    request: &ContextGateRequest,
+    model_id: &str,
+) -> anyhow::Result<ContextGateResult> {
+    let payload = extract_json_object(raw)?;
+    let parsed: RawGateResponse =
+        serde_json::from_str(payload).with_context(|| "failed to parse gate JSON response")?;
+    let valid_ids = request
+        .candidates
+        .iter()
+        .map(|candidate| candidate.memory.id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut selected_memory_ids = Vec::new();
+    for memory_id in parsed.selected_ids {
+        if valid_ids.contains(&memory_id) && !selected_memory_ids.contains(&memory_id) {
+            selected_memory_ids.push(memory_id);
+        }
+        if selected_memory_ids.len() >= request.max_injected {
+            break;
+        }
+    }
+
+    let decision = match parsed.decision.as_str() {
+        "inject_compact" => {
+            if selected_memory_ids.is_empty() {
+                bail!("gate returned inject_compact without any valid selected_ids");
+            }
+            GateDecision::InjectCompact
+        }
+        "no_inject" => GateDecision::NoInject,
+        "defer_to_tool" => GateDecision::DeferToTool,
+        other => bail!("unknown gate decision `{other}`"),
+    };
+
+    Ok(ContextGateResult {
+        decision,
+        confidence: parsed.confidence.unwrap_or(0.5).clamp(0.0, 1.0),
+        reason: parsed
+            .reason
+            .unwrap_or_else(|| "bedrock_gate".to_string())
+            .trim()
+            .to_string(),
+        selected_memory_ids,
+        model_id: Some(model_id.to_string()),
+    })
+}
+
+fn extract_json_object(raw: &str) -> anyhow::Result<&str> {
+    let trimmed = raw.trim().trim_matches('`').trim();
+    let start = trimmed
+        .find('{')
+        .with_context(|| "gate response did not include a JSON object")?;
+    let end = trimmed
+        .rfind('}')
+        .with_context(|| "gate response did not include a JSON object")?;
+    if end <= start {
+        bail!("gate response did not include a valid JSON object");
+    }
+    Ok(&trimmed[start..=end])
 }
 
 #[cfg(test)]
@@ -461,6 +795,39 @@ mod tests {
         assert!(prompt.contains(&trace_id.to_string()));
         assert!(prompt.contains("Injected personal context"));
         assert!(prompt.contains("Recent conversation context"));
+        assert!(prompt.contains("harness"));
+        assert!(prompt.contains("memory bank"));
+    }
+
+    #[test]
+    fn gate_prompt_mentions_relevance_role() {
+        let request = ContextGateRequest {
+            query: "What am I building?".to_string(),
+            recent_turns: Vec::new(),
+            recent_context: None,
+            candidates: vec![ScoredMemory {
+                memory: sample_memory(),
+                semantic_score: 0.8,
+                lexical_score: 0.2,
+                fusion_score: 0.4,
+                temporal_bonus: 0.0,
+                thread_bonus: 0.0,
+                salience_bonus: 0.0,
+                confidence_bonus: 0.0,
+                reinjection_penalty: 0.0,
+                stale_penalty: 0.0,
+                final_score: 0.4,
+                prior_injected: false,
+                candidate_rank: 0,
+            }],
+            max_injected: 3,
+            model_id: None,
+            trace_id: Uuid::new_v4(),
+        };
+
+        let prompt = build_gate_prompt(&request).unwrap();
+        assert!(prompt.contains("relevant to the latest user query"));
+        assert!(prompt.contains("\"selected_ids\""));
     }
 
     #[test]
@@ -487,6 +854,7 @@ mod tests {
             profile: Some("ancilla-dev".to_string()),
             config_file: Some(PathBuf::from("/tmp/project/.aws/config")),
             shared_credentials_file: None,
+            bearer_token: None,
             default_model_id: "model".to_string(),
             models: vec![ChatModelOption {
                 label: "Model".to_string(),

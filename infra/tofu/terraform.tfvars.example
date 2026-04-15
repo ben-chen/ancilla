@@ -8,31 +8,26 @@ vpc_cidr                = "10.42.0.0/16"
 public_subnet_cidrs     = ["10.42.0.0/24", "10.42.1.0/24"]
 private_app_subnet_cidrs = ["10.42.10.0/24", "10.42.11.0/24"] # reserved for future private services
 private_db_subnet_cidrs  = ["10.42.20.0/24", "10.42.21.0/24"]
-bedrock_chat_model_id    = "us.anthropic.claude-opus-4-6-v1"
+domain_name              = "ancillabot.com"
+enable_https_listener    = false
+basic_auth_enabled       = false
+basic_auth_username      = "ancilla"
+bedrock_chat_model_id    = "moonshot.kimi-k2-thinking"
+bedrock_gate_model_id    = "moonshot.kimi-k2-thinking"
 bedrock_chat_models = [
   {
-    label           = "Claude Opus 4.6"
-    model_id        = "us.anthropic.claude-opus-4-6-v1"
-    description     = "Deepest reasoning"
-    thinking_mode   = "adaptive"
-  },
-  {
-    label           = "Claude Sonnet 4.6"
-    model_id        = "us.anthropic.claude-sonnet-4-6"
-    description     = "Balanced reasoning and speed"
-    thinking_mode   = "adaptive"
-  },
-  {
-    label       = "Claude Haiku 4.5"
-    model_id    = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-    description = "Fastest responses"
+    label       = "Kimi K2 Thinking"
+    model_id    = "moonshot.kimi-k2-thinking"
+    description = "Moonshot reasoning model"
   },
 ]
 container_image_tag      = "latest"
 embedder_enabled         = true
 embedder_image_tag       = "latest"
-embedder_instance_type   = "g6f.large"
+embedder_accelerator     = "cpu"
+embedder_instance_type   = "t3.large"
 embedder_port            = 4000
+embedder_device          = "cpu"
 embedder_timeout_seconds = 120
 desired_count            = 1
 task_cpu                 = 256

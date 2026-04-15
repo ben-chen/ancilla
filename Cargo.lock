@@ -28,6 +28,7 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "axum",
+ "base64",
  "chrono",
  "clap",
  "crossterm",

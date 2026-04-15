@@ -4,26 +4,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     InitConfigResult, discover_user_config_file, env_bool, env_f32, env_i32, env_var,
-    init_user_config, load_toml_file, merge_optional_path, merge_optional_string,
-    redact_database_url,
+    init_user_config, load_toml_path, merge_optional_path, merge_optional_string,
+    redact_database_url, redact_secret, user_config_file,
 };
 use crate::model::{ChatModelOption, ChatModelsResponse, ChatThinkingMode};
 
-const SERVER_CONFIG_APP_NAME: &str = "ancilla-server";
-const SERVER_CONFIG_FILE_NAME: &str = "config.toml";
+const SERVER_CONFIG_DIR_NAME: &str = "ancilla";
+const SERVER_CONFIG_FILE_NAME: &str = "server.toml";
+const LEGACY_SERVER_CONFIG_DIR_NAME: &str = "ancilla-server";
+const LEGACY_SERVER_CONFIG_FILE_NAME: &str = "config.toml";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ServerConfig {
     pub app_env: String,
     pub data_file: PathBuf,
     pub database_url: Option<String>,
+    pub basic_auth_username: Option<String>,
+    pub basic_auth_password: Option<String>,
     pub embedder_base_url: Option<String>,
     pub embedder_timeout_seconds: i32,
     pub aws_region: String,
     pub aws_profile: Option<String>,
     pub aws_config_file: Option<PathBuf>,
     pub aws_shared_credentials_file: Option<PathBuf>,
+    pub aws_bearer_token_bedrock: Option<String>,
     pub bedrock_chat_model_id: Option<String>,
+    pub bedrock_gate_model_id: Option<String>,
     pub chat_models: Vec<ChatModelOption>,
     pub bedrock_chat_max_tokens: i32,
     pub bedrock_chat_temperature: f32,
@@ -41,6 +47,9 @@ pub struct EffectiveServerConfigView {
     pub data_backend: String,
     pub data_file: PathBuf,
     pub database_url: Option<String>,
+    pub basic_auth_enabled: bool,
+    pub basic_auth_username: Option<String>,
+    pub basic_auth_password: Option<String>,
     pub embedder_base_url: Option<String>,
     pub embedder_timeout_seconds: i32,
     pub aws_region: String,
@@ -49,8 +58,10 @@ pub struct EffectiveServerConfigView {
     pub aws_config_file_exists: Option<bool>,
     pub aws_shared_credentials_file: Option<PathBuf>,
     pub aws_shared_credentials_file_exists: Option<bool>,
+    pub aws_bearer_token_bedrock: Option<String>,
     pub chat_backend: String,
     pub bedrock_chat_model_id: Option<String>,
+    pub bedrock_gate_model_id: Option<String>,
     pub chat_models: Vec<ChatModelOption>,
     pub bedrock_chat_max_tokens: i32,
     pub bedrock_chat_temperature: f32,
@@ -66,13 +77,17 @@ struct FileConfig {
     pub app_env: Option<String>,
     pub data_file: Option<PathBuf>,
     pub database_url: Option<String>,
+    pub basic_auth_username: Option<String>,
+    pub basic_auth_password: Option<String>,
     pub embedder_base_url: Option<String>,
     pub embedder_timeout_seconds: Option<i32>,
     pub aws_region: Option<String>,
     pub aws_profile: Option<String>,
     pub aws_config_file: Option<PathBuf>,
     pub aws_shared_credentials_file: Option<PathBuf>,
+    pub aws_bearer_token_bedrock: Option<String>,
     pub bedrock_chat_model_id: Option<String>,
+    pub bedrock_gate_model_id: Option<String>,
     pub chat_models: Option<Vec<ChatModelOption>>,
     pub bedrock_chat_max_tokens: Option<i32>,
     pub bedrock_chat_temperature: Option<f32>,
@@ -85,24 +100,24 @@ struct FileConfig {
 impl ServerConfig {
     pub fn load() -> anyhow::Result<Self> {
         let mut config = Self::defaults();
-        if let Some(file_config) =
-            load_toml_file::<FileConfig>(SERVER_CONFIG_APP_NAME, SERVER_CONFIG_FILE_NAME)?
-        {
+        if let Some(file_config) = load_file_config()? {
             config.apply_file_config(file_config);
         }
         config.apply_env_overrides()?;
+        config.validate()?;
         Ok(config)
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
         let mut config = Self::defaults();
         config.apply_env_overrides()?;
+        config.validate()?;
         Ok(config)
     }
 
     pub fn init_user_config(force: bool) -> anyhow::Result<InitConfigResult> {
         init_user_config(
-            SERVER_CONFIG_APP_NAME,
+            SERVER_CONFIG_DIR_NAME,
             SERVER_CONFIG_FILE_NAME,
             default_user_config_contents(),
             force,
@@ -110,8 +125,8 @@ impl ServerConfig {
     }
 
     pub fn to_view(&self, show_secrets: bool) -> EffectiveServerConfigView {
-        let user_config_file =
-            discover_user_config_file(SERVER_CONFIG_APP_NAME, SERVER_CONFIG_FILE_NAME);
+        let user_config_file = discover_server_config_file()
+            .or_else(|| user_config_file(SERVER_CONFIG_DIR_NAME, SERVER_CONFIG_FILE_NAME).ok());
         let chat_models = self.chat_models_response();
         EffectiveServerConfigView {
             user_config_file_exists: user_config_file.as_ref().is_some_and(|path| path.exists()),
@@ -130,6 +145,16 @@ impl ServerConfig {
                     redact_database_url(url)
                 }
             }),
+            basic_auth_enabled: self.basic_auth_username.is_some()
+                && self.basic_auth_password.is_some(),
+            basic_auth_username: self.basic_auth_username.clone(),
+            basic_auth_password: self.basic_auth_password.as_deref().map(|value| {
+                if show_secrets {
+                    value.to_string()
+                } else {
+                    redact_secret(value)
+                }
+            }),
             embedder_base_url: self.embedder_base_url.clone(),
             embedder_timeout_seconds: self.embedder_timeout_seconds,
             aws_region: self.aws_region.clone(),
@@ -141,8 +166,16 @@ impl ServerConfig {
                 .aws_shared_credentials_file
                 .as_ref()
                 .map(|path| path.exists()),
+            aws_bearer_token_bedrock: self.aws_bearer_token_bedrock.as_deref().map(|value| {
+                if show_secrets {
+                    value.to_string()
+                } else {
+                    redact_secret(value)
+                }
+            }),
             chat_backend: chat_models.backend,
             bedrock_chat_model_id: chat_models.default_model_id,
+            bedrock_gate_model_id: self.default_gate_model_id(),
             chat_models: chat_models.models,
             bedrock_chat_max_tokens: self.bedrock_chat_max_tokens,
             bedrock_chat_temperature: self.bedrock_chat_temperature,
@@ -158,13 +191,17 @@ impl ServerConfig {
             app_env: "development".to_string(),
             data_file: PathBuf::from(".ancilla/state.json"),
             database_url: None,
+            basic_auth_username: None,
+            basic_auth_password: None,
             embedder_base_url: None,
             embedder_timeout_seconds: 30,
             aws_region: "us-west-2".to_string(),
             aws_profile: None,
             aws_config_file: None,
             aws_shared_credentials_file: None,
+            aws_bearer_token_bedrock: None,
             bedrock_chat_model_id: None,
+            bedrock_gate_model_id: None,
             chat_models: Vec::new(),
             bedrock_chat_max_tokens: 800,
             bedrock_chat_temperature: 0.2,
@@ -187,6 +224,14 @@ impl ServerConfig {
         }
         self.database_url =
             merge_optional_string(self.database_url.take(), file_config.database_url);
+        self.basic_auth_username = merge_optional_string(
+            self.basic_auth_username.take(),
+            file_config.basic_auth_username,
+        );
+        self.basic_auth_password = merge_optional_string(
+            self.basic_auth_password.take(),
+            file_config.basic_auth_password,
+        );
         self.embedder_base_url =
             merge_optional_string(self.embedder_base_url.take(), file_config.embedder_base_url);
         if let Some(value) = file_config.embedder_timeout_seconds {
@@ -202,9 +247,18 @@ impl ServerConfig {
             self.aws_shared_credentials_file.take(),
             file_config.aws_shared_credentials_file,
         );
+        self.aws_bearer_token_bedrock = merge_optional_string(
+            self.aws_bearer_token_bedrock.take(),
+            file_config.aws_bearer_token_bedrock,
+        );
         self.bedrock_chat_model_id = merge_optional_string(
             self.bedrock_chat_model_id.take(),
             file_config.bedrock_chat_model_id,
+        )
+        .map(|model_id| canonicalize_chat_model_id(&model_id));
+        self.bedrock_gate_model_id = merge_optional_string(
+            self.bedrock_gate_model_id.take(),
+            file_config.bedrock_gate_model_id,
         )
         .map(|model_id| canonicalize_chat_model_id(&model_id));
         if let Some(chat_models) = file_config.chat_models {
@@ -247,6 +301,16 @@ impl ServerConfig {
         {
             self.database_url = Some(value);
         }
+        if let Some(value) = env_var("ANCILLA_SERVER_BASIC_AUTH_USERNAME")
+            .or_else(|| env_var("ANCILLA_BASIC_AUTH_USERNAME"))
+        {
+            self.basic_auth_username = Some(value);
+        }
+        if let Some(value) = env_var("ANCILLA_SERVER_BASIC_AUTH_PASSWORD")
+            .or_else(|| env_var("ANCILLA_BASIC_AUTH_PASSWORD"))
+        {
+            self.basic_auth_password = Some(value);
+        }
         if let Some(value) = env_var("ANCILLA_SERVER_EMBEDDER_BASE_URL")
             .or_else(|| env_var("ANCILLA_EMBEDDER_BASE_URL"))
         {
@@ -281,10 +345,20 @@ impl ServerConfig {
         {
             self.aws_shared_credentials_file = Some(PathBuf::from(value));
         }
+        if let Some(value) = env_var("ANCILLA_SERVER_AWS_BEARER_TOKEN_BEDROCK")
+            .or_else(|| env_var("AWS_BEARER_TOKEN_BEDROCK"))
+        {
+            self.aws_bearer_token_bedrock = Some(value);
+        }
         if let Some(value) = env_var("ANCILLA_SERVER_BEDROCK_CHAT_MODEL_ID")
             .or_else(|| env_var("BEDROCK_CHAT_MODEL_ID"))
         {
             self.bedrock_chat_model_id = Some(canonicalize_chat_model_id(&value));
+        }
+        if let Some(value) = env_var("ANCILLA_SERVER_BEDROCK_GATE_MODEL_ID")
+            .or_else(|| env_var("BEDROCK_GATE_MODEL_ID"))
+        {
+            self.bedrock_gate_model_id = Some(canonicalize_chat_model_id(&value));
         }
         if let Some(value) = env_var("ANCILLA_SERVER_BEDROCK_CHAT_MODELS_JSON")
             .or_else(|| env_var("BEDROCK_CHAT_MODELS_JSON"))
@@ -364,6 +438,61 @@ impl ServerConfig {
             models,
         }
     }
+
+    pub fn default_gate_model_id(&self) -> Option<String> {
+        self.bedrock_gate_model_id
+            .clone()
+            .or_else(|| {
+                self.chat_models_response()
+                    .models
+                    .into_iter()
+                    .find(|model| model.model_id.contains("haiku"))
+                    .map(|model| model.model_id)
+            })
+            .or_else(|| self.bedrock_chat_model_id.clone())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match (
+            self.basic_auth_username.as_deref(),
+            self.basic_auth_password.as_deref(),
+        ) {
+            (Some(_), Some(_)) | (None, None) => Ok(()),
+            (Some(_), None) => anyhow::bail!(
+                "basic auth password is missing; set ANCILLA_SERVER_BASIC_AUTH_PASSWORD or basic_auth_password"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "basic auth username is missing; set ANCILLA_SERVER_BASIC_AUTH_USERNAME or basic_auth_username"
+            ),
+        }
+    }
+}
+
+fn load_file_config() -> anyhow::Result<Option<FileConfig>> {
+    let Some(path) = discover_server_config_file() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(load_toml_path(&path)?))
+}
+
+fn discover_server_config_file() -> Option<PathBuf> {
+    let preferred = discover_user_config_file(SERVER_CONFIG_DIR_NAME, SERVER_CONFIG_FILE_NAME);
+    if preferred.as_ref().is_some_and(|path| path.exists()) {
+        return preferred;
+    }
+
+    let legacy = discover_user_config_file(
+        LEGACY_SERVER_CONFIG_DIR_NAME,
+        LEGACY_SERVER_CONFIG_FILE_NAME,
+    );
+    if legacy.as_ref().is_some_and(|path| path.exists()) {
+        return legacy;
+    }
+
+    preferred.or(legacy)
 }
 
 fn normalize_chat_models(chat_models: Vec<ChatModelOption>) -> Vec<ChatModelOption> {
@@ -386,6 +515,22 @@ fn normalize_chat_models(chat_models: Vec<ChatModelOption>) -> Vec<ChatModelOpti
 fn synthesized_chat_model(model_id: &str) -> ChatModelOption {
     let model_id = canonicalize_chat_model_id(model_id);
     match model_id.as_str() {
+        "moonshot.kimi-k2-thinking" => ChatModelOption {
+            label: "Kimi K2 Thinking".to_string(),
+            model_id,
+            description: Some("Moonshot reasoning model".to_string()),
+            thinking_mode: None,
+            thinking_effort: None,
+            thinking_budget_tokens: None,
+        },
+        "moonshotai.kimi-k2.5" => ChatModelOption {
+            label: "Kimi K2.5".to_string(),
+            model_id,
+            description: Some("Moonshot general-purpose model".to_string()),
+            thinking_mode: None,
+            thinking_effort: None,
+            thinking_budget_tokens: None,
+        },
         "us.anthropic.claude-opus-4-6-v1" | "global.anthropic.claude-opus-4-6-v1" => {
             ChatModelOption {
                 label: "Claude Opus 4.6".to_string(),
@@ -446,30 +591,22 @@ fn default_user_config_contents() -> &'static str {
 app_env = "development"
 data_file = ".ancilla/state.json"
 # database_url = "postgres://user:password@host:5432/ancilla?sslmode=require"
+# basic_auth_username = "ancilla"
+# basic_auth_password = "replace-me"
 # embedder_base_url = "http://10.42.0.50:4000"
 # embedder_timeout_seconds = 30
 aws_region = "us-west-2"
 # aws_profile = "ancilla-dev"
 # aws_config_file = "~/path/to/ancilla/.aws/config"
 # aws_shared_credentials_file = "~/path/to/ancilla/.aws/credentials"
-# bedrock_chat_model_id = "us.anthropic.claude-opus-4-6-v1"
+# aws_bearer_token_bedrock = "bedrock-api-key-..."
+# bedrock_chat_model_id = "moonshot.kimi-k2-thinking"
+# bedrock_gate_model_id = "moonshot.kimi-k2-thinking"
 #
 # [[chat_models]]
-# label = "Claude Opus 4.6"
-# model_id = "us.anthropic.claude-opus-4-6-v1"
-# description = "Deepest reasoning"
-# thinking_mode = "adaptive"
-#
-# [[chat_models]]
-# label = "Claude Sonnet 4.6"
-# model_id = "us.anthropic.claude-sonnet-4-6"
-# description = "Balanced reasoning and speed"
-# thinking_mode = "adaptive"
-#
-# [[chat_models]]
-# label = "Claude Haiku 4.5"
-# model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-# description = "Fastest responses"
+# label = "Kimi K2 Thinking"
+# model_id = "moonshot.kimi-k2-thinking"
+# description = "Moonshot reasoning model"
 bedrock_chat_max_tokens = 800
 bedrock_chat_temperature = 0.2
 accept_client_embeddings = true
@@ -482,22 +619,22 @@ local_context_embed_model = "perplexity-ai/pplx-embed-context-v1-0.6b"
 #[cfg(test)]
 mod tests {
     use std::env;
-    use std::sync::Mutex;
 
     use tempfile::tempdir;
 
     use super::*;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::config::test_env_lock;
 
     #[test]
     fn server_config_loads_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = test_env_lock().lock().unwrap();
         clear_env();
 
         let config = ServerConfig::from_env().unwrap();
         assert_eq!(config.app_env, "development");
         assert_eq!(config.data_file, PathBuf::from(".ancilla/state.json"));
+        assert!(config.basic_auth_username.is_none());
+        assert!(config.basic_auth_password.is_none());
         assert_eq!(config.embedder_timeout_seconds, 30);
         assert_eq!(config.aws_region, "us-west-2");
         assert!(config.accept_client_embeddings);
@@ -506,10 +643,12 @@ mod tests {
 
     #[test]
     fn server_config_loads_env_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = test_env_lock().lock().unwrap();
         clear_env();
         unsafe {
             env::set_var("ANCILLA_SERVER_DATA_FILE", "/tmp/custom.json");
+            env::set_var("ANCILLA_SERVER_BASIC_AUTH_USERNAME", "ancilla");
+            env::set_var("ANCILLA_SERVER_BASIC_AUTH_PASSWORD", "secret-value");
             env::set_var("ANCILLA_SERVER_EMBEDDER_BASE_URL", "http://10.42.0.50:4000");
             env::set_var("ANCILLA_SERVER_EMBEDDER_TIMEOUT_SECONDS", "45");
             env::set_var("ANCILLA_SERVER_AWS_REGION", "eu-west-1");
@@ -519,6 +658,10 @@ mod tests {
                 "ANCILLA_SERVER_AWS_SHARED_CREDENTIALS_FILE",
                 "/tmp/project/.aws/credentials",
             );
+            env::set_var(
+                "ANCILLA_SERVER_AWS_BEARER_TOKEN_BEDROCK",
+                "bedrock-api-key-test-value",
+            );
             env::set_var("ANCILLA_SERVER_BEDROCK_CHAT_MAX_TOKENS", "512");
             env::set_var("ANCILLA_SERVER_BEDROCK_CHAT_TEMPERATURE", "0.1");
             env::set_var("ANCILLA_SERVER_ACCEPT_CLIENT_EMBEDDINGS", "false");
@@ -526,6 +669,8 @@ mod tests {
 
         let config = ServerConfig::from_env().unwrap();
         assert_eq!(config.data_file, PathBuf::from("/tmp/custom.json"));
+        assert_eq!(config.basic_auth_username.as_deref(), Some("ancilla"));
+        assert_eq!(config.basic_auth_password.as_deref(), Some("secret-value"));
         assert_eq!(
             config.embedder_base_url.as_deref(),
             Some("http://10.42.0.50:4000")
@@ -541,6 +686,10 @@ mod tests {
             config.aws_shared_credentials_file,
             Some(PathBuf::from("/tmp/project/.aws/credentials"))
         );
+        assert_eq!(
+            config.aws_bearer_token_bedrock.as_deref(),
+            Some("bedrock-api-key-test-value")
+        );
         assert_eq!(config.bedrock_chat_max_tokens, 512);
         assert_eq!(config.bedrock_chat_temperature, 0.1);
         assert!(!config.accept_client_embeddings);
@@ -548,21 +697,24 @@ mod tests {
 
     #[test]
     fn server_config_loads_file_values() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = test_env_lock().lock().unwrap();
         clear_env();
         let temp_dir = tempdir().unwrap();
-        let config_dir = temp_dir.path().join(SERVER_CONFIG_APP_NAME);
+        let config_dir = temp_dir.path().join(SERVER_CONFIG_DIR_NAME);
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join(SERVER_CONFIG_FILE_NAME),
             r#"
 database_url = "postgres://file"
 data_file = "/tmp/from-file.json"
+basic_auth_username = "ancilla"
+basic_auth_password = "from-file-secret"
 embedder_base_url = "http://10.42.0.77:4000"
 embedder_timeout_seconds = 55
 aws_profile = "ancilla-dev"
 aws_config_file = "~/workspace/ancilla/.aws/config"
 aws_shared_credentials_file = "~/workspace/ancilla/.aws/credentials"
+aws_bearer_token_bedrock = "bedrock-api-key-file-value"
 bedrock_chat_temperature = 0.6
 "#,
         )
@@ -574,18 +726,49 @@ bedrock_chat_temperature = 0.6
         let config = ServerConfig::load().unwrap();
         assert_eq!(config.database_url.as_deref(), Some("postgres://file"));
         assert_eq!(config.data_file, PathBuf::from("/tmp/from-file.json"));
+        assert_eq!(config.basic_auth_username.as_deref(), Some("ancilla"));
+        assert_eq!(
+            config.basic_auth_password.as_deref(),
+            Some("from-file-secret")
+        );
         assert_eq!(
             config.embedder_base_url.as_deref(),
             Some("http://10.42.0.77:4000")
         );
         assert_eq!(config.embedder_timeout_seconds, 55);
         assert_eq!(config.aws_profile.as_deref(), Some("ancilla-dev"));
+        assert_eq!(
+            config.aws_bearer_token_bedrock.as_deref(),
+            Some("bedrock-api-key-file-value")
+        );
         assert_eq!(config.bedrock_chat_temperature, 0.6);
     }
 
     #[test]
+    fn server_config_falls_back_to_legacy_path() {
+        let _guard = test_env_lock().lock().unwrap();
+        clear_env();
+        let temp_dir = tempdir().unwrap();
+        let config_dir = temp_dir.path().join(LEGACY_SERVER_CONFIG_DIR_NAME);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(LEGACY_SERVER_CONFIG_FILE_NAME),
+            r#"
+aws_region = "eu-central-1"
+"#,
+        )
+        .unwrap();
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        }
+
+        let config = ServerConfig::load().unwrap();
+        assert_eq!(config.aws_region, "eu-central-1");
+    }
+
+    #[test]
     fn server_config_init_user_config_creates_scaffold() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = test_env_lock().lock().unwrap();
         clear_env();
         let temp_dir = tempdir().unwrap();
         unsafe {
@@ -609,13 +792,17 @@ bedrock_chat_temperature = 0.6
                 "postgres://ancilla:supersecret@example.com:5432/ancilla?sslmode=require"
                     .to_string(),
             ),
+            basic_auth_username: Some("ancilla".to_string()),
+            basic_auth_password: Some("supersecretpassword".to_string()),
             embedder_base_url: Some("http://10.42.0.50:4000".to_string()),
             embedder_timeout_seconds: 30,
             aws_region: "us-west-2".to_string(),
             aws_profile: Some("ancilla-dev".to_string()),
             aws_config_file: Some(PathBuf::from("/tmp/project/.aws/config")),
             aws_shared_credentials_file: Some(PathBuf::from("/tmp/project/.aws/credentials")),
+            aws_bearer_token_bedrock: Some("bedrock-api-key-example".to_string()),
             bedrock_chat_model_id: Some("us.anthropic.claude-opus-4-6-v1".to_string()),
+            bedrock_gate_model_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
             chat_models: vec![ChatModelOption {
                 label: "Claude Opus 4.6".to_string(),
                 model_id: "us.anthropic.claude-opus-4-6-v1".to_string(),
@@ -635,6 +822,12 @@ bedrock_chat_temperature = 0.6
         let view = config.to_view(false);
         assert_eq!(view.data_backend, "postgres");
         assert_eq!(view.chat_backend, "bedrock");
+        assert!(view.basic_auth_enabled);
+        assert_eq!(view.basic_auth_username.as_deref(), Some("ancilla"));
+        assert_eq!(
+            view.basic_auth_password.as_deref(),
+            Some("supersecretp...word")
+        );
         assert_eq!(view.chat_models.len(), 1);
         assert_eq!(
             view.embedder_base_url.as_deref(),
@@ -644,11 +837,19 @@ bedrock_chat_temperature = 0.6
             view.database_url.as_deref(),
             Some("postgres://ancilla:***@example.com:5432/ancilla?sslmode=require")
         );
+        assert_eq!(
+            view.aws_bearer_token_bedrock.as_deref(),
+            Some("bedrock-api-...mple")
+        );
+        assert_eq!(
+            view.bedrock_gate_model_id.as_deref(),
+            Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+        );
     }
 
     #[test]
     fn server_config_parses_chat_models_json_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = test_env_lock().lock().unwrap();
         clear_env();
         unsafe {
             env::set_var(
@@ -666,18 +867,30 @@ bedrock_chat_temperature = 0.6
         );
     }
 
+    #[test]
+    fn server_config_rejects_half_configured_basic_auth() {
+        let mut config = ServerConfig::from_env().unwrap();
+        config.basic_auth_username = Some("ancilla".to_string());
+        config.basic_auth_password = None;
+        assert!(config.validate().is_err());
+    }
+
     fn clear_env() {
         for key in [
             "ANCILLA_SERVER_APP_ENV",
             "ANCILLA_SERVER_DATA_FILE",
             "ANCILLA_SERVER_DATABASE_URL",
+            "ANCILLA_SERVER_BASIC_AUTH_USERNAME",
+            "ANCILLA_SERVER_BASIC_AUTH_PASSWORD",
             "ANCILLA_SERVER_EMBEDDER_BASE_URL",
             "ANCILLA_SERVER_EMBEDDER_TIMEOUT_SECONDS",
             "ANCILLA_SERVER_AWS_REGION",
             "ANCILLA_SERVER_AWS_PROFILE",
             "ANCILLA_SERVER_AWS_CONFIG_FILE",
             "ANCILLA_SERVER_AWS_SHARED_CREDENTIALS_FILE",
+            "ANCILLA_SERVER_AWS_BEARER_TOKEN_BEDROCK",
             "ANCILLA_SERVER_BEDROCK_CHAT_MODEL_ID",
+            "ANCILLA_SERVER_BEDROCK_GATE_MODEL_ID",
             "ANCILLA_SERVER_BEDROCK_CHAT_MODELS_JSON",
             "ANCILLA_SERVER_BEDROCK_CHAT_MAX_TOKENS",
             "ANCILLA_SERVER_BEDROCK_CHAT_TEMPERATURE",
@@ -688,6 +901,8 @@ bedrock_chat_temperature = 0.6
             "ANCILLA_APP_ENV",
             "ANCILLA_DATA_FILE",
             "DATABASE_URL",
+            "ANCILLA_BASIC_AUTH_USERNAME",
+            "ANCILLA_BASIC_AUTH_PASSWORD",
             "ANCILLA_EMBEDDER_BASE_URL",
             "ANCILLA_EMBEDDER_TIMEOUT_SECONDS",
             "AWS_REGION",
@@ -695,7 +910,9 @@ bedrock_chat_temperature = 0.6
             "AWS_PROFILE",
             "AWS_CONFIG_FILE",
             "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_BEARER_TOKEN_BEDROCK",
             "BEDROCK_CHAT_MODEL_ID",
+            "BEDROCK_GATE_MODEL_ID",
             "BEDROCK_CHAT_MODELS_JSON",
             "BEDROCK_CHAT_MAX_TOKENS",
             "BEDROCK_CHAT_TEMPERATURE",

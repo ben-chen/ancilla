@@ -89,6 +89,37 @@ variable "allowed_ingress_cidr_blocks" {
   default     = ["0.0.0.0/0"]
 }
 
+variable "domain_name" {
+  description = "Optional public DNS name for Ancilla, for example ancillabot.com."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
+variable "create_www_record" {
+  description = "When true and domain_name is set, also create www.<domain_name> pointing at the ALB."
+  type        = bool
+  default     = true
+}
+
+variable "enable_https_listener" {
+  description = "When true, wait for ACM DNS validation and create an HTTPS listener plus HTTP->HTTPS redirect."
+  type        = bool
+  default     = false
+}
+
+variable "basic_auth_enabled" {
+  description = "When true, require HTTP Basic auth for all app routes except /healthz."
+  type        = bool
+  default     = false
+}
+
+variable "basic_auth_username" {
+  description = "Username to require when basic_auth_enabled is true."
+  type        = string
+  default     = "ancilla"
+}
+
 variable "app_port" {
   description = "Ancilla HTTP port inside the container."
   type        = number
@@ -135,6 +166,13 @@ variable "log_retention_days" {
 variable "bedrock_chat_model_id" {
   description = "Bedrock Converse model ID for Ancilla chat responses."
   type        = string
+}
+
+variable "bedrock_gate_model_id" {
+  description = "Bedrock Converse model ID for Ancilla context gating. Leave null to let the server derive a default."
+  type        = string
+  default     = null
+  nullable    = true
 }
 
 variable "bedrock_chat_models" {
@@ -255,6 +293,17 @@ variable "embedder_instance_type" {
   description = "EC2 instance type for the always-on embedder host."
   type        = string
   default     = "g6f.large"
+}
+
+variable "embedder_accelerator" {
+  description = "Accelerator mode for the embedder host. Use cpu for a low-cost fallback or gpu for CUDA-backed inference."
+  type        = string
+  default     = "gpu"
+
+  validation {
+    condition     = contains(["cpu", "gpu"], lower(var.embedder_accelerator))
+    error_message = "embedder_accelerator must be either cpu or gpu."
+  }
 }
 
 variable "embedder_root_volume_size_gb" {

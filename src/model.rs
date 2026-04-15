@@ -219,6 +219,7 @@ pub struct Artifact {
     pub ordinal: u32,
     pub display_text: String,
     pub retrieval_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingVector>,
     #[serde(default = "empty_object")]
     pub metadata: Metadata,
@@ -254,6 +255,7 @@ pub struct MemoryRecord {
     pub confidence: f32,
     pub salience: f32,
     pub state: MemoryState,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingVector>,
     #[serde(default)]
     pub source_artifact_ids: Vec<Uuid>,
@@ -359,6 +361,70 @@ pub struct EmbeddingVector {
     pub source: Option<String>,
 }
 
+impl Artifact {
+    pub fn without_embedding(mut self) -> Self {
+        self.embedding = None;
+        self
+    }
+}
+
+impl MemoryRecord {
+    pub fn without_embedding(mut self) -> Self {
+        self.embedding = None;
+        self
+    }
+}
+
+impl ScoredMemory {
+    pub fn without_embedding(mut self) -> Self {
+        self.memory = self.memory.without_embedding();
+        self
+    }
+}
+
+impl CaptureEntryResponse {
+    pub fn without_embeddings(mut self) -> Self {
+        self.artifacts = self
+            .artifacts
+            .into_iter()
+            .map(Artifact::without_embedding)
+            .collect();
+        self.memories = self
+            .memories
+            .into_iter()
+            .map(MemoryRecord::without_embedding)
+            .collect();
+        self
+    }
+}
+
+impl AssembleContextResponse {
+    pub fn without_embeddings(mut self) -> Self {
+        self.selected_memories = self
+            .selected_memories
+            .into_iter()
+            .map(MemoryRecord::without_embedding)
+            .collect();
+        self.candidates = self
+            .candidates
+            .into_iter()
+            .map(ScoredMemory::without_embedding)
+            .collect();
+        self
+    }
+}
+
+impl ChatResponse {
+    pub fn without_embeddings(mut self) -> Self {
+        self.selected_memories = self
+            .selected_memories
+            .into_iter()
+            .map(MemoryRecord::without_embedding)
+            .collect();
+        self
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PreparedArtifactInput {
     pub kind: ArtifactKind,
@@ -459,6 +525,8 @@ pub struct AssembleContextRequest {
     #[serde(default)]
     pub recent_turns: Vec<ConversationTurn>,
     pub recent_context: Option<String>,
+    #[serde(default)]
+    pub gate_model_id: Option<String>,
     pub conversation_id: Option<Uuid>,
     pub active_thread_id: Option<Uuid>,
     pub focus_from: Option<DateTime<Utc>>,
@@ -485,6 +553,8 @@ pub struct ChatRespondRequest {
     pub message: String,
     #[serde(default)]
     pub model_id: Option<String>,
+    #[serde(default)]
+    pub gate_model_id: Option<String>,
     #[serde(default)]
     pub recent_turns: Vec<ConversationTurn>,
     pub recent_context: Option<String>,

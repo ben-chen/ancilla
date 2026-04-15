@@ -2,6 +2,8 @@ FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
+ARG TORCH_VARIANT=cpu
+
 ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/var/lib/ancilla-embedder/huggingface
 ENV TRANSFORMERS_CACHE=/var/lib/ancilla-embedder/huggingface
@@ -20,7 +22,11 @@ COPY scripts/embedder_service.py /app/scripts/embedder_service.py
 COPY scripts/pplx_embed.py /app/scripts/pplx_embed.py
 
 RUN mkdir -p /var/lib/ancilla-embedder/huggingface \
-  && uv pip install --system --python python --index-url https://download.pytorch.org/whl/cu124 torch \
+  && if [ "$TORCH_VARIANT" = "cu124" ]; then \
+       uv pip install --system --python python --index-url https://download.pytorch.org/whl/cu124 torch; \
+     else \
+       uv pip install --system --python python --index-url https://download.pytorch.org/whl/cpu torch; \
+     fi \
   && uv pip install --system --python python \
     fastapi \
     transformers \

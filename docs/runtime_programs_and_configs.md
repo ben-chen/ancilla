@@ -17,7 +17,7 @@ Responsibilities:
 
 Config file:
 
-- `~/.config/ancilla-server/config.toml`
+- `~/.config/ancilla/server.toml`
 
 This program is the thing you deploy to ECS.
 
@@ -27,6 +27,7 @@ Responsibilities:
 
 - render the ratatui terminal UI
 - talk to a running server over HTTP
+- optionally send HTTP Basic auth from client config
 - preview retrieval/context assembly without invoking the chat model
 - fetch the server-advertised model catalog and let the user pick from it
 - never read the database directly
@@ -34,7 +35,7 @@ Responsibilities:
 
 Config file:
 
-- `~/.config/ancilla-client/config.toml`
+- `~/.config/ancilla/client.toml`
 
 This program is local-only and points at either a local server or the deployed ECS task IP.
 
@@ -45,11 +46,11 @@ The split is intentional:
 - server config owns storage, AWS, Bedrock, and embedding/runtime knobs
 - server config includes the optional `embedder_base_url` used for synchronous embeddings
 - server config also owns which chat models are available
-- client config owns only the remote server address
+- client config owns the remote server address and optional HTTP Basic auth credentials
 
 That keeps deploy concerns out of the TUI and keeps UI concerns out of the server container.
 
-The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be extended further.
+The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be extended further. The loaders also still fall back to `~/.config/ancilla-server/config.toml` and `~/.config/ancilla-client/config.toml` if the new shared-dir files do not exist yet.
 
 ## Operational Consequences
 
@@ -57,7 +58,7 @@ The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be ext
 - the deploy script prints the live task IP and leaves it to the operator to update `ancilla-client` if needed
 - ECS only needs the `ancilla-server` binary in the container image
 - the optional `ancilla-embedder` runtime is a separate service with its own image
-- local TUI testing only needs `base_url`
+- local TUI testing only needs `base_url` unless the server has Basic auth enabled
 
 ## Recommended Local Setup
 
@@ -69,6 +70,6 @@ The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be ext
 For deployed testing:
 
 1. Redeploy the server.
-2. Get the current task IP.
-3. Set `base_url = "http://<ip>:3000"` in `~/.config/ancilla-client/config.toml`.
+2. Set `base_url = "https://ancillabot.com"` or the current ALB DNS name in `~/.config/ancilla/client.toml`.
+3. If the server has Basic auth enabled, also set `basic_auth_username` and `basic_auth_password` in `~/.config/ancilla/client.toml`.
 4. Run `ancilla-client`.

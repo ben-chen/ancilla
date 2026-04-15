@@ -13,6 +13,7 @@ use crate::{
     },
 };
 use anyhow::{Context, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -41,7 +42,7 @@ const COLOR_ERROR: Color = Color::Rgb(255, 115, 115);
 
 pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> anyhow::Result<()> {
     let base_url = resolve_base_url(base_url_override, config)?;
-    let api = RemoteApi::new(base_url.clone())?;
+    let api = RemoteApi::new(base_url.clone(), config)?;
     let mut app = ClientApp::new(base_url);
 
     app.refresh_remote_state(&api).await?;
@@ -65,10 +66,16 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
             ClientAction::Quit => break,
             ClientAction::Refresh => {
                 app.set_info(format!("Refreshing timeline from {}", api.base_url));
-                app.refresh_remote_state(&api).await?;
+                if let Err(error) = app.refresh_remote_state(&api).await {
+                    app.set_request_error("Refresh failed.", "Refresh Error", error.to_string());
+                }
             }
             ClientAction::SubmitAsk { message, model_id } => {
                 app.set_info("Sending question to remote service...");
+                let model_label = app
+                    .selected_model_label()
+                    .unwrap_or("server default")
+                    .to_string();
                 match api
                     .ask(
                         &message,
@@ -82,20 +89,32 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                         app.set_chat_response(message, response);
                         app.set_success("Answer received.");
                     }
-                    Err(error) => app.set_error(error.to_string()),
+                    Err(error) => app.set_request_error(
+                        format!("Chat request failed for {model_label}."),
+                        format!("Chat Error [{model_label}]"),
+                        format!("Q: {message}\n\n{error}"),
+                    ),
                 }
             }
             ClientAction::SubmitAssemble(message) => {
                 app.set_info("Assembling retrieval context on remote service...");
+                let model_label = app
+                    .selected_model_label()
+                    .unwrap_or("server default")
+                    .to_string();
                 match api
-                    .assemble_context(&message, app.conversation_id, &app.recent_turns)
+                    .assemble_context(&message, None, app.conversation_id, &app.recent_turns)
                     .await
                 {
                     Ok(response) => {
                         app.set_context_preview(message, response);
                         app.set_success("Context preview received.");
                     }
-                    Err(error) => app.set_error(error.to_string()),
+                    Err(error) => app.set_request_error(
+                        format!("Context request failed for {model_label}."),
+                        format!("Context Error [{model_label}]"),
+                        format!("Q: {message}\n\n{error}"),
+                    ),
                 }
             }
             ClientAction::SubmitCapture(text) => {
@@ -107,9 +126,19 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                             response.entry.id,
                             response.memories.len()
                         ));
-                        app.refresh_timeline(&api).await?;
+                        if let Err(error) = app.refresh_timeline(&api).await {
+                            app.set_request_error(
+                                "Capture succeeded but refresh failed.",
+                                "Refresh Error",
+                                error.to_string(),
+                            );
+                        }
                     }
-                    Err(error) => app.set_error(error.to_string()),
+                    Err(error) => app.set_request_error(
+                        "Capture failed.",
+                        "Capture Error",
+                        format!("Memory: {text}\n\n{error}"),
+                    ),
                 }
             }
         }
@@ -134,11 +163,24 @@ struct RemoteApi {
 }
 
 impl RemoteApi {
-    fn new(base_url: String) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .context("failed to build HTTP client")?;
+    fn new(base_url: String, config: &ClientConfig) -> anyhow::Result<Self> {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
+
+        if let (Some(username), Some(password)) = (
+            config.basic_auth_username.as_deref(),
+            config.basic_auth_password.as_deref(),
+        ) {
+            let token = BASE64.encode(format!("{username}:{password}"));
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Basic {token}"))
+                    .context("invalid basic auth header value")?,
+            );
+            builder = builder.default_headers(headers);
+        }
+
+        let http = builder.build().context("failed to build HTTP client")?;
         Ok(Self { base_url, http })
     }
 
@@ -195,6 +237,7 @@ impl RemoteApi {
             &ChatRespondRequest {
                 message: message.to_string(),
                 model_id: model_id.map(ToOwned::to_owned),
+                gate_model_id: None,
                 recent_turns: recent_turns.to_vec(),
                 recent_context: None,
                 conversation_id: Some(conversation_id),
@@ -210,6 +253,7 @@ impl RemoteApi {
     async fn assemble_context(
         &self,
         message: &str,
+        gate_model_id: Option<&str>,
         conversation_id: Uuid,
         recent_turns: &[ConversationTurn],
     ) -> anyhow::Result<AssembleContextResponse> {
@@ -219,6 +263,7 @@ impl RemoteApi {
                 query: message.to_string(),
                 recent_turns: recent_turns.to_vec(),
                 recent_context: None,
+                gate_model_id: gate_model_id.map(ToOwned::to_owned),
                 conversation_id: Some(conversation_id),
                 active_thread_id: None,
                 focus_from: None,
@@ -280,7 +325,7 @@ where
                     body
                 }
             });
-        bail!("{message}")
+        bail!("{status}: {message}")
     }
 
     response
@@ -698,6 +743,17 @@ impl ClientApp {
             message: message.into(),
             updated_at: Instant::now(),
         };
+    }
+
+    fn set_request_error(
+        &mut self,
+        status_message: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        self.response_title = title.into();
+        self.response_body = body.into();
+        self.set_error(status_message);
     }
 
     fn selected_model_index(&self) -> Option<usize> {
@@ -1474,6 +1530,23 @@ mod tests {
                 .contains("semantic / project: You are building Ancilla.")
         );
         assert!(app.response_body.contains("Top candidates"));
+    }
+
+    #[test]
+    fn request_error_updates_status_and_response_pane() {
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        app.set_request_error(
+            "Chat request failed for Kimi K2 Thinking.",
+            "Chat Error [Kimi K2 Thinking]",
+            "Q: hello\n\n502 Bad Gateway: upstream model failed",
+        );
+
+        assert_eq!(app.status.kind, StatusKind::Error);
+        assert_eq!(app.response_title, "Chat Error [Kimi K2 Thinking]");
+        assert!(
+            app.response_body
+                .contains("502 Bad Gateway: upstream model failed")
+        );
     }
 
     fn render_screen(app: &mut ClientApp) -> String {

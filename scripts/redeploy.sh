@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/redeploy.sh [--tag TAG] [--skip-healthcheck]
 
-Builds new app and embedder images, pushes them to ECR, updates
+Builds a new app image and, when enabled, an embedder image, pushes them to ECR, updates
 infra/tofu/terraform.tfvars, applies the stack, waits for ECS to stabilize,
 prints the current task public IP, and optionally runs /healthz.
 
@@ -32,6 +32,18 @@ read_tfvar_string() {
   local fallback="$2"
   local value
   value="$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\"[[:space:]]*$/\\1/p" "$TFVARS" | head -n1)"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+read_tfvar_bool() {
+  local key="$1"
+  local fallback="$2"
+  local value
+  value="$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\\1/ip" "$TFVARS" | head -n1 | tr '[:upper:]' '[:lower:]')"
   if [[ -n "$value" ]]; then
     printf '%s\n' "$value"
   else
@@ -92,6 +104,8 @@ AWS_CONFIG_PATH="${AWS_CONFIG_FILE:-$REPO_ROOT/.aws/config}"
 AWS_CREDENTIALS_PATH="${AWS_SHARED_CREDENTIALS_FILE:-$REPO_ROOT/.aws/credentials}"
 AWS_PROFILE_VALUE="${AWS_PROFILE:-$(read_tfvar_string aws_profile ancilla-dev)}"
 AWS_REGION_VALUE="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(read_tfvar_string aws_region us-west-2)}}"
+EMBEDDER_ENABLED="$(read_tfvar_bool embedder_enabled true)"
+EMBEDDER_ACCELERATOR="$(read_tfvar_string embedder_accelerator gpu)"
 
 [[ -f "$AWS_CONFIG_PATH" ]] || fail "missing AWS config file: $AWS_CONFIG_PATH"
 [[ -f "$AWS_CREDENTIALS_PATH" ]] || fail "missing AWS shared credentials file: $AWS_CREDENTIALS_PATH"
@@ -109,19 +123,31 @@ log "using repo-local AWS credentials: $AWS_SHARED_CREDENTIALS_FILE"
 log "using AWS profile: $AWS_PROFILE"
 log "using AWS region: $AWS_REGION"
 log "using image tag: $tag"
+log "embedder enabled: $EMBEDDER_ENABLED"
+if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
+  log "embedder accelerator: $EMBEDDER_ACCELERATOR"
+fi
 
 aws sts get-caller-identity >/dev/null
 
 pushd "$INFRA_DIR" >/dev/null
 log "bootstrapping ECR repositories"
-tofu apply -auto-approve \
-  -target=aws_ecr_repository.app \
-  -target=aws_ecr_repository.embedder >/dev/null
+if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
+  tofu apply -auto-approve \
+    -target=aws_ecr_repository.app \
+    -target=aws_ecr_repository.embedder >/dev/null
+else
+  tofu apply -auto-approve \
+    -target=aws_ecr_repository.app >/dev/null
+fi
 
 ECR_URL="$(tofu output -raw ecr_repository_url)"
-EMBEDDER_ECR_URL="$(tofu output -raw embedder_ecr_repository_url)"
 CLUSTER="$(tofu output -raw ecs_cluster_name)"
 SERVICE="$(tofu output -raw ecs_service_name)"
+EMBEDDER_ECR_URL=""
+if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
+  EMBEDDER_ECR_URL="$(tofu output -raw embedder_ecr_repository_url)"
+fi
 popd >/dev/null
 
 REGISTRY_HOST="${ECR_URL%/*}"
@@ -133,14 +159,29 @@ log "building app image: $ECR_URL:$tag"
 pushd "$REPO_ROOT" >/dev/null
 docker buildx build --platform linux/arm64 --load -t "$ECR_URL:$tag" .
 docker push "$ECR_URL:$tag"
-log "building embedder image: $EMBEDDER_ECR_URL:$tag"
-docker buildx build --platform linux/amd64 --load -f Dockerfile.embedder -t "$EMBEDDER_ECR_URL:$tag" .
-docker push "$EMBEDDER_ECR_URL:$tag"
+if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
+  torch_variant="cpu"
+  if [[ "$EMBEDDER_ACCELERATOR" == "gpu" ]]; then
+    torch_variant="cu124"
+  fi
+  log "building embedder image: $EMBEDDER_ECR_URL:$tag ($EMBEDDER_ACCELERATOR)"
+  docker buildx build \
+    --platform linux/amd64 \
+    --load \
+    --build-arg TORCH_VARIANT="$torch_variant" \
+    -f Dockerfile.embedder \
+    -t "$EMBEDDER_ECR_URL:$tag" .
+  docker push "$EMBEDDER_ECR_URL:$tag"
+else
+  log "skipping embedder image build because embedder_enabled=false"
+fi
 popd >/dev/null
 
 log "updating terraform.tfvars image tags"
 update_tfvar_string "container_image_tag" "$tag"
-update_tfvar_string "embedder_image_tag" "$tag"
+if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
+  update_tfvar_string "embedder_image_tag" "$tag"
+fi
 
 log "applying infrastructure"
 pushd "$INFRA_DIR" >/dev/null
@@ -167,11 +208,16 @@ if [[ "$skip_healthcheck" -eq 0 ]]; then
   curl -sS -o /tmp/ancilla-healthcheck.out -w '[redeploy] healthz status: %{http_code}\n' "http://$APP_IP:3000/healthz"
 fi
 
+EMBEDDER_IMAGE_SUMMARY="disabled"
+if [[ -n "$EMBEDDER_ECR_URL" ]]; then
+  EMBEDDER_IMAGE_SUMMARY="$EMBEDDER_ECR_URL:$tag"
+fi
+
 cat <<EOF
 
 Redeploy complete.
 App image:      $ECR_URL:$tag
-Embedder image: $EMBEDDER_ECR_URL:$tag
+Embedder image: $EMBEDDER_IMAGE_SUMMARY
 Task:           $TASK_ARN
 App IP:         $APP_IP
 Embedder URL:   ${EMBEDDER_URL:-disabled}

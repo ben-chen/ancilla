@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     api,
-    bedrock::build_chat_backend,
+    bedrock::{build_chat_backend, build_context_gate_backend},
     embedder_client::HttpEmbedder,
     model::{
         ChatRespondRequest, CreateAudioEntryRequest, CreateMemoryRequest, MemoryKind,
@@ -108,6 +108,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     let config = ServerConfig::load()?;
+    let basic_auth = match (
+        config.basic_auth_username.as_ref(),
+        config.basic_auth_password.as_ref(),
+    ) {
+        (Some(username), Some(password)) => Some(api::BasicAuthConfig {
+            username: username.clone(),
+            password: password.clone(),
+        }),
+        _ => None,
+    };
     let data_file = data_file.unwrap_or(config.data_file.clone());
     let snapshot_path = if config.database_url.is_some() {
         None
@@ -116,6 +126,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let chat_backend: Arc<dyn crate::bedrock::ChatCompletionBackend> =
         build_chat_backend(&config).await?;
+    let gate_backend = build_context_gate_backend(&config).await?;
     let embedder = if let Some(base_url) = config.embedder_base_url.clone() {
         Some(Arc::new(
             HttpEmbedder::new(
@@ -131,13 +142,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         snapshot_path,
         config.database_url.clone(),
         chat_backend,
+        gate_backend,
         embedder,
         config.local_embed_model.clone(),
     )
     .await?;
 
     match command {
-        Command::Serve { bind } => run_server(service, &bind).await,
+        Command::Serve { bind } => run_server(service, &bind, basic_auth).await,
         Command::Capture {
             text,
             audio_asset,
@@ -240,6 +252,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .chat_respond(ChatRespondRequest {
                     message,
                     model_id: None,
+                    gate_model_id: None,
                     recent_turns: Vec::new(),
                     recent_context: None,
                     conversation_id: None,
@@ -292,12 +305,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-async fn run_server(service: AppService, bind: &str) -> anyhow::Result<()> {
+async fn run_server(
+    service: AppService,
+    bind: &str,
+    basic_auth: Option<api::BasicAuthConfig>,
+) -> anyhow::Result<()> {
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid bind address {bind}"))?;
     let listener = TcpListener::bind(addr).await?;
-    serve(listener, api::router(service)).await?;
+    serve(listener, api::router(service, basic_auth)).await?;
     Ok(())
 }
 
