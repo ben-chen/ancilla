@@ -20,8 +20,9 @@ Reference docs:
 
 - [`docs/runtime_programs_and_configs.md`](docs/runtime_programs_and_configs.md)
 - [`docs/sql_schema_and_retrieval.md`](docs/sql_schema_and_retrieval.md)
-- [`sql/v1_schema.sql`](sql/v1_schema.sql)
-- [`sql/hybrid_memory_candidates.sql`](sql/hybrid_memory_candidates.sql)
+- [`migrations/0001_init.sql`](migrations/0001_init.sql)
+- [`migrations/0003_markdown_memories.sql`](migrations/0003_markdown_memories.sql)
+- [`prompts/memory_creation.md`](prompts/memory_creation.md)
 
 Current embedding choice:
 
@@ -219,17 +220,18 @@ cargo run --bin ancilla-server -- serve --bind 127.0.0.1:3000
 Common admin commands:
 
 - `capture`: store an explicit memory from text or audio, recording the original source modality in entry metadata
+  - text capture now sends freeform context through the model-backed memory generator and may create zero memories if nothing is important enough to keep
 
   ```bash
   cargo run --bin ancilla-server -- capture --text "I prefer Rust for backend services." --timezone UTC
   ```
 
-- `remember`: store an explicit memory with explicit kind and subtype controls
+- `remember`: convenience command for storing one explicit memory directly
+  - this wraps the given text into Ancilla's canonical markdown memory format
+  - for full control over title, tags, and markdown body, use `POST /v1/memories`
 
   ```bash
-  cargo run --bin ancilla-server -- remember "You prefer Rust for backend services." \
-    --kind semantic \
-    --subtype preference
+  cargo run --bin ancilla-server -- remember "You prefer Rust for backend services." --kind semantic
   ```
 
 - `ask`: run context assembly plus the configured chat backend for one question
@@ -257,10 +259,11 @@ Common admin commands:
   ```
 
 - `patch-memory`: update a memory record by ID
+  - this now replaces the stored markdown body directly
 
   ```bash
   cargo run --bin ancilla-server -- patch-memory 00000000-0000-0000-0000-000000000000 \
-    --display-text "You prefer Rust."
+    --markdown "# Rust Preference\n\nTags: preference\n\nYou prefer Rust."
   ```
 
 - `forget`: delete a memory record by ID
@@ -331,7 +334,7 @@ curl http://127.0.0.1:3000/healthz
 curl http://127.0.0.1:3000/v1/timeline
 curl -X POST http://127.0.0.1:3000/v1/memories \
   -H 'content-type: application/json' \
-  --data '{"display_text":"You prefer Rust.","kind":"semantic","subtype":"preference","timezone":"UTC"}'
+  --data '{"content_markdown":"# Rust Preference\n\nTags: preference\n\nYou prefer Rust for backend services.","kind":"semantic","timezone":"UTC"}'
 ```
 
 Deployed service example:
@@ -384,7 +387,21 @@ aws ecs execute-command \
 
 The backend does not assume it owns transcription.
 
-`POST /v1/memories` is now the primary explicit capture path. It stores a text entry plus one durable memory record. `POST /v1/entries/text` and `POST /v1/entries/audio` remain lower-level ingest endpoints for clients that want to manage artifacts or prepared memories explicitly.
+`POST /v1/memories` is the explicit markdown memory store path. It accepts one canonical markdown memory document and stores it directly as a durable memory record.
+
+`POST /v1/memories/generate` is the model-backed memory extraction path. It accepts freeform context text, runs the runtime prompt in [`prompts/memory_creation.md`](prompts/memory_creation.md), and may return zero or more memory documents if the model decides nothing is worth remembering.
+
+Canonical stored memory format:
+
+```md
+# Building Ancilla
+
+Tags: project, ancilla
+
+I am building Ancilla, a personal memory system.
+```
+
+`POST /v1/entries/text` and `POST /v1/entries/audio` remain lower-level ingest endpoints for clients that want to manage artifacts or prepared memories explicitly.
 
 `POST /v1/context/assemble` and `POST /v1/chat/respond` accept either a client-supplied `query_embedding` or recent conversation turns. When the client omits `query_embedding` and the server has `embedder_base_url` configured, the server asks the embedder for a query embedding directly.
 
@@ -437,7 +454,8 @@ Current runtime notes:
 
 - the Postgres path reads and writes the normalized tables directly
 - `entries.kind` is normalized to `text`, `chat_turn`, or `import`; source modality like `text` vs `audio` lives in `entries.metadata.source_modality`
-- candidate retrieval currently runs from the in-memory state view built from Postgres, using hybrid lexical plus cosine similarity ranking
+- memory content is stored as markdown, while `search_text` is derived plain text used for lexical search and embeddings
+- candidate retrieval currently runs from the in-memory state view built from Postgres, using derived-text lexical search plus cosine similarity ranking
 - when `BEDROCK_CHAT_MODEL_ID` is configured, `POST /v1/chat/respond` calls Bedrock `Converse`
 - the JSON file path remains available as a fallback when `DATABASE_URL` is unset
 - the Postgres path expects `pgvector` to be available in the target database
@@ -652,7 +670,11 @@ curl "http://$APP_IP:3000/healthz"
 
 curl -X POST "http://$APP_IP:3000/v1/memories" \
   -H 'content-type: application/json' \
-  --data '{"display_text":"You prefer Rust for backend services.","kind":"semantic","subtype":"preference","timezone":"UTC"}'
+  --data '{"content_markdown":"# Rust Preference\n\nTags: preference\n\nYou prefer Rust for backend services.","kind":"semantic","timezone":"UTC"}'
+
+curl -X POST "http://$APP_IP:3000/v1/memories/generate" \
+  -H 'content-type: application/json' \
+  --data '{"context_text":"I am building Ancilla, a personal memory system.","kind":"semantic","timezone":"UTC"}'
 
 curl "http://$APP_IP:3000/v1/timeline"
 ```

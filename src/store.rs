@@ -9,11 +9,7 @@ use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
-use sqlx::{
-    FromRow, PgPool, Postgres, Transaction,
-    postgres::{PgPoolOptions, types::PgInterval},
-    types::Json,
-};
+use sqlx::{FromRow, PgPool, Postgres, Transaction, postgres::PgPoolOptions, types::Json};
 use tokio::{fs, sync::RwLock};
 use uuid::Uuid;
 
@@ -21,9 +17,6 @@ use crate::model::{
     Artifact, AssembleContextRequest, EmbeddingVector, Entry, GateDecision, MemoryRecord,
     PersistedState, ProfileBlock, RetrievalTrace, RetrievalTraceCandidate, ScoredMemory, Thread,
 };
-use crate::retrieval::build_query_material;
-
-const HYBRID_MEMORY_CANDIDATES_SQL: &str = include_str!("../sql/hybrid_memory_candidates.sql");
 
 #[derive(Clone, Debug)]
 pub struct SharedStore {
@@ -105,12 +98,8 @@ impl SharedStore {
         now: DateTime<Utc>,
         state: &PersistedState,
     ) -> anyhow::Result<Option<Vec<ScoredMemory>>> {
-        match &self.backend {
-            PersistBackend::Postgres(store) => Ok(Some(
-                store.search_candidates(request, limit, now, state).await?,
-            )),
-            PersistBackend::Memory | PersistBackend::JsonFile(_) => Ok(None),
-        }
+        let _ = (request, limit, now, state);
+        Ok(None)
     }
 
     pub async fn write_with<R>(
@@ -212,7 +201,7 @@ impl PostgresStore {
         .collect::<BTreeMap<_, _>>();
 
         for memory in sqlx::query_as::<_, MemoryRow>(
-            "SELECT id, lineage_id, kind, subtype, display_text, retrieval_text, attrs, observed_at, valid_from, valid_to, confidence, salience, state, thread_id, parent_id, path, created_at, updated_at FROM memory_records ORDER BY created_at",
+            "SELECT id, lineage_id, kind, title, tags, content_markdown, search_text, attrs, observed_at, valid_from, valid_to, state, thread_id, parent_id, path, created_at, updated_at FROM memory_records ORDER BY created_at",
         )
         .fetch_all(&self.pool)
         .await
@@ -293,65 +282,6 @@ impl PostgresStore {
         }
 
         Ok(state)
-    }
-
-    async fn search_candidates(
-        &self,
-        request: &AssembleContextRequest,
-        limit: usize,
-        now: DateTime<Utc>,
-        state: &PersistedState,
-    ) -> anyhow::Result<Vec<ScoredMemory>> {
-        let focus_to = request.focus_from.map(|_| request.focus_to.unwrap_or(now));
-        let query_embedding = request
-            .query_embedding
-            .as_ref()
-            .map(|embedding| Vector::from(canonicalize_embedding_values(&embedding.values)));
-        let candidate_limit = i32::try_from(limit.max(20)).context("search limit exceeds i32")?;
-        let final_limit = i32::try_from(limit.max(1)).context("search limit exceeds i32")?;
-
-        let rows = sqlx::query_as::<_, HybridCandidateRow>(HYBRID_MEMORY_CANDIDATES_SQL)
-            .bind(build_query_material(request, &state.threads))
-            .bind(query_embedding)
-            .bind(now)
-            .bind(request.focus_from)
-            .bind(focus_to)
-            .bind(request.active_thread_id)
-            .bind(candidate_limit)
-            .bind(candidate_limit)
-            .bind(final_limit)
-            .bind(PgInterval {
-                months: 0,
-                days: 7,
-                microseconds: 0,
-            })
-            .fetch_all(&self.pool)
-            .await
-            .with_context(|| "failed to execute hybrid memory candidate query")?;
-
-        let mut candidates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(memory) = state.memories.get(&row.id).cloned() else {
-                continue;
-            };
-            candidates.push(ScoredMemory {
-                memory,
-                semantic_score: row.semantic_score.unwrap_or(0.0) as f32,
-                lexical_score: row.lexical_score.unwrap_or(0.0) as f32,
-                fusion_score: row.fusion_score as f32,
-                temporal_bonus: row.temporal_bonus as f32,
-                thread_bonus: row.thread_bonus as f32,
-                salience_bonus: row.salience_bonus as f32,
-                confidence_bonus: row.confidence_bonus as f32,
-                reinjection_penalty: row.reinjection_penalty as f32,
-                stale_penalty: row.stale_penalty as f32,
-                final_score: row.final_score as f32,
-                prior_injected: row.prior_injected,
-                candidate_rank: usize::try_from(row.candidate_rank).unwrap_or_default(),
-            });
-        }
-
-        Ok(candidates)
     }
 
     async fn persist_delta(
@@ -756,15 +686,14 @@ async fn upsert_memory(
           id,
           lineage_id,
           kind,
-          subtype,
-          display_text,
-          retrieval_text,
+          title,
+          tags,
+          content_markdown,
+          search_text,
           attrs,
           observed_at,
           valid_from,
           valid_to,
-          confidence,
-          salience,
           state,
           thread_id,
           parent_id,
@@ -775,20 +704,19 @@ async fn upsert_memory(
         )
         VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-          $11, $12, $13, $14, $15, NULL, $16, $17, $18
+          $11, $12, $13, $14, NULL, $15, $16, $17
         )
         ON CONFLICT (id) DO UPDATE SET
           lineage_id = EXCLUDED.lineage_id,
           kind = EXCLUDED.kind,
-          subtype = EXCLUDED.subtype,
-          display_text = EXCLUDED.display_text,
-          retrieval_text = EXCLUDED.retrieval_text,
+          title = EXCLUDED.title,
+          tags = EXCLUDED.tags,
+          content_markdown = EXCLUDED.content_markdown,
+          search_text = EXCLUDED.search_text,
           attrs = EXCLUDED.attrs,
           observed_at = EXCLUDED.observed_at,
           valid_from = EXCLUDED.valid_from,
           valid_to = EXCLUDED.valid_to,
-          confidence = EXCLUDED.confidence,
-          salience = EXCLUDED.salience,
           state = EXCLUDED.state,
           thread_id = EXCLUDED.thread_id,
           parent_id = EXCLUDED.parent_id,
@@ -799,15 +727,14 @@ async fn upsert_memory(
     .bind(memory.id)
     .bind(memory.lineage_id)
     .bind(enum_text(&memory.kind)?)
-    .bind(enum_text(&memory.subtype)?)
-    .bind(&memory.display_text)
-    .bind(&memory.retrieval_text)
+    .bind(&memory.title)
+    .bind(&memory.tags)
+    .bind(&memory.content_markdown)
+    .bind(&memory.search_text)
     .bind(Json(memory.attrs.clone()))
     .bind(memory.observed_at)
     .bind(memory.valid_from)
     .bind(memory.valid_to)
-    .bind(memory.confidence as f64)
-    .bind(memory.salience as f64)
     .bind(enum_text(&memory.state)?)
     .bind(memory.thread_id)
     .bind(memory.parent_id)
@@ -1137,23 +1064,6 @@ fn derive_selected_memory_ids(candidates: &[RetrievalTraceCandidate]) -> Vec<Uui
 }
 
 #[derive(FromRow)]
-struct HybridCandidateRow {
-    id: Uuid,
-    semantic_score: Option<f64>,
-    lexical_score: Option<f64>,
-    fusion_score: f64,
-    temporal_bonus: f64,
-    thread_bonus: f64,
-    salience_bonus: f64,
-    confidence_bonus: f64,
-    reinjection_penalty: f64,
-    stale_penalty: f64,
-    final_score: f64,
-    prior_injected: bool,
-    candidate_rank: i64,
-}
-
-#[derive(FromRow)]
 struct EntryRow {
     id: Uuid,
     kind: String,
@@ -1274,15 +1184,14 @@ struct MemoryRow {
     id: Uuid,
     lineage_id: Uuid,
     kind: String,
-    subtype: String,
-    display_text: String,
-    retrieval_text: String,
+    title: String,
+    tags: Vec<String>,
+    content_markdown: String,
+    search_text: String,
     attrs: Json<serde_json::Value>,
     observed_at: Option<DateTime<Utc>>,
     valid_from: DateTime<Utc>,
     valid_to: Option<DateTime<Utc>>,
-    confidence: f64,
-    salience: f64,
     state: String,
     thread_id: Option<Uuid>,
     parent_id: Option<Uuid>,
@@ -1299,15 +1208,14 @@ impl TryFrom<MemoryRow> for MemoryRecord {
             id: row.id,
             lineage_id: row.lineage_id,
             kind: parse_enum(&row.kind)?,
-            subtype: parse_enum(&row.subtype)?,
-            display_text: row.display_text,
-            retrieval_text: row.retrieval_text,
+            title: row.title,
+            tags: row.tags,
+            content_markdown: row.content_markdown,
+            search_text: row.search_text,
             attrs: row.attrs.0,
             observed_at: row.observed_at,
             valid_from: row.valid_from,
             valid_to: row.valid_to,
-            confidence: row.confidence as f32,
-            salience: row.salience as f32,
             state: parse_enum(&row.state)?,
             embedding: None,
             source_artifact_ids: Vec::new(),

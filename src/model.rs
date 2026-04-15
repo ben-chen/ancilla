@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::memory_markdown;
+
 pub type Metadata = Value;
 
 pub fn empty_object() -> Metadata {
@@ -61,32 +63,6 @@ pub enum MemoryKind {
     Semantic,
     Episodic,
     Procedural,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Default,
-    clap::ValueEnum,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum MemorySubtype {
-    #[default]
-    Fact,
-    Preference,
-    Project,
-    Habit,
-    Person,
-    Place,
-    Goal,
 }
 
 #[derive(
@@ -244,16 +220,17 @@ pub struct MemoryRecord {
     pub id: Uuid,
     pub lineage_id: Uuid,
     pub kind: MemoryKind,
-    pub subtype: MemorySubtype,
-    pub display_text: String,
-    pub retrieval_text: String,
+    pub title: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub content_markdown: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub search_text: String,
     #[serde(default = "empty_object")]
     pub attrs: Metadata,
     pub observed_at: Option<DateTime<Utc>>,
     pub valid_from: DateTime<Utc>,
     pub valid_to: Option<DateTime<Utc>>,
-    pub confidence: f32,
-    pub salience: f32,
     pub state: MemoryState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingVector>,
@@ -401,7 +378,25 @@ impl Artifact {
 impl MemoryRecord {
     pub fn without_embedding(mut self) -> Self {
         self.embedding = None;
+        self.search_text.clear();
         self
+    }
+
+    pub fn excerpt(&self, max_chars: usize) -> String {
+        memory_markdown::markdown_excerpt(&self.content_markdown, max_chars)
+    }
+
+    pub fn has_tag(&self, tag: &str) -> bool {
+        memory_markdown::has_tag(&self.tags, tag)
+    }
+
+    pub fn context_line(&self) -> String {
+        let excerpt = self.excerpt(180);
+        if excerpt.is_empty() || excerpt == self.title {
+            self.title.clone()
+        } else {
+            format!("{}: {}", self.title, excerpt)
+        }
     }
 }
 
@@ -484,16 +479,12 @@ pub struct PreparedArtifactInput {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PreparedMemoryInput {
     pub kind: MemoryKind,
-    pub subtype: MemorySubtype,
-    pub display_text: String,
-    pub retrieval_text: String,
+    pub content_markdown: String,
     #[serde(default = "empty_object")]
     pub attrs: Metadata,
     pub observed_at: Option<DateTime<Utc>>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
-    pub confidence: Option<f32>,
-    pub salience: Option<f32>,
     pub state: Option<MemoryState>,
     pub embedding: Option<EmbeddingVector>,
     pub thread_title: Option<String>,
@@ -532,10 +523,8 @@ pub struct CreateAudioEntryRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CreateMemoryRequest {
-    pub display_text: String,
-    pub retrieval_text: Option<String>,
+    pub content_markdown: String,
     pub kind: MemoryKind,
-    pub subtype: MemorySubtype,
     pub captured_at: Option<DateTime<Utc>>,
     pub timezone: Option<String>,
     pub source_app: Option<String>,
@@ -544,8 +533,25 @@ pub struct CreateMemoryRequest {
     pub observed_at: Option<DateTime<Utc>>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
-    pub confidence: Option<f32>,
-    pub salience: Option<f32>,
+    pub thread_title: Option<String>,
+    #[serde(default = "empty_object")]
+    pub metadata: Metadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GenerateMemoriesRequest {
+    pub context_text: String,
+    pub kind: MemoryKind,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    pub captured_at: Option<DateTime<Utc>>,
+    pub timezone: Option<String>,
+    pub source_app: Option<String>,
+    #[serde(default = "empty_object")]
+    pub attrs: Metadata,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
     pub thread_title: Option<String>,
     #[serde(default = "empty_object")]
     pub metadata: Metadata,
@@ -560,7 +566,6 @@ pub struct SearchMemoriesRequest {
     pub focus_to: Option<DateTime<Utc>>,
     pub active_thread_id: Option<Uuid>,
     pub kind: Option<MemoryKind>,
-    pub subtype: Option<MemorySubtype>,
     pub query_embedding: Option<EmbeddingVector>,
     pub limit: Option<usize>,
 }
@@ -584,12 +589,9 @@ pub struct AssembleContextRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PatchMemoryRequest {
-    pub display_text: Option<String>,
-    pub retrieval_text: Option<String>,
+    pub content_markdown: Option<String>,
     pub attrs: Option<Metadata>,
     pub valid_to: Option<Option<DateTime<Utc>>>,
-    pub confidence: Option<f32>,
-    pub salience: Option<f32>,
     pub state: Option<MemoryState>,
     pub thread_id: Option<Option<Uuid>>,
 }

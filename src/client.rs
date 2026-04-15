@@ -8,8 +8,8 @@ use crate::{
     model::{
         ApiErrorBody, AssembleContextRequest, AssembleContextResponse, CaptureEntryResponse,
         ChatModelOption, ChatModelsResponse, ChatRespondRequest, ChatResponse, ChatStreamEvent,
-        ConversationRole, ConversationTurn, CreateMemoryRequest, Entry, EntryKind, GateDecision,
-        MemoryKind, MemoryRecord, MemorySubtype, empty_object,
+        ConversationRole, ConversationTurn, Entry, EntryKind, GateDecision,
+        GenerateMemoriesRequest, MemoryKind, MemoryRecord, empty_object,
     },
 };
 use anyhow::{Context, bail};
@@ -106,9 +106,9 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                     ),
                 }
             }
-            ClientAction::SubmitCapture(text) => {
+            ClientAction::SubmitCapture { text, model_id } => {
                 app.set_info("Capturing memory on remote service...");
-                match api.capture_text(&text).await {
+                match api.generate_memories(&text, model_id.as_deref()).await {
                     Ok(response) => {
                         app.set_success(format!(
                             "Captured memory entry {} with {} memories.",
@@ -186,14 +186,17 @@ impl RemoteApi {
         Ok(Some(parse_json_response(response).await?))
     }
 
-    async fn capture_text(&self, raw_text: &str) -> anyhow::Result<CaptureEntryResponse> {
+    async fn generate_memories(
+        &self,
+        raw_text: &str,
+        model_id: Option<&str>,
+    ) -> anyhow::Result<CaptureEntryResponse> {
         self.post_json(
-            "/v1/memories",
-            &CreateMemoryRequest {
-                display_text: raw_text.to_string(),
-                retrieval_text: None,
+            "/v1/memories/generate",
+            &GenerateMemoriesRequest {
+                context_text: raw_text.to_string(),
                 kind: MemoryKind::Semantic,
-                subtype: MemorySubtype::Fact,
+                model_id: model_id.map(ToOwned::to_owned),
                 captured_at: None,
                 timezone: Some("UTC".to_string()),
                 source_app: Some("ratatui-client".to_string()),
@@ -201,8 +204,6 @@ impl RemoteApi {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: None,
                 metadata: empty_object(),
             },
@@ -891,7 +892,10 @@ impl ClientApp {
                             model_id: self.selected_model_id.clone(),
                         },
                         InputMode::ContextPreview => ClientAction::SubmitAssemble(input),
-                        InputMode::Capture => ClientAction::SubmitCapture(input),
+                        InputMode::Capture => ClientAction::SubmitCapture {
+                            text: input,
+                            model_id: self.selected_model_id.clone(),
+                        },
                         InputMode::Normal | InputMode::ModelPicker => ClientAction::None,
                     }
                 }
@@ -1235,7 +1239,10 @@ enum ClientAction {
         model_id: Option<String>,
     },
     SubmitAssemble(String),
-    SubmitCapture(String),
+    SubmitCapture {
+        text: String,
+        model_id: Option<String>,
+    },
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut ClientApp) {
@@ -1342,19 +1349,27 @@ fn draw_memory_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut Client
         app.memories
             .iter()
             .map(|memory| {
-                let title = format!(
-                    "{} / {}  {}",
-                    memory_kind_label(memory.kind),
-                    memory_subtype_label(memory.subtype),
-                    memory.updated_at.format("%Y-%m-%d %H:%M")
-                );
+                let title = if memory.tags.is_empty() {
+                    format!(
+                        "{}  {}",
+                        memory_kind_label(memory.kind),
+                        memory.updated_at.format("%Y-%m-%d %H:%M")
+                    )
+                } else {
+                    format!(
+                        "{} [{}]  {}",
+                        memory_kind_label(memory.kind),
+                        memory.tags.join(", "),
+                        memory.updated_at.format("%Y-%m-%d %H:%M")
+                    )
+                };
                 ListItem::new(vec![
                     Line::from(Span::styled(
                         title,
                         Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(Span::styled(
-                        truncate(&memory.display_text, 56),
+                        truncate(&memory.context_line(), 56),
                         Style::default().fg(COLOR_MUTED),
                     )),
                 ])
@@ -1761,12 +1776,16 @@ fn gate_decision_label(decision: GateDecision) -> &'static str {
 }
 
 fn format_memory(memory: &MemoryRecord) -> String {
-    format!(
-        "{} / {}: {}",
-        memory_kind_label(memory.kind),
-        memory_subtype_label(memory.subtype),
-        memory.display_text
-    )
+    if memory.tags.is_empty() {
+        format!("{}: {}", memory_kind_label(memory.kind), memory.title)
+    } else {
+        format!(
+            "{} [{}]: {}",
+            memory_kind_label(memory.kind),
+            memory.tags.join(", "),
+            memory.title
+        )
+    }
 }
 
 fn memory_kind_label(kind: MemoryKind) -> &'static str {
@@ -1774,18 +1793,6 @@ fn memory_kind_label(kind: MemoryKind) -> &'static str {
         MemoryKind::Semantic => "semantic",
         MemoryKind::Episodic => "episodic",
         MemoryKind::Procedural => "procedural",
-    }
-}
-
-fn memory_subtype_label(subtype: MemorySubtype) -> &'static str {
-    match subtype {
-        MemorySubtype::Fact => "fact",
-        MemorySubtype::Preference => "preference",
-        MemorySubtype::Project => "project",
-        MemorySubtype::Habit => "habit",
-        MemorySubtype::Person => "person",
-        MemorySubtype::Place => "place",
-        MemorySubtype::Goal => "goal",
     }
 }
 
@@ -1813,9 +1820,13 @@ fn selected_memory_text(memory: Option<&MemoryRecord>) -> Text<'static> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("Subtype: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled("Tags: ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
-                memory_subtype_label(memory.subtype),
+                if memory.tags.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    memory.tags.join(", ")
+                },
                 Style::default()
                     .fg(COLOR_ACCENT)
                     .add_modifier(Modifier::BOLD),
@@ -1839,17 +1850,8 @@ fn selected_memory_text(memory: Option<&MemoryRecord>) -> Text<'static> {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Confidence: ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(
-                format!("{:.2}", memory.confidence),
-                Style::default().fg(COLOR_TEXT),
-            ),
-            Span::raw("  "),
-            Span::styled("Salience: ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(
-                format!("{:.2}", memory.salience),
-                Style::default().fg(COLOR_TEXT),
-            ),
+            Span::styled("Title: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(memory.title.clone(), Style::default().fg(COLOR_TEXT)),
         ]),
         Line::from(vec![
             Span::styled("Thread: ", Style::default().fg(COLOR_MUTED)),
@@ -1863,24 +1865,13 @@ fn selected_memory_text(memory: Option<&MemoryRecord>) -> Text<'static> {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "Display text",
+            "Markdown",
             Style::default()
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            memory.display_text.clone(),
-            Style::default().fg(COLOR_TEXT),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Retrieval text",
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            memory.retrieval_text.clone(),
+            memory.content_markdown.clone(),
             Style::default().fg(COLOR_TEXT),
         )),
     ])
@@ -1984,6 +1975,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_markdown::markdown_from_plain_text;
     use crate::model::{GateDecision, MemoryState, ScoredMemory, now_utc};
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
@@ -2053,31 +2045,41 @@ mod tests {
         assert!(screen.contains("No memory selected."));
     }
 
-    #[test]
-    fn context_preview_formats_selected_memories_and_candidates() {
-        let mut app = ClientApp::new("http://example.test:3000".to_string());
-        let memory = MemoryRecord {
+    fn sample_memory(title_text: &str, tags: &[&str]) -> MemoryRecord {
+        let now = now_utc();
+        MemoryRecord {
             id: Uuid::new_v4(),
             lineage_id: Uuid::new_v4(),
             kind: MemoryKind::Semantic,
-            subtype: MemorySubtype::Project,
-            display_text: "You are building Ancilla.".to_string(),
-            retrieval_text: "project Ancilla".to_string(),
+            title: title_text.to_string(),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            content_markdown: markdown_from_plain_text(
+                title_text,
+                &tags
+                    .iter()
+                    .map(|tag| (*tag).to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            search_text: title_text.to_string(),
             attrs: empty_object(),
-            observed_at: Some(now_utc()),
-            valid_from: now_utc(),
+            observed_at: Some(now),
+            valid_from: now,
             valid_to: None,
-            confidence: 0.95,
-            salience: 0.9,
             state: MemoryState::Accepted,
             embedding: None,
             source_artifact_ids: Vec::new(),
             thread_id: None,
             parent_id: None,
             path: None,
-            created_at: now_utc(),
-            updated_at: now_utc(),
-        };
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn context_preview_formats_selected_memories_and_candidates() {
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let memory = sample_memory("You are building Ancilla.", &["project"]);
         app.set_context_preview(
             "What am I building?".to_string(),
             AssembleContextResponse {
@@ -2111,7 +2113,7 @@ mod tests {
         assert!(app.response_body.contains("Selected memories"));
         assert!(
             app.response_body
-                .contains("semantic / project: You are building Ancilla.")
+                .contains("semantic [project]: You are building Ancilla.")
         );
         assert!(app.response_body.contains("Top candidates"));
     }
@@ -2179,28 +2181,7 @@ mod tests {
             injected_context: Some(
                 "Relevant personal context:\n- You are building Ancilla.".to_string(),
             ),
-            selected_memories: vec![MemoryRecord {
-                id: Uuid::new_v4(),
-                lineage_id: Uuid::new_v4(),
-                kind: MemoryKind::Semantic,
-                subtype: MemorySubtype::Project,
-                display_text: "You are building Ancilla.".to_string(),
-                retrieval_text: "building Ancilla".to_string(),
-                attrs: empty_object(),
-                observed_at: Some(now_utc()),
-                valid_from: now_utc(),
-                valid_to: None,
-                confidence: 0.9,
-                salience: 0.8,
-                state: MemoryState::Accepted,
-                embedding: None,
-                source_artifact_ids: Vec::new(),
-                thread_id: None,
-                parent_id: None,
-                path: None,
-                created_at: now_utc(),
-                updated_at: now_utc(),
-            }],
+            selected_memories: vec![sample_memory("You are building Ancilla.", &["project"])],
         }))
         .unwrap();
         tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Delta {

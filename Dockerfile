@@ -4,6 +4,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY prompts ./prompts
 COPY sql ./sql
 
 RUN cargo build --release --bin ancilla-server
@@ -17,6 +18,7 @@ RUN apt-get update \
 
 COPY --from=builder /app/target/release/ancilla-server /usr/local/bin/ancilla-server
 COPY --from=builder /app/migrations /app/migrations
+COPY --from=builder /app/prompts /app/prompts
 COPY --from=builder /app/sql /app/sql
 
 EXPOSE 3000

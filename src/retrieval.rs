@@ -203,25 +203,56 @@ pub fn gate_candidates(
     candidates: &[ScoredMemory],
     max_injected: usize,
 ) -> GateResult {
-    let preferred_subtype = preferred_subtype_for_query(query);
-    let ordered_candidates = reorder_candidates_for_gate(candidates, preferred_subtype);
+    let ordered_candidates = candidates.iter().collect::<Vec<_>>();
     let mut selected = Vec::new();
     let mut seen_lineages = HashSet::new();
+
+    let lowered_query = query.to_ascii_lowercase();
+    let preferred_tag = if query_prefers_tag(&lowered_query, "project") {
+        Some("project")
+    } else if query_prefers_tag(&lowered_query, "preference") {
+        Some("preference")
+    } else if query_prefers_tag(&lowered_query, "goal") {
+        Some("goal")
+    } else {
+        None
+    };
+
+    if let Some(tag) = preferred_tag {
+        for candidate in &ordered_candidates {
+            if candidate.final_score < GATE_THRESHOLD * 0.5 {
+                continue;
+            }
+            if !candidate.memory.has_tag(tag) {
+                continue;
+            }
+            if !seen_lineages.insert(candidate.memory.lineage_id) {
+                continue;
+            }
+            selected.push((*candidate).clone());
+            if selected.len() >= max_injected {
+                break;
+            }
+        }
+
+        if !selected.is_empty() {
+            return GateResult {
+                decision: GateDecision::InjectCompact,
+                confidence: selected[0].final_score.clamp(0.0, 1.0),
+                reason: format!("tag_{tag}"),
+                selected,
+            };
+        }
+    }
+
     for candidate in &ordered_candidates {
-        let threshold = match preferred_subtype {
-            Some(subtype) if candidate.memory.subtype == subtype => 0.12,
-            _ => GATE_THRESHOLD,
-        };
-        if candidate.final_score < threshold {
+        if candidate.final_score < GATE_THRESHOLD {
             continue;
         }
         if !seen_lineages.insert(candidate.memory.lineage_id) {
             continue;
         }
         selected.push((*candidate).clone());
-        if preferred_subtype.is_some() && !selected.is_empty() {
-            break;
-        }
         if selected.len() >= max_injected {
             break;
         }
@@ -252,7 +283,7 @@ pub fn gate_candidates(
         .get(1)
         .map(|next| selected[0].final_score - next.final_score)
         .unwrap_or(selected[0].final_score);
-    if preferred_subtype.is_none() && margin < 0.025 && selected.len() == 1 {
+    if margin < 0.025 && selected.len() == 1 {
         return GateResult {
             decision: GateDecision::DeferToTool,
             confidence: selected[0].final_score.clamp(0.0, 1.0),
@@ -261,10 +292,10 @@ pub fn gate_candidates(
         };
     }
 
-    let reason = match selected[0].memory.subtype {
-        crate::model::MemorySubtype::Preference => "preference_match",
-        crate::model::MemorySubtype::Project => "project_match",
-        crate::model::MemorySubtype::Goal => "goal_match",
+    let reason = match () {
+        _ if selected[0].memory.has_tag("preference") => "tag_preference",
+        _ if selected[0].memory.has_tag("project") => "tag_project",
+        _ if selected[0].memory.has_tag("goal") => "tag_goal",
         _ if selected[0].memory.kind == MemoryKind::Episodic => "episodic_match",
         _ => "high_signal_match",
     };
@@ -277,79 +308,26 @@ pub fn gate_candidates(
     }
 }
 
-fn preferred_subtype_for_query(query: &str) -> Option<crate::model::MemorySubtype> {
-    let normalized = query.to_ascii_lowercase();
-    let query = normalized.as_str();
-
-    if contains_any(
-        query,
-        &[
+fn query_prefers_tag(query: &str, tag: &str) -> bool {
+    match tag {
+        "project" => ["building", "working on", "project", "making", "creating"]
+            .iter()
+            .any(|needle| query.contains(needle)),
+        "preference" => [
             "prefer",
-            "favorite",
-            "favourite",
             "like",
-            "rather than",
-            "instead of",
-            "better than",
-            "do i use",
-            "do i choose",
-        ],
-    ) {
-        return Some(crate::model::MemorySubtype::Preference);
+            "favorite",
+            "drink",
+            "food",
+            "should i use",
+        ]
+        .iter()
+        .any(|needle| query.contains(needle)),
+        "goal" => ["goal", "trying to", "want to", "plan to"]
+            .iter()
+            .any(|needle| query.contains(needle)),
+        _ => false,
     }
-
-    if contains_any(
-        query,
-        &[
-            "what am i building",
-            "what are i building",
-            "what are we building",
-            "building",
-            "working on",
-            "project",
-            "ship",
-        ],
-    ) {
-        return Some(crate::model::MemorySubtype::Project);
-    }
-
-    if contains_any(
-        query,
-        &["goal", "trying to", "want to", "plan to", "aiming to"],
-    ) {
-        return Some(crate::model::MemorySubtype::Goal);
-    }
-
-    None
-}
-
-fn reorder_candidates_for_gate<'a>(
-    candidates: &'a [ScoredMemory],
-    preferred_subtype: Option<crate::model::MemorySubtype>,
-) -> Vec<&'a ScoredMemory> {
-    let Some(preferred_subtype) = preferred_subtype else {
-        return candidates.iter().collect();
-    };
-
-    let mut matching = Vec::new();
-    let mut remainder = Vec::new();
-    for candidate in candidates {
-        if candidate.memory.subtype == preferred_subtype {
-            matching.push(candidate);
-        } else {
-            remainder.push(candidate);
-        }
-    }
-
-    if matching.is_empty() {
-        return candidates.iter().collect();
-    }
-
-    matching.into_iter().chain(remainder).collect()
-}
-
-fn contains_any(query: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| query.contains(needle))
 }
 
 pub fn build_context_bundle(
@@ -364,7 +342,7 @@ pub fn build_context_bundle(
     let mut bundle = String::from("Relevant personal context:\n\n");
     for memory in selected {
         bundle.push_str("- ");
-        bundle.push_str(memory.memory.display_text.trim());
+        bundle.push_str(memory.memory.context_line().trim());
         bundle.push('\n');
     }
 
@@ -473,15 +451,15 @@ pub fn rebuild_profile_blocks(
 
     let identity_lines = accepted
         .iter()
-        .filter(|memory| memory.subtype == crate::model::MemorySubtype::Person)
-        .map(|memory| memory.display_text.clone())
+        .filter(|memory| memory.has_tag("person") || memory.has_tag("identity"))
+        .map(|memory| memory.context_line())
         .take(5)
         .collect::<Vec<_>>();
 
     let preference_lines = accepted
         .iter()
-        .filter(|memory| memory.subtype == crate::model::MemorySubtype::Preference)
-        .map(|memory| memory.display_text.clone())
+        .filter(|memory| memory.has_tag("preference"))
+        .map(|memory| memory.context_line())
         .take(5)
         .collect::<Vec<_>>();
 
@@ -547,7 +525,7 @@ fn lexical_rankings(query: &str, memories: &[MemoryRecord]) -> Vec<(uuid::Uuid, 
     let mut scores = memories
         .iter()
         .map(|memory| {
-            let memory_tokens = tokenize(&memory.retrieval_text);
+            let memory_tokens = tokenize(&memory.search_text);
             let intersection = query_tokens.intersection(&memory_tokens).count() as f32;
             let denom = ((query_tokens.len().max(1) * memory_tokens.len().max(1)) as f32).sqrt();
             let score = if denom == 0.0 {
@@ -582,7 +560,7 @@ fn semantic_rankings(
                     cosine_similarity(&query_embedding.values, &memory_embedding.values)
                 }
                 (None, None) => {
-                    cosine_similarity(&fallback_query_embedding, &embed(&memory.retrieval_text))
+                    cosine_similarity(&fallback_query_embedding, &embed(&memory.search_text))
                 }
                 _ => 0.0,
             };
@@ -655,25 +633,33 @@ mod tests {
     use chrono::Duration;
     use serde_json::json;
 
-    use crate::model::{AssembleContextRequest, MemorySubtype, empty_object, now_utc};
+    use crate::{
+        memory_markdown::markdown_from_plain_text,
+        model::{AssembleContextRequest, empty_object, now_utc},
+    };
 
     use super::*;
 
-    fn memory(text: &str, subtype: MemorySubtype) -> MemoryRecord {
+    fn memory(text: &str, tags: &[&str]) -> MemoryRecord {
         let now = now_utc();
         MemoryRecord {
             id: uuid::Uuid::new_v4(),
             lineage_id: uuid::Uuid::new_v4(),
             kind: MemoryKind::Semantic,
-            subtype,
-            display_text: text.to_string(),
-            retrieval_text: text.to_string(),
+            title: text.to_string(),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            content_markdown: markdown_from_plain_text(
+                text,
+                &tags
+                    .iter()
+                    .map(|tag| (*tag).to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            search_text: text.to_string(),
             attrs: json!({}),
             observed_at: Some(now),
             valid_from: now,
             valid_to: None,
-            confidence: 0.9,
-            salience: 0.9,
             state: MemoryState::Accepted,
             embedding: None,
             source_artifact_ids: Vec::new(),
@@ -688,10 +674,7 @@ mod tests {
     #[test]
     fn gate_prefers_high_signal_unique_lineages() {
         let first = ScoredMemory {
-            memory: memory(
-                "You prefer Rust for backend services.",
-                MemorySubtype::Preference,
-            ),
+            memory: memory("You prefer Rust for backend services.", &["preference"]),
             semantic_score: 0.8,
             lexical_score: 0.8,
             fusion_score: 0.5,
@@ -709,10 +692,7 @@ mod tests {
         duplicate.memory.id = uuid::Uuid::new_v4();
         duplicate.candidate_rank = 2;
         let second = ScoredMemory {
-            memory: memory(
-                "You are building a personal memory system.",
-                MemorySubtype::Project,
-            ),
+            memory: memory("You are building a personal memory system.", &["project"]),
             semantic_score: 0.7,
             lexical_score: 0.6,
             fusion_score: 0.45,
@@ -734,7 +714,7 @@ mod tests {
         );
         assert_eq!(gate.decision, GateDecision::InjectCompact);
         assert_eq!(gate.selected.len(), 2);
-        assert_eq!(gate.reason, "preference_match");
+        assert_eq!(gate.reason, "tag_preference");
         assert_eq!(gate.selected[0].memory.id, first.memory.id);
         assert_eq!(gate.selected[1].memory.id, second.memory.id);
     }
@@ -744,7 +724,7 @@ mod tests {
         let preference = ScoredMemory {
             memory: memory(
                 "You prefer small reliable AWS building blocks.",
-                MemorySubtype::Preference,
+                &["preference"],
             ),
             semantic_score: 0.25,
             lexical_score: 0.20,
@@ -762,7 +742,7 @@ mod tests {
         let project = ScoredMemory {
             memory: memory(
                 "You are building Ancilla, a personal memory system.",
-                MemorySubtype::Project,
+                &["project"],
             ),
             semantic_score: 0.13,
             lexical_score: 0.0,
@@ -780,7 +760,7 @@ mod tests {
 
         let gate = gate_candidates("What am I building?", &[preference, project.clone()], 3);
 
-        assert_eq!(gate.reason, "project_match");
+        assert_eq!(gate.reason, "tag_project");
         assert_eq!(gate.selected.len(), 1);
         assert_eq!(gate.selected[0].memory.id, project.memory.id);
     }
@@ -793,15 +773,17 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             lineage_id: uuid::Uuid::new_v4(),
             kind: MemoryKind::Semantic,
-            subtype: MemorySubtype::Project,
-            display_text: "You are using a retired stack.".to_string(),
-            retrieval_text: "using a retired stack".to_string(),
+            title: "You are using a retired stack.".to_string(),
+            tags: vec!["project".to_string()],
+            content_markdown: markdown_from_plain_text(
+                "You are using a retired stack.",
+                &["project".to_string()],
+            ),
+            search_text: "using a retired stack".to_string(),
             attrs: empty_object(),
             observed_at: Some(now - Duration::days(20)),
             valid_from: now - Duration::days(20),
             valid_to: Some(now - Duration::days(2)),
-            confidence: 0.8,
-            salience: 0.8,
             state: MemoryState::Accepted,
             embedding: None,
             source_artifact_ids: Vec::new(),

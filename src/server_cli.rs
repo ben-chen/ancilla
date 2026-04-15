@@ -10,9 +10,10 @@ use crate::{
     api,
     bedrock::{build_chat_backend, build_context_gate_backend},
     embedder_client::HttpEmbedder,
+    memory_markdown::markdown_from_plain_text,
     model::{
-        ChatRespondRequest, CreateAudioEntryRequest, CreateMemoryRequest, MemoryKind,
-        MemorySubtype, PatchMemoryRequest, SearchMemoriesRequest, empty_object,
+        ChatRespondRequest, CreateAudioEntryRequest, CreateMemoryRequest, GenerateMemoriesRequest,
+        MemoryKind, PatchMemoryRequest, SearchMemoriesRequest, empty_object,
     },
     server_config::ServerConfig,
     service::AppService,
@@ -50,8 +51,6 @@ pub enum Command {
         text: String,
         #[arg(long, default_value = "semantic")]
         kind: MemoryKind,
-        #[arg(long, default_value = "fact")]
-        subtype: MemorySubtype,
         #[arg(long, default_value = "UTC")]
         timezone: String,
         #[arg(long, default_value = "cli")]
@@ -79,7 +78,7 @@ pub enum Command {
     PatchMemory {
         id: Uuid,
         #[arg(long)]
-        display_text: Option<String>,
+        markdown: Option<String>,
     },
 }
 
@@ -160,11 +159,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             if let Some(text) = text {
                 print_json(
                     &service
-                        .create_memory(CreateMemoryRequest {
-                            display_text: text,
-                            retrieval_text: None,
+                        .generate_memories(GenerateMemoriesRequest {
+                            context_text: text,
                             kind: MemoryKind::Semantic,
-                            subtype: MemorySubtype::Fact,
+                            model_id: None,
                             captured_at: None,
                             timezone: Some(timezone),
                             source_app: Some(source_app),
@@ -172,8 +170,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             observed_at: None,
                             valid_from: None,
                             valid_to: None,
-                            confidence: None,
-                            salience: None,
                             thread_title: None,
                             metadata: empty_object(),
                         })
@@ -186,15 +182,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .map(|value| {
                         vec![crate::model::PreparedMemoryInput {
                             kind: MemoryKind::Semantic,
-                            subtype: MemorySubtype::Fact,
-                            display_text: value.trim().to_string(),
-                            retrieval_text: value.trim().to_string(),
+                            content_markdown: markdown_from_plain_text(value.trim(), &[]),
                             attrs: empty_object(),
                             observed_at: None,
                             valid_from: None,
                             valid_to: None,
-                            confidence: None,
-                            salience: None,
                             state: None,
                             embedding: None,
                             thread_title: None,
@@ -223,16 +215,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Remember {
             text,
             kind,
-            subtype,
             timezone,
             source_app,
         } => print_json(
             &service
                 .create_memory(CreateMemoryRequest {
-                    display_text: text,
-                    retrieval_text: None,
+                    content_markdown: markdown_from_plain_text(&text, &[]),
                     kind,
-                    subtype,
                     captured_at: None,
                     timezone: Some(timezone),
                     source_app: Some(source_app),
@@ -240,8 +229,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     observed_at: None,
                     valid_from: None,
                     valid_to: None,
-                    confidence: None,
-                    salience: None,
                     thread_title: None,
                     metadata: empty_object(),
                 })
@@ -275,24 +262,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     focus_to: None,
                     active_thread_id: None,
                     kind: None,
-                    subtype: None,
                     query_embedding: None,
                     limit: Some(10),
                 })
                 .await?,
         ),
         Command::Forget { id } => print_json(&service.delete_memory(id).await?),
-        Command::PatchMemory { id, display_text } => print_json(
+        Command::PatchMemory { id, markdown } => print_json(
             &service
                 .patch_memory(
                     id,
                     PatchMemoryRequest {
-                        display_text,
-                        retrieval_text: None,
+                        content_markdown: markdown,
                         attrs: None,
                         valid_to: None,
-                        confidence: None,
-                        salience: None,
                         state: None,
                         thread_id: None,
                     },

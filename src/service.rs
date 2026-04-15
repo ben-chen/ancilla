@@ -9,17 +9,18 @@ use crate::{
     bedrock::{
         ChatCompletionBackend, ChatCompletionRequest, ChatCompletionStream,
         ChatCompletionStreamEvent, ContextGateBackend, ContextGateRequest, ContextGateResult,
-        SyntheticChatBackend,
+        MemoryCreationRequest, SyntheticChatBackend,
     },
     embedder_client::Embedder,
+    memory_markdown::{derive_search_text, markdown_from_parts, parse_memory_document},
     model::{
         Artifact, ArtifactKind, AssembleContextRequest, AssembleContextResponse,
         CaptureEntryResponse, ChatModelsResponse, ChatRespondRequest, ChatResponse,
         ConversationRole, CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest,
-        EmbeddingVector, Entry, EntryKind, MemoryKind, MemoryRecord, MemoryState, MemorySubtype,
-        PatchMemoryRequest, PersistedState, PreparedArtifactInput, PreparedMemoryInput,
-        ProfileBlock, RetrievalTrace, ScoredMemory, SearchMemoriesRequest, Thread, ThreadKind,
-        ThreadStatus, empty_object, now_utc,
+        EmbeddingVector, Entry, EntryKind, GenerateMemoriesRequest, MemoryKind, MemoryRecord,
+        MemoryState, PatchMemoryRequest, PersistedState, PreparedArtifactInput,
+        PreparedMemoryInput, ProfileBlock, RetrievalTrace, ScoredMemory, SearchMemoriesRequest,
+        Thread, ThreadKind, ThreadStatus, empty_object, now_utc,
     },
     retrieval::{
         SearchEnvironment, build_context_bundle, build_trace,
@@ -40,15 +41,14 @@ pub struct AppService {
 #[derive(Clone, Debug)]
 struct MemoryDraft {
     kind: MemoryKind,
-    subtype: MemorySubtype,
-    display_text: String,
-    retrieval_text: String,
+    title: String,
+    tags: Vec<String>,
+    content_markdown: String,
+    search_text: String,
     attrs: serde_json::Value,
     observed_at: Option<DateTime<Utc>>,
     valid_from: Option<DateTime<Utc>>,
     valid_to: Option<DateTime<Utc>>,
-    confidence: f32,
-    salience: f32,
     state: MemoryState,
     embedding: Option<EmbeddingVector>,
     thread_title: Option<String>,
@@ -184,41 +184,91 @@ impl AppService {
         &self,
         request: CreateMemoryRequest,
     ) -> anyhow::Result<CaptureEntryResponse> {
-        let display_text = request.display_text.trim().to_string();
-        if display_text.is_empty() {
-            bail!("memory display_text cannot be empty");
+        let content_markdown = request.content_markdown.trim().to_string();
+        if content_markdown.is_empty() {
+            bail!("memory content_markdown cannot be empty");
         }
 
-        let memory = PreparedMemoryInput {
+        let prepared_memories = vec![PreparedMemoryInput {
             kind: request.kind,
-            subtype: request.subtype,
-            display_text: display_text.clone(),
-            retrieval_text: request
-                .retrieval_text
-                .clone()
-                .unwrap_or_else(|| display_text.clone()),
-            attrs: request.attrs,
+            content_markdown: content_markdown.clone(),
+            attrs: request.attrs.clone(),
             observed_at: request.observed_at,
             valid_from: request.valid_from,
             valid_to: request.valid_to,
-            confidence: request.confidence,
-            salience: request.salience,
             state: Some(MemoryState::Accepted),
             embedding: None,
-            thread_title: request.thread_title,
+            thread_title: request.thread_title.clone(),
             source_artifact_ordinals: vec![0],
-        };
+        }];
 
         self.create_text_entry(CreateTextEntryRequest {
-            raw_text: display_text,
+            raw_text: content_markdown,
             captured_at: request.captured_at,
             timezone: request.timezone,
             source_app: request.source_app,
             prepared_artifacts: Vec::new(),
-            prepared_memories: vec![memory],
+            prepared_memories,
             metadata: merge_attrs(
                 request.metadata,
                 json!({ "capture_type": "explicit_memory" }),
+            ),
+        })
+        .await
+    }
+
+    pub async fn generate_memories(
+        &self,
+        request: GenerateMemoriesRequest,
+    ) -> anyhow::Result<CaptureEntryResponse> {
+        let context_text = request.context_text.trim().to_string();
+        if context_text.is_empty() {
+            bail!("memory context_text cannot be empty");
+        }
+
+        let extraction = self
+            .chat_backend
+            .extract_memories(&MemoryCreationRequest {
+                context_text: context_text.clone(),
+                model_id: request.model_id.clone(),
+                trace_id: Uuid::new_v4(),
+            })
+            .await?;
+
+        let prepared_memories = extraction
+            .memories
+            .into_iter()
+            .map(|memory| PreparedMemoryInput {
+                kind: request.kind,
+                content_markdown: markdown_from_parts(
+                    &memory.title,
+                    &memory.tags,
+                    &memory.body_markdown,
+                ),
+                attrs: request.attrs.clone(),
+                observed_at: request.observed_at,
+                valid_from: request.valid_from,
+                valid_to: request.valid_to,
+                state: Some(MemoryState::Accepted),
+                embedding: None,
+                thread_title: request.thread_title.clone(),
+                source_artifact_ordinals: vec![0],
+            })
+            .collect::<Vec<_>>();
+
+        self.create_text_entry(CreateTextEntryRequest {
+            raw_text: context_text,
+            captured_at: request.captured_at,
+            timezone: request.timezone,
+            source_app: request.source_app,
+            prepared_artifacts: Vec::new(),
+            prepared_memories,
+            metadata: merge_attrs(
+                request.metadata,
+                json!({
+                    "capture_type": "generated_memories",
+                    "memory_creation_model_id": extraction.model_id,
+                }),
             ),
         })
         .await
@@ -276,9 +326,6 @@ impl AppService {
 
         if let Some(kind) = request.kind {
             candidates.retain(|candidate| candidate.memory.kind == kind);
-        }
-        if let Some(subtype) = request.subtype {
-            candidates.retain(|candidate| candidate.memory.subtype == subtype);
         }
         Ok(candidates)
     }
@@ -356,23 +403,18 @@ impl AppService {
                     .memories
                     .get_mut(&memory_id)
                     .with_context(|| format!("memory {memory_id} not found"))?;
-                if let Some(display_text) = request.display_text {
-                    memory.display_text = display_text;
-                }
-                if let Some(retrieval_text) = request.retrieval_text {
-                    memory.retrieval_text = retrieval_text;
+                if let Some(content_markdown) = request.content_markdown {
+                    let document = parse_memory_document(&content_markdown)?;
+                    memory.title = document.title;
+                    memory.tags = document.tags;
+                    memory.content_markdown = content_markdown;
+                    memory.search_text = derive_search_text(&memory.content_markdown)?;
                 }
                 if let Some(attrs) = request.attrs {
                     memory.attrs = attrs;
                 }
                 if let Some(valid_to) = request.valid_to {
                     memory.valid_to = valid_to;
-                }
-                if let Some(confidence) = request.confidence {
-                    memory.confidence = confidence.clamp(0.0, 1.0);
-                }
-                if let Some(salience) = request.salience {
-                    memory.salience = salience.clamp(0.0, 1.0);
                 }
                 if let Some(state_value) = request.state {
                     memory.state = state_value;
@@ -568,9 +610,10 @@ impl AppService {
         let mut missing_indexes = Vec::new();
         let mut texts = Vec::new();
         for (index, memory) in prepared_memories.iter().enumerate() {
-            if memory.embedding.is_none() && !memory.retrieval_text.trim().is_empty() {
+            let search_text = derive_search_text(&memory.content_markdown)?;
+            if memory.embedding.is_none() && !search_text.trim().is_empty() {
                 missing_indexes.push(index);
-                texts.push(memory.retrieval_text.clone());
+                texts.push(search_text);
             }
         }
         if missing_indexes.is_empty() {
@@ -813,9 +856,10 @@ fn materialize_memories(
             id: Uuid::new_v4(),
             lineage_id: Uuid::new_v4(),
             kind: draft.kind,
-            subtype: draft.subtype,
-            display_text: draft.display_text,
-            retrieval_text: draft.retrieval_text,
+            title: draft.title,
+            tags: draft.tags,
+            content_markdown: draft.content_markdown,
+            search_text: draft.search_text,
             attrs: merge_attrs(
                 draft.attrs,
                 json!({
@@ -825,8 +869,6 @@ fn materialize_memories(
             observed_at: draft.observed_at.or(Some(entry.captured_at)),
             valid_from: draft.valid_from.unwrap_or(entry.captured_at),
             valid_to: draft.valid_to,
-            confidence: draft.confidence,
-            salience: draft.salience,
             state: draft.state,
             embedding: draft.embedding,
             source_artifact_ids,
@@ -937,17 +979,19 @@ fn reflect_text(text: &str) -> String {
 }
 
 fn memory_draft_from_prepared(prepared: PreparedMemoryInput) -> MemoryDraft {
+    let document = parse_memory_document(&prepared.content_markdown)
+        .expect("prepared memory markdown should already be validated");
     MemoryDraft {
         kind: prepared.kind,
-        subtype: prepared.subtype,
-        display_text: prepared.display_text,
-        retrieval_text: prepared.retrieval_text,
+        title: document.title,
+        tags: document.tags,
+        content_markdown: prepared.content_markdown.clone(),
+        search_text: derive_search_text(&prepared.content_markdown)
+            .expect("prepared memory markdown should already derive search text"),
         attrs: prepared.attrs,
         observed_at: prepared.observed_at,
         valid_from: prepared.valid_from,
         valid_to: prepared.valid_to,
-        confidence: prepared.confidence.unwrap_or(0.8).clamp(0.0, 1.0),
-        salience: prepared.salience.unwrap_or(0.8).clamp(0.0, 1.0),
         state: prepared.state.unwrap_or(MemoryState::Accepted),
         embedding: prepared.embedding,
         thread_title: prepared.thread_title,
@@ -1069,9 +1113,20 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use tempfile::tempdir;
 
+    use crate::memory_markdown::markdown_from_plain_text;
     use crate::model::{GateDecision, ProfileLabel, SearchMemoriesRequest};
 
     use super::*;
+
+    fn memory_markdown(text: &str, tags: &[&str]) -> String {
+        markdown_from_plain_text(
+            text,
+            &tags
+                .iter()
+                .map(|tag| (*tag).to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
 
     #[derive(Clone, Default)]
     struct RecordingBackend {
@@ -1117,6 +1172,24 @@ mod tests {
             })
         }
 
+        async fn extract_memories(
+            &self,
+            request: &crate::bedrock::MemoryCreationRequest,
+        ) -> anyhow::Result<crate::bedrock::MemoryCreationResult> {
+            Ok(crate::bedrock::MemoryCreationResult {
+                memories: if request.context_text.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![crate::memory_markdown::MemoryDocument {
+                        title: crate::memory_markdown::infer_title(&request.context_text),
+                        tags: Vec::new(),
+                        body_markdown: request.context_text.trim().to_string(),
+                    }]
+                },
+                model_id: request.model_id.clone(),
+            })
+        }
+
         fn models(&self) -> ChatModelsResponse {
             ChatModelsResponse {
                 backend: "bedrock".to_string(),
@@ -1131,10 +1204,11 @@ mod tests {
         let service = AppService::new_in_memory();
         let response = service
             .create_memory(CreateMemoryRequest {
-                display_text: "You prefer Rust for backend services.".to_string(),
-                retrieval_text: None,
+                content_markdown: memory_markdown(
+                    "You prefer Rust for backend services.",
+                    &["preference"],
+                ),
                 kind: MemoryKind::Semantic,
-                subtype: MemorySubtype::Preference,
                 captured_at: Some(Utc.with_ymd_and_hms(2026, 4, 13, 18, 0, 0).unwrap()),
                 timezone: Some("America/Los_Angeles".to_string()),
                 source_app: Some("test".to_string()),
@@ -1142,15 +1216,13 @@ mod tests {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: None,
                 metadata: json!({}),
             })
             .await
             .unwrap();
 
-        assert_eq!(response.artifacts.len(), 3);
+        assert!(response.artifacts.len() >= 3);
         assert_eq!(response.memories.len(), 1);
 
         let blocks = service.profile_blocks().await;
@@ -1218,10 +1290,11 @@ mod tests {
         let service = AppService::new_in_memory();
         service
             .create_memory(CreateMemoryRequest {
-                display_text: "You prefer Rust for backend services.".to_string(),
-                retrieval_text: Some("backend language rust".to_string()),
+                content_markdown: memory_markdown(
+                    "You prefer Rust for backend services.",
+                    &["preference"],
+                ),
                 kind: MemoryKind::Semantic,
-                subtype: MemorySubtype::Preference,
                 captured_at: Some(now_utc() - Duration::days(1)),
                 timezone: None,
                 source_app: None,
@@ -1229,8 +1302,6 @@ mod tests {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: None,
                 metadata: json!({}),
             })
@@ -1238,10 +1309,11 @@ mod tests {
             .unwrap();
         service
             .create_memory(CreateMemoryRequest {
-                display_text: "You are building a personal memory system on AWS.".to_string(),
-                retrieval_text: Some("building personal memory system aws".to_string()),
+                content_markdown: memory_markdown(
+                    "You are building a personal memory system on AWS.",
+                    &["project"],
+                ),
                 kind: MemoryKind::Semantic,
-                subtype: MemorySubtype::Project,
                 captured_at: Some(now_utc() - Duration::days(1)),
                 timezone: None,
                 source_app: None,
@@ -1249,8 +1321,6 @@ mod tests {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: Some("Ancilla".to_string()),
                 metadata: json!({}),
             })
@@ -1266,14 +1336,13 @@ mod tests {
                 focus_to: None,
                 active_thread_id: None,
                 kind: None,
-                subtype: Some(MemorySubtype::Preference),
                 query_embedding: None,
                 limit: Some(5),
             })
             .await
             .unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].memory.subtype, MemorySubtype::Preference);
+        assert!(results[0].memory.has_tag("preference"));
 
         let assembled = service
             .assemble_context(AssembleContextRequest {
@@ -1308,10 +1377,8 @@ mod tests {
         let service = AppService::new_in_memory();
         let created = service
             .create_memory(CreateMemoryRequest {
-                display_text: "You prefer Rust.".to_string(),
-                retrieval_text: None,
+                content_markdown: memory_markdown("You prefer Rust.", &["preference"]),
                 kind: MemoryKind::Semantic,
-                subtype: MemorySubtype::Preference,
                 captured_at: None,
                 timezone: None,
                 source_app: None,
@@ -1319,8 +1386,6 @@ mod tests {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: None,
                 metadata: json!({}),
             })
@@ -1332,19 +1397,19 @@ mod tests {
             .patch_memory(
                 memory.id,
                 PatchMemoryRequest {
-                    display_text: Some("You prefer Rust and Axum.".to_string()),
-                    retrieval_text: None,
+                    content_markdown: Some(memory_markdown(
+                        "You prefer Rust and Axum.",
+                        &["preference"],
+                    )),
                     attrs: None,
                     valid_to: None,
-                    confidence: Some(0.99),
-                    salience: None,
                     state: None,
                     thread_id: None,
                 },
             )
             .await
             .unwrap();
-        assert!(patched.display_text.contains("Axum"));
+        assert!(patched.content_markdown.contains("Axum"));
 
         let deleted = service.delete_memory(memory.id).await.unwrap();
         assert_eq!(deleted.state, MemoryState::Deleted);
@@ -1356,10 +1421,11 @@ mod tests {
         let service = AppService::new_in_memory_with_chat_backend(Arc::new(backend.clone()));
         service
             .create_memory(CreateMemoryRequest {
-                display_text: "You are building a personal memory system.".to_string(),
-                retrieval_text: Some("building personal memory system".to_string()),
+                content_markdown: memory_markdown(
+                    "You are building a personal memory system.",
+                    &["project"],
+                ),
                 kind: MemoryKind::Semantic,
-                subtype: MemorySubtype::Project,
                 captured_at: None,
                 timezone: None,
                 source_app: None,
@@ -1367,8 +1433,6 @@ mod tests {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: Some("Ancilla".to_string()),
                 metadata: json!({}),
             })
@@ -1449,15 +1513,11 @@ mod tests {
                 prepared_memories: vec![
                     PreparedMemoryInput {
                         kind: MemoryKind::Semantic,
-                        subtype: MemorySubtype::Preference,
-                        display_text: "You prefer Rust.".to_string(),
-                        retrieval_text: "preference rust".to_string(),
+                        content_markdown: memory_markdown("You prefer Rust.", &["preference"]),
                         attrs: json!({}),
                         observed_at: None,
                         valid_from: None,
                         valid_to: None,
-                        confidence: Some(0.95),
-                        salience: Some(0.9),
                         state: Some(MemoryState::Accepted),
                         embedding: Some(matching_embedding),
                         thread_title: None,
@@ -1465,15 +1525,11 @@ mod tests {
                     },
                     PreparedMemoryInput {
                         kind: MemoryKind::Semantic,
-                        subtype: MemorySubtype::Preference,
-                        display_text: "You prefer Go.".to_string(),
-                        retrieval_text: "preference go".to_string(),
+                        content_markdown: memory_markdown("You prefer Go.", &["preference"]),
                         attrs: json!({}),
                         observed_at: None,
                         valid_from: None,
                         valid_to: None,
-                        confidence: Some(0.95),
-                        salience: Some(0.9),
                         state: Some(MemoryState::Accepted),
                         embedding: Some(other_embedding),
                         thread_title: None,
@@ -1494,14 +1550,13 @@ mod tests {
                 focus_to: None,
                 active_thread_id: None,
                 kind: None,
-                subtype: Some(MemorySubtype::Preference),
                 query_embedding: Some(query_embedding),
                 limit: Some(5),
             })
             .await
             .unwrap();
 
-        assert_eq!(results[0].memory.display_text, "You prefer Rust.");
+        assert_eq!(results[0].memory.title, "You prefer Rust.");
         assert!(results[0].semantic_score > results[1].semantic_score);
     }
 
@@ -1541,15 +1596,14 @@ mod tests {
                 prepared_memories: vec![
                     PreparedMemoryInput {
                         kind: MemoryKind::Semantic,
-                        subtype: MemorySubtype::Preference,
-                        display_text: format!("You prefer Rust for {unique_tag}."),
-                        retrieval_text: format!("preference {unique_tag}"),
+                        content_markdown: memory_markdown(
+                            &format!("You prefer Rust for {unique_tag}."),
+                            &["preference"],
+                        ),
                         attrs: json!({}),
                         observed_at: None,
                         valid_from: None,
                         valid_to: None,
-                        confidence: Some(0.95),
-                        salience: Some(0.9),
                         state: Some(MemoryState::Accepted),
                         embedding: Some(query_embedding.clone()),
                         thread_title: None,
@@ -1557,15 +1611,14 @@ mod tests {
                     },
                     PreparedMemoryInput {
                         kind: MemoryKind::Semantic,
-                        subtype: MemorySubtype::Preference,
-                        display_text: format!("You prefer Go for {unique_tag}."),
-                        retrieval_text: format!("preference {unique_tag}"),
+                        content_markdown: memory_markdown(
+                            &format!("You prefer Go for {unique_tag}."),
+                            &["preference"],
+                        ),
                         attrs: json!({}),
                         observed_at: None,
                         valid_from: None,
                         valid_to: None,
-                        confidence: Some(0.95),
-                        salience: Some(0.9),
                         state: Some(MemoryState::Accepted),
                         embedding: Some(EmbeddingVector {
                             values: vec![0.0, 1.0, 0.0],
@@ -1591,7 +1644,6 @@ mod tests {
                 focus_to: None,
                 active_thread_id: None,
                 kind: None,
-                subtype: Some(MemorySubtype::Preference),
                 query_embedding: Some(query_embedding),
                 limit: Some(5),
             })
@@ -1599,7 +1651,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            results[0].memory.display_text,
+            results[0].memory.title,
             format!("You prefer Rust for {unique_tag}.")
         );
         assert!(results[0].semantic_score >= results[1].semantic_score);

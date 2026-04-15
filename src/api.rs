@@ -17,8 +17,8 @@ use uuid::Uuid;
 use crate::{
     model::{
         ApiErrorBody, AssembleContextRequest, ChatRespondRequest, ChatStreamEvent,
-        CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest, PatchMemoryRequest,
-        SearchMemoriesRequest,
+        CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest,
+        GenerateMemoriesRequest, PatchMemoryRequest, SearchMemoriesRequest,
     },
     service::AppService,
 };
@@ -66,6 +66,7 @@ pub fn router(service: AppService, basic_auth: Option<BasicAuthConfig>) -> Route
         .route("/v1/entries/text", post(create_text_entry))
         .route("/v1/entries/audio", post(create_audio_entry))
         .route("/v1/memories", get(get_memories).post(create_memory))
+        .route("/v1/memories/generate", post(generate_memories))
         .route("/v1/timeline", get(get_timeline))
         .route("/v1/chat/models", get(get_chat_models))
         .route("/v1/context/assemble", post(assemble_context))
@@ -160,6 +161,19 @@ async fn create_memory(
         state
             .service
             .create_memory(request)
+            .await?
+            .without_embeddings(),
+    ))
+}
+
+async fn generate_memories(
+    State(state): State<ApiState>,
+    Json(request): Json<GenerateMemoriesRequest>,
+) -> Result<Json<crate::model::CaptureEntryResponse>, ApiError> {
+    Ok(Json(
+        state
+            .service
+            .generate_memories(request)
             .await?
             .without_embeddings(),
     ))
@@ -407,6 +421,7 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
+    use crate::memory_markdown::markdown_from_plain_text;
     use crate::service::AppService;
 
     use super::*;
@@ -426,10 +441,8 @@ mod tests {
                             "timezone": "UTC"
                             ,
                             "prepared_memories": [{
-                                "display_text": "You are building Ancilla, a personal memory system.",
-                                "retrieval_text": "project Ancilla personal memory system",
+                                "content_markdown": "# Building Ancilla\n\nTags: project\n\nYou are building Ancilla, a personal memory system.",
                                 "kind": "semantic",
-                                "subtype": "project",
                                 "embedding": {
                                     "values": [0.1, 0.2, 0.3],
                                     "model": "test-model",
@@ -482,10 +495,11 @@ mod tests {
         let service = AppService::new_in_memory();
         let created = service
             .create_memory(CreateMemoryRequest {
-                display_text: "You prefer Rust.".to_string(),
-                retrieval_text: None,
+                content_markdown: markdown_from_plain_text(
+                    "You prefer Rust.",
+                    &["preference".to_string()],
+                ),
                 kind: crate::model::MemoryKind::Semantic,
-                subtype: crate::model::MemorySubtype::Preference,
                 captured_at: None,
                 timezone: Some("UTC".to_string()),
                 source_app: None,
@@ -493,8 +507,6 @@ mod tests {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: None,
                 metadata: json!({}),
             })
@@ -510,7 +522,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "display_text": "You prefer Rust and SQLx."
+                            "content_markdown": "# You prefer Rust and SQLx.\n\nTags: preference\n\nYou prefer Rust and SQLx."
                         })
                         .to_string(),
                     ))
@@ -532,14 +544,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_generate_memories_route_creates_markdown_memories() {
+        let app = router(AppService::new_in_memory(), None);
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/memories/generate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "context_text": "I am building Ancilla, a personal memory system.",
+                            "kind": "semantic",
+                            "timezone": "UTC"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let memory = &value["memories"][0];
+        assert_eq!(
+            memory["title"],
+            "I am building Ancilla, a personal memory system."
+        );
+        assert!(
+            memory["content_markdown"]
+                .as_str()
+                .unwrap()
+                .starts_with("# I am building Ancilla, a personal memory system.")
+        );
+    }
+
+    #[tokio::test]
     async fn api_lists_memories_without_embeddings() {
         let service = AppService::new_in_memory();
         service
             .create_memory(CreateMemoryRequest {
-                display_text: "You prefer sparkling water.".to_string(),
-                retrieval_text: Some("preference sparkling water over soda".to_string()),
+                content_markdown: markdown_from_plain_text(
+                    "You prefer sparkling water.",
+                    &["preference".to_string()],
+                ),
                 kind: crate::model::MemoryKind::Semantic,
-                subtype: crate::model::MemorySubtype::Preference,
                 captured_at: None,
                 timezone: Some("UTC".to_string()),
                 source_app: None,
@@ -547,8 +599,6 @@ mod tests {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: None,
                 metadata: json!({}),
             })
@@ -568,7 +618,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 1);
         assert!(value[0].get("embedding").is_none());
-        assert_eq!(value[0]["display_text"], "You prefer sparkling water.");
+        assert_eq!(value[0]["title"], "You prefer sparkling water.");
     }
 
     #[tokio::test]
@@ -576,10 +626,11 @@ mod tests {
         let service = AppService::new_in_memory();
         service
             .create_memory(CreateMemoryRequest {
-                display_text: "You are building Ancilla.".to_string(),
-                retrieval_text: Some("building Ancilla".to_string()),
+                content_markdown: markdown_from_plain_text(
+                    "You are building Ancilla.",
+                    &["project".to_string()],
+                ),
                 kind: crate::model::MemoryKind::Semantic,
-                subtype: crate::model::MemorySubtype::Project,
                 captured_at: None,
                 timezone: Some("UTC".to_string()),
                 source_app: None,
@@ -587,8 +638,6 @@ mod tests {
                 observed_at: None,
                 valid_from: None,
                 valid_to: None,
-                confidence: None,
-                salience: None,
                 thread_title: None,
                 metadata: json!({}),
             })

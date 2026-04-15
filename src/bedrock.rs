@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
+    memory_markdown::{MemoryDocument, parse_memory_list_json},
     model::{
         ChatModelOption, ChatModelsResponse, ChatThinkingMode, ConversationTurn, GateDecision,
         MemoryRecord, ScoredMemory,
@@ -33,6 +34,7 @@ use crate::{
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are Ancilla, a personal AI assistant. You are speaking with a specific user over a harness that may provide background memories about that user when they seem relevant. Treat injected memory context as potentially helpful user background, not as guaranteed ground truth about every question. Use it when it is relevant, ignore it when it is not, and never invent personalized facts that were not provided. Answer directly, naturally, and helpfully. In the future this harness may let you search the memory bank or create new explicit memories, but those tools are not available in this turn.";
 const DEFAULT_GATE_SYSTEM_PROMPT: &str = "You are Ancilla's memory gate. Your job is to decide whether candidate stored memories are actually relevant to the user's latest query and recent conversation context. Prefer the smallest useful subset, and prefer no memories when the candidates are weak, redundant, or off-topic. Only select memories that would materially help the assistant answer better. Return strict JSON only with keys decision, confidence, reason, and selected_ids.";
+const MEMORY_CREATION_SYSTEM_PROMPT: &str = include_str!("../prompts/memory_creation.md");
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatCompletionRequest {
@@ -48,6 +50,19 @@ pub struct ChatCompletionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatCompletionResult {
     pub answer: String,
+    pub model_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryCreationRequest {
+    pub context_text: String,
+    pub model_id: Option<String>,
+    pub trace_id: Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryCreationResult {
+    pub memories: Vec<MemoryDocument>,
     pub model_id: Option<String>,
 }
 
@@ -76,6 +91,10 @@ pub trait ChatCompletionBackend: Send + Sync {
         &self,
         request: &ChatCompletionRequest,
     ) -> anyhow::Result<ChatCompletionStream>;
+    async fn extract_memories(
+        &self,
+        request: &MemoryCreationRequest,
+    ) -> anyhow::Result<MemoryCreationResult>;
     fn models(&self) -> ChatModelsResponse;
 }
 
@@ -508,6 +527,48 @@ impl ChatCompletionBackend for BedrockChatBackend {
         })
     }
 
+    async fn extract_memories(
+        &self,
+        request: &MemoryCreationRequest,
+    ) -> anyhow::Result<MemoryCreationResult> {
+        let model = self.resolve_model(request.model_id.as_deref())?;
+        let model_id = model.model_id.clone();
+        let response = self
+            .client
+            .converse()
+            .model_id(&model_id)
+            .set_system(Some(vec![SystemContentBlock::Text(
+                MEMORY_CREATION_SYSTEM_PROMPT.to_string(),
+            )]))
+            .set_messages(Some(vec![
+                Message::builder()
+                    .role(ConversationRole::User)
+                    .content(ContentBlock::Text(request.context_text.clone()))
+                    .build()
+                    .expect("memory creation message build should not fail"),
+            ]))
+            .inference_config(
+                InferenceConfiguration::builder()
+                    .max_tokens(self.settings.max_tokens.max(1600))
+                    .temperature(0.0)
+                    .build(),
+            )
+            .set_request_metadata(Some(HashMap::from([(
+                "trace_id".to_string(),
+                request.trace_id.to_string(),
+            )])))
+            .send()
+            .await
+            .map_err(|error| bedrock_request_error("memory creation", &model_id, &error))?;
+
+        let raw = extract_text_response(&response)?;
+        let memories = parse_memory_list_json(&raw)?;
+        Ok(MemoryCreationResult {
+            memories,
+            model_id: Some(model_id),
+        })
+    }
+
     fn models(&self) -> ChatModelsResponse {
         self.catalog.clone()
     }
@@ -589,6 +650,26 @@ impl ChatCompletionBackend for SyntheticChatBackend {
         })
     }
 
+    async fn extract_memories(
+        &self,
+        request: &MemoryCreationRequest,
+    ) -> anyhow::Result<MemoryCreationResult> {
+        let text = request.context_text.trim();
+        let memories = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![MemoryDocument {
+                title: crate::memory_markdown::infer_title(text),
+                tags: Vec::new(),
+                body_markdown: text.to_string(),
+            }]
+        };
+        Ok(MemoryCreationResult {
+            memories,
+            model_id: None,
+        })
+    }
+
     fn models(&self) -> ChatModelsResponse {
         ChatModelsResponse {
             backend: "synthetic".to_string(),
@@ -604,7 +685,7 @@ pub fn synthesize_answer(message: &str, memories: &[MemoryRecord]) -> String {
     } else {
         let facts = memories
             .iter()
-            .map(|memory| memory.display_text.clone())
+            .map(MemoryRecord::context_line)
             .collect::<Vec<_>>()
             .join(" ");
         format!("Respond to: {message}. Use these memories: {facts}")
@@ -650,9 +731,10 @@ fn build_gate_prompt(request: &ContextGateRequest) -> anyhow::Result<String> {
             .map(|candidate| serde_json::json!({
                 "id": candidate.memory.id,
                 "kind": candidate.memory.kind,
-                "subtype": candidate.memory.subtype,
-                "display_text": candidate.memory.display_text,
-                "retrieval_text_preview": truncate_for_gate(&candidate.memory.retrieval_text, 280),
+                "title": candidate.memory.title,
+                "tags": candidate.memory.tags,
+                "content_markdown_preview": truncate_for_gate(&candidate.memory.content_markdown, 280),
+                "search_text_preview": truncate_for_gate(&candidate.memory.search_text, 280),
                 "semantic_score": candidate.semantic_score,
                 "lexical_score": candidate.lexical_score,
                 "final_score": candidate.final_score,
@@ -876,8 +958,9 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use crate::model::{
-        ChatThinkingEffort, ConversationRole, MemoryKind, MemoryState, MemorySubtype, now_utc,
+    use crate::{
+        memory_markdown::markdown_from_plain_text,
+        model::{ChatThinkingEffort, ConversationRole, MemoryKind, MemoryState, now_utc},
     };
 
     use super::*;
@@ -888,15 +971,17 @@ mod tests {
             id: Uuid::new_v4(),
             lineage_id: Uuid::new_v4(),
             kind: MemoryKind::Semantic,
-            subtype: MemorySubtype::Preference,
-            display_text: "You prefer Rust.".to_string(),
-            retrieval_text: "preference rust".to_string(),
+            title: "You prefer Rust.".to_string(),
+            tags: vec!["preference".to_string()],
+            content_markdown: markdown_from_plain_text(
+                "You prefer Rust.",
+                &["preference".to_string()],
+            ),
+            search_text: "You prefer Rust.\npreference".to_string(),
             attrs: serde_json::json!({}),
             observed_at: Some(now),
             valid_from: now,
             valid_to: None,
-            confidence: 0.9,
-            salience: 0.8,
             state: MemoryState::Accepted,
             embedding: None,
             source_artifact_ids: Vec::new(),

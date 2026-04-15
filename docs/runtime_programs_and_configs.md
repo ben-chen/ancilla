@@ -14,6 +14,7 @@ Responsibilities:
 - optionally call a separate embedder service for live query and memory embeddings
 - own the curated chat model catalog and default model
 - provide local admin commands like `capture`, `remember`, `timeline`, `review`, and `search`
+- expose both explicit markdown-memory storage and model-backed memory generation endpoints
 
 Config file:
 
@@ -63,6 +64,7 @@ The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be ext
 - local TUI testing only needs `base_url` unless the server has Basic auth enabled
 - the TUI now treats the memory browser as the primary view and keeps the timeline as a secondary provenance view
 - chat streaming is additive; `/v1/chat/respond` stays available while the TUI uses `/v1/chat/respond/stream`
+- `capture` in the TUI and CLI now targets the generated-memory path, while explicit markdown writes stay available through `POST /v1/memories`
 
 ## Recommended Local Setup
 
