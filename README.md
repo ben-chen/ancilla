@@ -118,13 +118,13 @@ aws_profile = "ancilla-dev"
 aws_config_file = "~/workspace/ancilla/.aws/config"
 aws_shared_credentials_file = "~/workspace/ancilla/.aws/credentials"
 # aws_bearer_token_bedrock = "bedrock-api-key-..."
-bedrock_chat_model_id = "moonshot.kimi-k2-thinking"
-bedrock_gate_model_id = "moonshot.kimi-k2-thinking"
+bedrock_chat_model_id = "moonshotai.kimi-k2.5"
+bedrock_gate_model_id = "moonshotai.kimi-k2.5"
 
 [[chat_models]]
-label = "Kimi K2 Thinking"
-model_id = "moonshot.kimi-k2-thinking"
-description = "Moonshot reasoning model"
+label = "Kimi K2.5"
+model_id = "moonshotai.kimi-k2.5"
+description = "Moonshot general-purpose model"
 
 bedrock_chat_max_tokens = 800
 bedrock_chat_temperature = 0.2
@@ -142,7 +142,7 @@ cargo run --bin ancilla-server -- show-config --show-secrets
 
 If `database_url` is set, the server uses Postgres. If it is unset, the server falls back to the local JSON state file.
 
-If `bedrock_chat_model_id` is set, `POST /v1/chat/respond` uses Bedrock `Converse`. If it is unset, the server uses the deterministic synthetic backend.
+If `bedrock_chat_model_id` is set, `POST /v1/chat/respond` uses Bedrock `Converse` and `POST /v1/chat/respond/stream` uses Bedrock `ConverseStream`. If it is unset, the server uses the deterministic synthetic backend for both routes.
 
 If a gate model is available, `POST /v1/context/assemble` also uses Bedrock to decide which candidate memories to inject. The server prefers `bedrock_gate_model_id` when set, otherwise it falls back to the latest configured Haiku model, then finally to `bedrock_chat_model_id`. If no Bedrock gate model is available or the Bedrock call fails, the server falls back to the deterministic gate.
 
@@ -152,7 +152,7 @@ If `embedder_base_url` is set, the server asks the embedder service for live que
 
 While Anthropic approval is pending, the recommended temporary config is:
 
-- Kimi K2 Thinking
+- Kimi K2.5
 
 For the deployed AWS service, the live `DATABASE_URL` is not stored in this repo. OpenTofu builds it in [`infra/tofu/main.tf`](infra/tofu/main.tf), stores it in AWS Secrets Manager, and ECS injects it into the container as `DATABASE_URL`.
 
@@ -301,11 +301,11 @@ cargo run --bin ancilla-client -- --base-url http://16.146.111.110:3000
 
 The client UI supports:
 
-- timeline browsing
-- entry inspection
+- memory browsing by default, with `Tab` to switch to the raw timeline
+- memory inspection and entry inspection
 - model selection from the server-advertised catalog with `m`
 - retrieval/context preview with `s`, calling `POST /v1/context/assemble`; when the server has a gate model configured this still uses the Bedrock gate, but it does not generate a final chat answer
-- sending chat questions to the live server
+- sending chat questions to the live server with streamed answer rendering from `POST /v1/chat/respond/stream`
 - capturing new memories on the live server
 
 The client does not define its own model list. It fetches the catalog from `GET /v1/chat/models` and sends the selected `model_id` with each ask request.

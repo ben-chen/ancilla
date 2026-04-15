@@ -501,14 +501,6 @@ fn normalize_chat_models(chat_models: Vec<ChatModelOption>) -> Vec<ChatModelOpti
 fn synthesized_chat_model(model_id: &str) -> ChatModelOption {
     let model_id = canonicalize_chat_model_id(model_id);
     match model_id.as_str() {
-        "moonshot.kimi-k2-thinking" => ChatModelOption {
-            label: "Kimi K2 Thinking".to_string(),
-            model_id,
-            description: Some("Moonshot reasoning model".to_string()),
-            thinking_mode: None,
-            thinking_effort: None,
-            thinking_budget_tokens: None,
-        },
         "moonshotai.kimi-k2.5" => ChatModelOption {
             label: "Kimi K2.5".to_string(),
             model_id,
@@ -586,13 +578,13 @@ aws_region = "us-west-2"
 # aws_config_file = "~/path/to/ancilla/.aws/config"
 # aws_shared_credentials_file = "~/path/to/ancilla/.aws/credentials"
 # aws_bearer_token_bedrock = "bedrock-api-key-..."
-# bedrock_chat_model_id = "moonshot.kimi-k2-thinking"
-# bedrock_gate_model_id = "moonshot.kimi-k2-thinking"
+# bedrock_chat_model_id = "moonshotai.kimi-k2.5"
+# bedrock_gate_model_id = "moonshotai.kimi-k2.5"
 #
 # [[chat_models]]
-# label = "Kimi K2 Thinking"
-# model_id = "moonshot.kimi-k2-thinking"
-# description = "Moonshot reasoning model"
+# label = "Kimi K2.5"
+# model_id = "moonshotai.kimi-k2.5"
+# description = "Moonshot general-purpose model"
 bedrock_chat_max_tokens = 800
 bedrock_chat_temperature = 0.2
 accept_client_embeddings = true

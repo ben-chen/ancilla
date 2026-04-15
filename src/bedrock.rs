@@ -20,6 +20,7 @@ use aws_sdk_bedrockruntime::{
 use aws_smithy_types::{Document, Number};
 use aws_types::region::Region;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
@@ -50,12 +51,31 @@ pub struct ChatCompletionResult {
     pub model_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChatCompletionStreamEvent {
+    Delta(String),
+    Done {
+        answer: String,
+        stop_reason: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+pub struct ChatCompletionStream {
+    pub model_id: Option<String>,
+    pub receiver: mpsc::Receiver<anyhow::Result<ChatCompletionStreamEvent>>,
+}
+
 #[async_trait]
 pub trait ChatCompletionBackend: Send + Sync {
     async fn complete(
         &self,
         request: &ChatCompletionRequest,
     ) -> anyhow::Result<ChatCompletionResult>;
+    async fn start_stream(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> anyhow::Result<ChatCompletionStream>;
     fn models(&self) -> ChatModelsResponse;
 }
 
@@ -389,6 +409,105 @@ impl ChatCompletionBackend for BedrockChatBackend {
         })
     }
 
+    async fn start_stream(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> anyhow::Result<ChatCompletionStream> {
+        let model = self.resolve_model(request.model_id.as_deref())?;
+        let model_id = model.model_id.clone();
+        let system_prompt = compose_system_prompt(
+            DEFAULT_SYSTEM_PROMPT,
+            request.injected_context.as_deref(),
+            request.recent_context.as_deref(),
+            request.trace_id,
+        );
+        let messages = build_bedrock_messages(&request.recent_turns, &request.message);
+        let mut converse = self
+            .client
+            .converse_stream()
+            .model_id(&model_id)
+            .set_system(Some(vec![SystemContentBlock::Text(system_prompt)]))
+            .set_messages(Some(messages))
+            .inference_config(
+                InferenceConfiguration::builder()
+                    .max_tokens(self.settings.max_tokens)
+                    .temperature(self.settings.temperature)
+                    .build(),
+            )
+            .set_request_metadata(Some(HashMap::from([(
+                "trace_id".to_string(),
+                request.trace_id.to_string(),
+            )])));
+        if let Some(additional_fields) = build_additional_model_request_fields(model)? {
+            converse = converse.additional_model_request_fields(additional_fields);
+        }
+        let response = converse
+            .send()
+            .await
+            .map_err(|error| bedrock_request_error("chat_stream", &model_id, &error))?;
+
+        let (tx, rx) = mpsc::channel(64);
+        let stream_model_id = model_id.clone();
+        tokio::spawn(async move {
+            let mut stream = response.stream;
+            let mut answer = String::new();
+            let mut stop_reason = None;
+            loop {
+                match stream.recv().await {
+                    Ok(Some(event)) => match event {
+                        aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockDelta(
+                            delta_event,
+                        ) => {
+                            if let Some(aws_sdk_bedrockruntime::types::ContentBlockDelta::Text(
+                                delta,
+                            )) = delta_event.delta
+                            {
+                                answer.push_str(&delta);
+                                if tx
+                                    .send(Ok(ChatCompletionStreamEvent::Delta(delta)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        aws_sdk_bedrockruntime::types::ConverseStreamOutput::MessageStop(
+                            stop_event,
+                        ) => {
+                            stop_reason = Some(stop_event.stop_reason().to_string());
+                        }
+                        _ => {}
+                    },
+                    Ok(None) => {
+                        let _ = tx
+                            .send(Ok(ChatCompletionStreamEvent::Done {
+                                answer,
+                                stop_reason,
+                            }))
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(bedrock_request_error(
+                                "chat_stream",
+                                &stream_model_id,
+                                &error,
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(ChatCompletionStream {
+            model_id: Some(model_id),
+            receiver: rx,
+        })
+    }
+
     fn models(&self) -> ChatModelsResponse {
         self.catalog.clone()
     }
@@ -444,6 +563,29 @@ impl ChatCompletionBackend for SyntheticChatBackend {
         Ok(ChatCompletionResult {
             answer: synthesize_answer(&request.message, &request.selected_memories),
             model_id: None,
+        })
+    }
+
+    async fn start_stream(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> anyhow::Result<ChatCompletionStream> {
+        let answer = synthesize_answer(&request.message, &request.selected_memories);
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(ChatCompletionStreamEvent::Delta(answer.clone())))
+                .await;
+            let _ = tx
+                .send(Ok(ChatCompletionStreamEvent::Done {
+                    answer,
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(ChatCompletionStream {
+            model_id: None,
+            receiver: rx,
         })
     }
 

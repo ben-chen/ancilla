@@ -7,8 +7,9 @@ use uuid::Uuid;
 
 use crate::{
     bedrock::{
-        ChatCompletionBackend, ChatCompletionRequest, ContextGateBackend, ContextGateRequest,
-        ContextGateResult, SyntheticChatBackend,
+        ChatCompletionBackend, ChatCompletionRequest, ChatCompletionStream,
+        ChatCompletionStreamEvent, ContextGateBackend, ContextGateRequest, ContextGateResult,
+        SyntheticChatBackend,
     },
     embedder_client::Embedder,
     model::{
@@ -52,6 +53,15 @@ struct MemoryDraft {
     embedding: Option<EmbeddingVector>,
     thread_title: Option<String>,
     source_artifact_ordinals: Vec<u32>,
+}
+
+#[derive(Debug)]
+pub struct ChatResponseStream {
+    pub trace_id: Uuid,
+    pub injected_context: Option<String>,
+    pub selected_memories: Vec<MemoryRecord>,
+    pub model_id: Option<String>,
+    pub receiver: tokio::sync::mpsc::Receiver<anyhow::Result<ChatCompletionStreamEvent>>,
 }
 
 impl AppService {
@@ -472,6 +482,70 @@ impl AppService {
             injected_context: context.context,
             selected_memories: context.selected_memories,
             model_id: completion.model_id,
+        })
+    }
+
+    pub async fn chat_respond_stream(
+        &self,
+        request: ChatRespondRequest,
+    ) -> anyhow::Result<ChatResponseStream> {
+        let recent_turns = request.recent_turns.clone();
+        let recent_context = request.recent_context.clone();
+        let context = self
+            .assemble_context(AssembleContextRequest {
+                query: request.message.clone(),
+                recent_turns,
+                recent_context: recent_context.clone(),
+                gate_model_id: request.gate_model_id.clone(),
+                conversation_id: request.conversation_id,
+                active_thread_id: request.active_thread_id,
+                focus_from: request.focus_from,
+                focus_to: request.focus_to,
+                query_embedding: request.query_embedding.clone(),
+                max_candidates: Some(20),
+                max_injected: Some(3),
+            })
+            .await?;
+
+        let ChatCompletionStream { model_id, receiver } = self
+            .chat_backend
+            .start_stream(&ChatCompletionRequest {
+                message: request.message.clone(),
+                model_id: request.model_id.clone(),
+                recent_turns: request.recent_turns.clone(),
+                recent_context,
+                injected_context: context.context.clone(),
+                selected_memories: context.selected_memories.clone(),
+                trace_id: context.trace_id,
+            })
+            .await?;
+
+        self.store
+            .write_with(|state| {
+                let entry = Entry {
+                    id: Uuid::new_v4(),
+                    kind: EntryKind::ChatTurn,
+                    raw_text: Some(request.message.clone()),
+                    asset_ref: None,
+                    captured_at: now_utc(),
+                    timezone: "UTC".to_string(),
+                    source_app: Some("chat".to_string()),
+                    metadata: json!({
+                        "role": ConversationRole::User,
+                        "trace_id": context.trace_id,
+                    }),
+                    created_at: now_utc(),
+                };
+                state.entries.insert(entry.id, entry);
+            })
+            .await?;
+
+        Ok(ChatResponseStream {
+            trace_id: context.trace_id,
+            injected_context: context.context,
+            selected_memories: context.selected_memories,
+            model_id,
+            receiver,
         })
     }
 
@@ -1014,6 +1088,32 @@ mod tests {
             Ok(crate::bedrock::ChatCompletionResult {
                 answer: format!("bedrock-mock: {}", request.message),
                 model_id: request.model_id.clone(),
+            })
+        }
+
+        async fn start_stream(
+            &self,
+            request: &ChatCompletionRequest,
+        ) -> anyhow::Result<crate::bedrock::ChatCompletionStream> {
+            self.seen.lock().unwrap().push(request.clone());
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let answer = format!("bedrock-mock: {}", request.message);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(crate::bedrock::ChatCompletionStreamEvent::Delta(
+                        answer.clone(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(crate::bedrock::ChatCompletionStreamEvent::Done {
+                        answer,
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            });
+            Ok(crate::bedrock::ChatCompletionStream {
+                model_id: request.model_id.clone(),
+                receiver: rx,
             })
         }
 

@@ -354,6 +354,36 @@ pub struct ChatResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatStreamEvent {
+    Start {
+        trace_id: Uuid,
+        #[serde(default)]
+        model_id: Option<String>,
+        injected_context: Option<String>,
+        #[serde(default)]
+        selected_memories: Vec<MemoryRecord>,
+    },
+    Delta {
+        delta: String,
+    },
+    Done {
+        answer: String,
+        trace_id: Uuid,
+        #[serde(default)]
+        model_id: Option<String>,
+        #[serde(default)]
+        stop_reason: Option<String>,
+    },
+    Error {
+        error: String,
+        trace_id: Uuid,
+        #[serde(default)]
+        model_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EmbeddingVector {
     pub values: Vec<f32>,
     pub model: Option<String>,
@@ -421,6 +451,22 @@ impl ChatResponse {
             .into_iter()
             .map(MemoryRecord::without_embedding)
             .collect();
+        self
+    }
+}
+
+impl ChatStreamEvent {
+    pub fn without_embeddings(mut self) -> Self {
+        if let ChatStreamEvent::Start {
+            selected_memories, ..
+        } = &mut self
+        {
+            *selected_memories = selected_memories
+                .clone()
+                .into_iter()
+                .map(MemoryRecord::without_embedding)
+                .collect();
+        }
         self
     }
 }

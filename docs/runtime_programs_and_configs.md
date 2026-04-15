@@ -28,7 +28,9 @@ Responsibilities:
 - render the ratatui terminal UI
 - talk to a running server over HTTP
 - optionally send HTTP Basic auth from client config
+- browse durable memories by default, with a switchable raw-entry timeline
 - preview retrieval/context assembly without invoking the chat model
+- stream chat answers from the server into the response pane
 - fetch the server-advertised model catalog and let the user pick from it
 - never read the database directly
 - never require AWS credentials or Bedrock settings
@@ -59,6 +61,8 @@ The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be ext
 - ECS only needs the `ancilla-server` binary in the container image
 - the optional `ancilla-embedder` runtime is a separate service with its own image
 - local TUI testing only needs `base_url` unless the server has Basic auth enabled
+- the TUI now treats the memory browser as the primary view and keeps the timeline as a secondary provenance view
+- chat streaming is additive; `/v1/chat/respond` stays available while the TUI uses `/v1/chat/respond/stream`
 
 ## Recommended Local Setup
 

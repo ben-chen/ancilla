@@ -12,13 +12,13 @@ domain_name              = "ancillabot.com"
 enable_https_listener    = false
 basic_auth_enabled       = false
 basic_auth_username      = "ancilla"
-bedrock_chat_model_id    = "moonshot.kimi-k2-thinking"
-bedrock_gate_model_id    = "moonshot.kimi-k2-thinking"
+bedrock_chat_model_id    = "moonshotai.kimi-k2.5"
+bedrock_gate_model_id    = "moonshotai.kimi-k2.5"
 bedrock_chat_models = [
   {
-    label       = "Kimi K2 Thinking"
-    model_id    = "moonshot.kimi-k2-thinking"
-    description = "Moonshot reasoning model"
+    label       = "Kimi K2.5"
+    model_id    = "moonshotai.kimi-k2.5"
+    description = "Moonshot general-purpose model"
   },
 ]
 container_image_tag      = "latest"

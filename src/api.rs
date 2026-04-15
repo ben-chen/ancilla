@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::{Path, State},
     http::{HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
@@ -10,12 +11,14 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use thiserror::Error;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use uuid::Uuid;
 
 use crate::{
     model::{
-        ApiErrorBody, AssembleContextRequest, ChatRespondRequest, CreateAudioEntryRequest,
-        CreateMemoryRequest, CreateTextEntryRequest, PatchMemoryRequest, SearchMemoriesRequest,
+        ApiErrorBody, AssembleContextRequest, ChatRespondRequest, ChatStreamEvent,
+        CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest, PatchMemoryRequest,
+        SearchMemoriesRequest,
     },
     service::AppService,
 };
@@ -62,7 +65,7 @@ pub fn router(service: AppService, basic_auth: Option<BasicAuthConfig>) -> Route
     let protected = Router::new()
         .route("/v1/entries/text", post(create_text_entry))
         .route("/v1/entries/audio", post(create_audio_entry))
-        .route("/v1/memories", post(create_memory))
+        .route("/v1/memories", get(get_memories).post(create_memory))
         .route("/v1/timeline", get(get_timeline))
         .route("/v1/chat/models", get(get_chat_models))
         .route("/v1/context/assemble", post(assemble_context))
@@ -73,6 +76,7 @@ pub fn router(service: AppService, basic_auth: Option<BasicAuthConfig>) -> Route
         )
         .route("/v1/profile/blocks", get(profile_blocks))
         .route("/v1/chat/respond", post(chat_respond))
+        .route("/v1/chat/respond/stream", post(chat_respond_stream))
         .route("/v1/retrieval-traces/{id}", get(get_trace))
         .with_state(state.clone());
 
@@ -165,6 +169,18 @@ async fn get_timeline(State(state): State<ApiState>) -> Json<Vec<crate::model::E
     Json(state.service.list_timeline().await)
 }
 
+async fn get_memories(State(state): State<ApiState>) -> Json<Vec<crate::model::MemoryRecord>> {
+    Json(
+        state
+            .service
+            .review_memories()
+            .await
+            .into_iter()
+            .map(crate::model::MemoryRecord::without_embedding)
+            .collect(),
+    )
+}
+
 async fn assemble_context(
     State(state): State<ApiState>,
     Json(request): Json<AssembleContextRequest>,
@@ -237,11 +253,97 @@ async fn chat_respond(
     ))
 }
 
+async fn chat_respond_stream(
+    State(state): State<ApiState>,
+    Json(request): Json<ChatRespondRequest>,
+) -> Result<Response, ApiError> {
+    let stream = state.service.chat_respond_stream(request).await?;
+    let crate::service::ChatResponseStream {
+        trace_id,
+        injected_context,
+        selected_memories,
+        model_id,
+        receiver,
+    } = stream;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+
+    tokio::spawn(async move {
+        let start = ChatStreamEvent::Start {
+            trace_id,
+            model_id: model_id.clone(),
+            injected_context,
+            selected_memories,
+        }
+        .without_embeddings();
+        if send_stream_event(&tx, &start).await.is_err() {
+            return;
+        }
+
+        let mut receiver = receiver;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                Ok(crate::bedrock::ChatCompletionStreamEvent::Delta(delta)) => {
+                    if send_stream_event(&tx, &ChatStreamEvent::Delta { delta })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(crate::bedrock::ChatCompletionStreamEvent::Done {
+                    answer,
+                    stop_reason,
+                }) => {
+                    let done = ChatStreamEvent::Done {
+                        answer,
+                        trace_id,
+                        model_id: model_id.clone(),
+                        stop_reason,
+                    };
+                    let _ = send_stream_event(&tx, &done).await;
+                    return;
+                }
+                Err(error) => {
+                    let error = ChatStreamEvent::Error {
+                        error: error.to_string(),
+                        trace_id,
+                        model_id: model_id.clone(),
+                    };
+                    let _ = send_stream_event(&tx, &error).await;
+                    return;
+                }
+            }
+        }
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(rx).map(Ok::<Bytes, Infallible>));
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-ndjson"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 async fn get_trace(
     State(state): State<ApiState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<crate::model::RetrievalTrace>, ApiError> {
     Ok(Json(state.service.retrieval_trace(id).await?))
+}
+
+async fn send_stream_event(
+    tx: &tokio::sync::mpsc::Sender<Bytes>,
+    event: &ChatStreamEvent,
+) -> Result<(), tokio::sync::mpsc::error::SendError<Bytes>> {
+    let mut line = serde_json::to_vec(event).expect("stream event should serialize");
+    line.push(b'\n');
+    tx.send(Bytes::from(line)).await
 }
 
 #[derive(Debug, Error)]
@@ -429,10 +531,124 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn api_lists_memories_without_embeddings() {
+        let service = AppService::new_in_memory();
+        service
+            .create_memory(CreateMemoryRequest {
+                display_text: "You prefer sparkling water.".to_string(),
+                retrieval_text: Some("preference sparkling water over soda".to_string()),
+                kind: crate::model::MemoryKind::Semantic,
+                subtype: crate::model::MemorySubtype::Preference,
+                captured_at: None,
+                timezone: Some("UTC".to_string()),
+                source_app: None,
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        let app = router(service, None);
+
+        let response = app
+            .oneshot(Request::get("/v1/memories").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert!(value[0].get("embedding").is_none());
+        assert_eq!(value[0]["display_text"], "You prefer sparkling water.");
+    }
+
+    #[tokio::test]
+    async fn api_chat_stream_route_returns_ndjson_events() {
+        let service = AppService::new_in_memory();
+        service
+            .create_memory(CreateMemoryRequest {
+                display_text: "You are building Ancilla.".to_string(),
+                retrieval_text: Some("building Ancilla".to_string()),
+                kind: crate::model::MemoryKind::Semantic,
+                subtype: crate::model::MemorySubtype::Project,
+                captured_at: None,
+                timezone: Some("UTC".to_string()),
+                source_app: None,
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                salience: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        let app = router(service, None);
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/respond/stream")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "message": "What am I building?"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-ndjson"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<ChatStreamEvent>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            events.first(),
+            Some(ChatStreamEvent::Start { .. })
+        ));
+        assert!(matches!(events.last(), Some(ChatStreamEvent::Done { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ChatStreamEvent::Delta { delta } if delta.contains("Respond to:")
+        )));
+        match &events[0] {
+            ChatStreamEvent::Start {
+                selected_memories, ..
+            } => {
+                assert!(!selected_memories.is_empty());
+                assert!(selected_memories[0].embedding.is_none());
+            }
+            _ => panic!("expected start event"),
+        }
+    }
+
     #[test]
     fn api_error_formats_full_chain_and_maps_bedrock_to_bad_gateway() {
         let error = anyhow::anyhow!("dispatch failure")
-            .context("bedrock chat request failed for model `moonshot.kimi-k2-thinking`");
+            .context("bedrock chat request failed for model `moonshotai.kimi-k2.5`");
 
         let api_error = ApiError::from(error);
         let response = api_error.into_response();

@@ -7,9 +7,9 @@ use crate::{
     client_config::{ClientConfig, normalize_base_url},
     model::{
         ApiErrorBody, AssembleContextRequest, AssembleContextResponse, CaptureEntryResponse,
-        ChatModelOption, ChatModelsResponse, ChatRespondRequest, ChatResponse, ConversationRole,
-        ConversationTurn, CreateMemoryRequest, Entry, EntryKind, GateDecision, MemoryKind,
-        MemoryRecord, MemorySubtype, empty_object,
+        ChatModelOption, ChatModelsResponse, ChatRespondRequest, ChatResponse, ChatStreamEvent,
+        ConversationRole, ConversationTurn, CreateMemoryRequest, Entry, EntryKind, GateDecision,
+        MemoryKind, MemoryRecord, MemorySubtype, empty_object,
     },
 };
 use anyhow::{Context, bail};
@@ -27,6 +27,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const COLOR_BG: Color = Color::Rgb(12, 16, 24);
@@ -49,6 +50,7 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
 
     let mut terminal = TerminalSession::enter()?;
     loop {
+        app.drain_stream_events();
         terminal.draw(|frame| draw(frame, &mut app))?;
 
         if !event::poll(Duration::from_millis(125))? {
@@ -65,36 +67,23 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
             ClientAction::None => {}
             ClientAction::Quit => break,
             ClientAction::Refresh => {
-                app.set_info(format!("Refreshing timeline from {}", api.base_url));
+                app.set_info(format!(
+                    "Refreshing memories and timeline from {}",
+                    api.base_url
+                ));
                 if let Err(error) = app.refresh_remote_state(&api).await {
                     app.set_request_error("Refresh failed.", "Refresh Error", error.to_string());
                 }
             }
             ClientAction::SubmitAsk { message, model_id } => {
                 app.set_info("Sending question to remote service...");
-                let model_label = app
-                    .selected_model_label()
-                    .unwrap_or("server default")
-                    .to_string();
-                match api
-                    .ask(
-                        &message,
-                        model_id.as_deref(),
-                        app.conversation_id,
-                        &app.recent_turns,
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        app.set_chat_response(message, response);
-                        app.set_success("Answer received.");
-                    }
-                    Err(error) => app.set_request_error(
-                        format!("Chat request failed for {model_label}."),
-                        format!("Chat Error [{model_label}]"),
-                        format!("Q: {message}\n\n{error}"),
-                    ),
-                }
+                let receiver = api.start_ask_stream(
+                    &message,
+                    model_id.as_deref(),
+                    app.conversation_id,
+                    &app.recent_turns,
+                );
+                app.begin_chat_stream(message, receiver);
             }
             ClientAction::SubmitAssemble(message) => {
                 app.set_info("Assembling retrieval context on remote service...");
@@ -126,7 +115,7 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                             response.entry.id,
                             response.memories.len()
                         ));
-                        if let Err(error) = app.refresh_timeline(&api).await {
+                        if let Err(error) = app.refresh_browse_data(&api).await {
                             app.set_request_error(
                                 "Capture succeeded but refresh failed.",
                                 "Refresh Error",
@@ -157,35 +146,31 @@ fn resolve_base_url(
     }
 }
 
+#[derive(Clone)]
 struct RemoteApi {
     base_url: String,
     http: reqwest::Client,
+    stream_http: reqwest::Client,
 }
 
 impl RemoteApi {
     fn new(base_url: String, config: &ClientConfig) -> anyhow::Result<Self> {
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
-
-        if let (Some(username), Some(password)) = (
-            config.basic_auth_username.as_deref(),
-            config.basic_auth_password.as_deref(),
-        ) {
-            let token = BASE64.encode(format!("{username}:{password}"));
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Basic {token}"))
-                    .context("invalid basic auth header value")?,
-            );
-            builder = builder.default_headers(headers);
-        }
-
-        let http = builder.build().context("failed to build HTTP client")?;
-        Ok(Self { base_url, http })
+        let headers = basic_auth_headers(config)?;
+        let http = build_http_client(headers.clone(), Duration::from_secs(20))?;
+        let stream_http = build_http_client(headers, Duration::from_secs(60 * 60))?;
+        Ok(Self {
+            base_url,
+            http,
+            stream_http,
+        })
     }
 
     async fn get_timeline(&self) -> anyhow::Result<Vec<Entry>> {
         self.get_json("/v1/timeline").await
+    }
+
+    async fn get_memories(&self) -> anyhow::Result<Vec<MemoryRecord>> {
+        self.get_json("/v1/memories").await
     }
 
     async fn get_chat_models(&self) -> anyhow::Result<Option<ChatModelsResponse>> {
@@ -225,29 +210,36 @@ impl RemoteApi {
         .await
     }
 
-    async fn ask(
+    fn start_ask_stream(
         &self,
         message: &str,
         model_id: Option<&str>,
         conversation_id: Uuid,
         recent_turns: &[ConversationTurn],
-    ) -> anyhow::Result<ChatResponse> {
-        self.post_json(
-            "/v1/chat/respond",
-            &ChatRespondRequest {
-                message: message.to_string(),
-                model_id: model_id.map(ToOwned::to_owned),
-                gate_model_id: None,
-                recent_turns: recent_turns.to_vec(),
-                recent_context: None,
-                conversation_id: Some(conversation_id),
-                active_thread_id: None,
-                focus_from: None,
-                focus_to: None,
-                query_embedding: None,
-            },
-        )
-        .await
+    ) -> mpsc::Receiver<RemoteChatUpdate> {
+        let request = ChatRespondRequest {
+            message: message.to_string(),
+            model_id: model_id.map(ToOwned::to_owned),
+            gate_model_id: None,
+            recent_turns: recent_turns.to_vec(),
+            recent_context: None,
+            conversation_id: Some(conversation_id),
+            active_thread_id: None,
+            focus_from: None,
+            focus_to: None,
+            query_embedding: None,
+        };
+        let url = self.url("/v1/chat/respond/stream");
+        let client = self.stream_http.clone();
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            if let Err(error) = pump_chat_stream(client, url, request, tx.clone()).await {
+                let _ = tx.send(RemoteChatUpdate::Error(error.to_string())).await;
+            }
+        });
+
+        rx
     }
 
     async fn assemble_context(
@@ -309,6 +301,33 @@ impl RemoteApi {
     }
 }
 
+fn basic_auth_headers(config: &ClientConfig) -> anyhow::Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let (Some(username), Some(password)) = (
+        config.basic_auth_username.as_deref(),
+        config.basic_auth_password.as_deref(),
+    ) {
+        let token = BASE64.encode(format!("{username}:{password}"));
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Basic {token}"))
+                .context("invalid basic auth header value")?,
+        );
+    }
+    Ok(headers)
+}
+
+fn build_http_client(
+    headers: reqwest::header::HeaderMap,
+    timeout: Duration,
+) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .default_headers(headers)
+        .build()
+        .context("failed to build HTTP client")
+}
+
 async fn parse_json_response<T>(response: reqwest::Response) -> anyhow::Result<T>
 where
     T: serde::de::DeserializeOwned,
@@ -332,6 +351,68 @@ where
         .json::<T>()
         .await
         .with_context(|| format!("failed to decode JSON response with status {status}"))
+}
+
+async fn pump_chat_stream(
+    client: reqwest::Client,
+    url: String,
+    request: ChatRespondRequest,
+    tx: mpsc::Sender<RemoteChatUpdate>,
+) -> anyhow::Result<()> {
+    let mut response = client
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .with_context(|| "request failed for POST /v1/chat/respond/stream")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<ApiErrorBody>(&body)
+            .map(|parsed| parsed.error)
+            .unwrap_or_else(|_| {
+                if body.trim().is_empty() {
+                    format!("request failed with status {status}")
+                } else {
+                    body
+                }
+            });
+        bail!("{status}: {message}");
+    }
+
+    let mut buffer = String::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| "failed to read chat stream chunk")?
+    {
+        let chunk =
+            std::str::from_utf8(&chunk).with_context(|| "chat stream chunk was not UTF-8")?;
+        buffer.push_str(chunk);
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer.drain(..=line_end).collect::<String>();
+            if let Some(event) = parse_stream_line(&line)? {
+                if tx.send(RemoteChatUpdate::Event(event)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    if let Some(event) = parse_stream_line(&buffer)? {
+        let _ = tx.send(RemoteChatUpdate::Event(event)).await;
+    }
+    Ok(())
+}
+
+fn parse_stream_line(line: &str) -> anyhow::Result<Option<ChatStreamEvent>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str::<ChatStreamEvent>(trimmed)
+        .map(Some)
+        .with_context(|| "failed to decode chat stream event")
 }
 
 struct TerminalSession {
@@ -378,6 +459,12 @@ enum InputMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowseTab {
+    Memories,
+    Timeline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusKind {
     Info,
     Success,
@@ -390,11 +477,28 @@ struct StatusLine {
     updated_at: Instant,
 }
 
+struct ActiveChatStream {
+    prompt: String,
+    answer: String,
+    trace_id: Option<Uuid>,
+    injected_context: Option<String>,
+    selected_memories: Vec<MemoryRecord>,
+    model_id: Option<String>,
+}
+
+enum RemoteChatUpdate {
+    Event(ChatStreamEvent),
+    Error(String),
+}
+
 struct ClientApp {
     base_url: String,
     conversation_id: Uuid,
     recent_turns: Vec<ConversationTurn>,
     mode: InputMode,
+    browse_tab: BrowseTab,
+    memories: Vec<MemoryRecord>,
+    memory_state: ListState,
     timeline: Vec<Entry>,
     timeline_state: ListState,
     input: String,
@@ -405,10 +509,14 @@ struct ClientApp {
     chat_models: Vec<ChatModelOption>,
     model_state: ListState,
     selected_model_id: Option<String>,
+    stream_receiver: Option<mpsc::Receiver<RemoteChatUpdate>>,
+    active_stream: Option<ActiveChatStream>,
 }
 
 impl ClientApp {
     fn new(base_url: String) -> Self {
+        let mut memory_state = ListState::default();
+        memory_state.select(Some(0));
         let mut timeline_state = ListState::default();
         timeline_state.select(Some(0));
         Self {
@@ -416,12 +524,15 @@ impl ClientApp {
             conversation_id: Uuid::new_v4(),
             recent_turns: Vec::new(),
             mode: InputMode::Normal,
+            browse_tab: BrowseTab::Memories,
+            memories: Vec::new(),
+            memory_state,
             timeline: Vec::new(),
             timeline_state,
             input: String::new(),
             response_title: "Response".to_string(),
             response_body:
-                "Press 's' to preview retrieval context, 'a' to ask the live service, or 'c' to capture a new memory."
+                "Press 's' to preview retrieval context, 'a' to ask the live service, or 'c' to capture a new memory. The memory browser is the default view; press Tab to switch to the raw timeline."
                     .to_string(),
             status: StatusLine {
                 kind: StatusKind::Info,
@@ -432,12 +543,38 @@ impl ClientApp {
             chat_models: Vec::new(),
             model_state: ListState::default(),
             selected_model_id: None,
+            stream_receiver: None,
+            active_stream: None,
         }
     }
 
     async fn refresh_remote_state(&mut self, api: &RemoteApi) -> anyhow::Result<()> {
         self.refresh_models(api).await?;
-        self.refresh_timeline(api).await
+        self.refresh_browse_data(api).await
+    }
+
+    async fn refresh_browse_data(&mut self, api: &RemoteApi) -> anyhow::Result<()> {
+        self.refresh_memories(api).await?;
+        self.refresh_timeline(api).await?;
+        self.set_success(format!(
+            "Loaded {} memories and {} entries from {}.",
+            self.memories.len(),
+            self.timeline.len(),
+            api.base_url
+        ));
+        Ok(())
+    }
+
+    async fn refresh_memories(&mut self, api: &RemoteApi) -> anyhow::Result<()> {
+        let memories = api.get_memories().await?;
+        self.memories = memories;
+        let next_selected = match self.memory_state.selected() {
+            Some(index) if !self.memories.is_empty() => Some(index.min(self.memories.len() - 1)),
+            _ if self.memories.is_empty() => None,
+            _ => Some(0),
+        };
+        self.memory_state.select(next_selected);
+        Ok(())
     }
 
     async fn refresh_timeline(&mut self, api: &RemoteApi) -> anyhow::Result<()> {
@@ -449,11 +586,6 @@ impl ClientApp {
             _ => Some(0),
         };
         self.timeline_state.select(next_selected);
-        self.set_success(format!(
-            "Loaded {} entries from {}.",
-            self.timeline.len(),
-            api.base_url
-        ));
         Ok(())
     }
 
@@ -484,7 +616,184 @@ impl ClientApp {
         self.model_state.select(self.selected_model_index());
     }
 
+    fn has_active_stream(&self) -> bool {
+        self.stream_receiver.is_some()
+    }
+
+    fn begin_chat_stream(&mut self, prompt: String, receiver: mpsc::Receiver<RemoteChatUpdate>) {
+        self.active_stream = Some(ActiveChatStream {
+            prompt: prompt.clone(),
+            answer: String::new(),
+            trace_id: None,
+            injected_context: None,
+            selected_memories: Vec::new(),
+            model_id: None,
+        });
+        self.stream_receiver = Some(receiver);
+        self.response_title = "Response [streaming]".to_string();
+        self.response_body = format!("Q: {prompt}\n\n");
+        self.set_info("Streaming response from the remote service...");
+    }
+
+    fn drain_stream_events(&mut self) {
+        let Some(mut receiver) = self.stream_receiver.take() else {
+            return;
+        };
+
+        let mut keep_receiver = true;
+        loop {
+            match receiver.try_recv() {
+                Ok(update) => match update {
+                    RemoteChatUpdate::Event(event) => match event {
+                        ChatStreamEvent::Start {
+                            trace_id,
+                            model_id,
+                            injected_context,
+                            selected_memories,
+                        } => {
+                            let model_label = model_id
+                                .as_deref()
+                                .and_then(|value| self.model_label(value))
+                                .map(ToOwned::to_owned)
+                                .or_else(|| model_id.clone())
+                                .unwrap_or_else(|| self.chat_backend.clone());
+                            let Some(stream) = self.active_stream.as_mut() else {
+                                continue;
+                            };
+                            stream.trace_id = Some(trace_id);
+                            stream.model_id = model_id.clone();
+                            stream.injected_context = injected_context;
+                            stream.selected_memories = selected_memories;
+                            self.response_title = format!(
+                                "Response [{} | {} memories | trace {} | streaming]",
+                                model_label,
+                                stream.selected_memories.len(),
+                                trace_id
+                            );
+                        }
+                        ChatStreamEvent::Delta { delta } => {
+                            if let Some(stream) = self.active_stream.as_mut() {
+                                stream.answer.push_str(&delta);
+                                self.response_body =
+                                    format!("Q: {}\n\n{}", stream.prompt, stream.answer);
+                            }
+                        }
+                        ChatStreamEvent::Done {
+                            answer,
+                            trace_id,
+                            model_id,
+                            ..
+                        } => {
+                            if let Some(stream) = self.active_stream.take() {
+                                self.set_chat_response(
+                                    stream.prompt,
+                                    ChatResponse {
+                                        answer,
+                                        trace_id,
+                                        injected_context: stream.injected_context,
+                                        selected_memories: stream.selected_memories,
+                                        model_id,
+                                    },
+                                );
+                                self.set_success("Answer received.");
+                            }
+                            keep_receiver = false;
+                        }
+                        ChatStreamEvent::Error {
+                            error, model_id, ..
+                        } => {
+                            let stream = self.active_stream.take();
+                            let model_label = model_id
+                                .as_deref()
+                                .and_then(|value| self.model_label(value))
+                                .map(ToOwned::to_owned)
+                                .or(model_id)
+                                .unwrap_or_else(|| {
+                                    self.selected_model_label()
+                                        .unwrap_or("server default")
+                                        .to_string()
+                                });
+                            let body = if let Some(stream) = stream {
+                                if stream.answer.is_empty() {
+                                    format!("Q: {}\n\n{}", stream.prompt, error)
+                                } else {
+                                    format!(
+                                        "Q: {}\n\nPartial response:\n{}\n\n{}",
+                                        stream.prompt, stream.answer, error
+                                    )
+                                }
+                            } else {
+                                error
+                            };
+                            self.set_request_error(
+                                format!("Chat stream failed for {model_label}."),
+                                format!("Chat Error [{model_label}]"),
+                                body,
+                            );
+                            keep_receiver = false;
+                        }
+                    },
+                    RemoteChatUpdate::Error(error) => {
+                        let prompt = self
+                            .active_stream
+                            .take()
+                            .map(|stream| stream.prompt)
+                            .unwrap_or_default();
+                        let body = if prompt.is_empty() {
+                            error
+                        } else {
+                            format!("Q: {prompt}\n\n{error}")
+                        };
+                        let model_label = self
+                            .selected_model_label()
+                            .unwrap_or("server default")
+                            .to_string();
+                        self.set_request_error(
+                            format!("Chat request failed for {model_label}."),
+                            format!("Chat Error [{model_label}]"),
+                            body,
+                        );
+                        keep_receiver = false;
+                    }
+                },
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    if self.active_stream.is_some() {
+                        let disconnected_body = self
+                            .active_stream
+                            .take()
+                            .map(|stream| {
+                                if stream.answer.is_empty() {
+                                    format!("Q: {}\n\nstream disconnected", stream.prompt)
+                                } else {
+                                    format!(
+                                        "Q: {}\n\nPartial response:\n{}\n\nstream disconnected",
+                                        stream.prompt, stream.answer
+                                    )
+                                }
+                            })
+                            .unwrap_or_else(|| "stream disconnected".to_string());
+                        self.set_request_error(
+                            "Chat stream ended unexpectedly.",
+                            "Chat Error [stream disconnected]",
+                            disconnected_body,
+                        );
+                    }
+                    keep_receiver = false;
+                    break;
+                }
+            }
+        }
+
+        if keep_receiver {
+            self.stream_receiver = Some(receiver);
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> ClientAction {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return ClientAction::Quit;
+        }
         match self.mode {
             InputMode::Normal => self.handle_normal_key(key),
             InputMode::Ask => self.handle_input_key(key, InputMode::Ask),
@@ -495,9 +804,22 @@ impl ClientApp {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> ClientAction {
+        if self.has_active_stream()
+            && matches!(
+                key.code,
+                KeyCode::Char('a') | KeyCode::Char('c') | KeyCode::Char('r') | KeyCode::Char('s')
+            )
+        {
+            self.set_error("Wait for the current streamed response to finish.");
+            return ClientAction::None;
+        }
         match key.code {
             KeyCode::Char('q') => ClientAction::Quit,
             KeyCode::Char('r') => ClientAction::Refresh,
+            KeyCode::Tab | KeyCode::Char('v') => {
+                self.toggle_browse_tab();
+                ClientAction::None
+            }
             KeyCode::Char('a') => {
                 self.mode = InputMode::Ask;
                 self.input.clear();
@@ -634,6 +956,12 @@ impl ClientApp {
         self.timeline_state
             .selected()
             .and_then(|index| self.timeline.get(index))
+    }
+
+    fn selected_memory(&self) -> Option<&MemoryRecord> {
+        self.memory_state
+            .selected()
+            .and_then(|index| self.memories.get(index))
     }
 
     fn set_chat_response(&mut self, prompt: String, response: ChatResponse) {
@@ -778,39 +1106,99 @@ impl ClientApp {
     }
 
     fn select_next(&mut self) {
-        if self.timeline.is_empty() {
-            self.timeline_state.select(None);
-            return;
+        match self.browse_tab {
+            BrowseTab::Memories => {
+                if self.memories.is_empty() {
+                    self.memory_state.select(None);
+                    return;
+                }
+                let current = self.memory_state.selected().unwrap_or(0);
+                let next = (current + 1).min(self.memories.len() - 1);
+                self.memory_state.select(Some(next));
+            }
+            BrowseTab::Timeline => {
+                if self.timeline.is_empty() {
+                    self.timeline_state.select(None);
+                    return;
+                }
+                let current = self.timeline_state.selected().unwrap_or(0);
+                let next = (current + 1).min(self.timeline.len() - 1);
+                self.timeline_state.select(Some(next));
+            }
         }
-        let current = self.timeline_state.selected().unwrap_or(0);
-        let next = (current + 1).min(self.timeline.len() - 1);
-        self.timeline_state.select(Some(next));
     }
 
     fn select_previous(&mut self) {
-        if self.timeline.is_empty() {
-            self.timeline_state.select(None);
-            return;
+        match self.browse_tab {
+            BrowseTab::Memories => {
+                if self.memories.is_empty() {
+                    self.memory_state.select(None);
+                    return;
+                }
+                let current = self.memory_state.selected().unwrap_or(0);
+                let next = current.saturating_sub(1);
+                self.memory_state.select(Some(next));
+            }
+            BrowseTab::Timeline => {
+                if self.timeline.is_empty() {
+                    self.timeline_state.select(None);
+                    return;
+                }
+                let current = self.timeline_state.selected().unwrap_or(0);
+                let next = current.saturating_sub(1);
+                self.timeline_state.select(Some(next));
+            }
         }
-        let current = self.timeline_state.selected().unwrap_or(0);
-        let next = current.saturating_sub(1);
-        self.timeline_state.select(Some(next));
     }
 
     fn select_first(&mut self) {
-        if self.timeline.is_empty() {
-            self.timeline_state.select(None);
-        } else {
-            self.timeline_state.select(Some(0));
+        match self.browse_tab {
+            BrowseTab::Memories => {
+                if self.memories.is_empty() {
+                    self.memory_state.select(None);
+                } else {
+                    self.memory_state.select(Some(0));
+                }
+            }
+            BrowseTab::Timeline => {
+                if self.timeline.is_empty() {
+                    self.timeline_state.select(None);
+                } else {
+                    self.timeline_state.select(Some(0));
+                }
+            }
         }
     }
 
     fn select_last(&mut self) {
-        if self.timeline.is_empty() {
-            self.timeline_state.select(None);
-        } else {
-            self.timeline_state.select(Some(self.timeline.len() - 1));
+        match self.browse_tab {
+            BrowseTab::Memories => {
+                if self.memories.is_empty() {
+                    self.memory_state.select(None);
+                } else {
+                    self.memory_state.select(Some(self.memories.len() - 1));
+                }
+            }
+            BrowseTab::Timeline => {
+                if self.timeline.is_empty() {
+                    self.timeline_state.select(None);
+                } else {
+                    self.timeline_state.select(Some(self.timeline.len() - 1));
+                }
+            }
         }
+    }
+
+    fn toggle_browse_tab(&mut self) {
+        self.browse_tab = match self.browse_tab {
+            BrowseTab::Memories => BrowseTab::Timeline,
+            BrowseTab::Timeline => BrowseTab::Memories,
+        };
+        let label = match self.browse_tab {
+            BrowseTab::Memories => "Memory browser",
+            BrowseTab::Timeline => "Timeline browser",
+        };
+        self.set_info(format!("{label} active. Press Tab to switch views."));
     }
 
     fn select_next_model(&mut self) {
@@ -913,7 +1301,7 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
             ),
         ]),
         Line::from(vec![Span::styled(
-            "Browse timeline, preview retrieval, ask live questions, capture entries, and switch models.",
+            "Browse durable memories by default, switch to the raw timeline with Tab, preview retrieval, ask live questions, capture entries, and switch models.",
             Style::default().fg(COLOR_MUTED),
         )]),
     ])
@@ -933,11 +1321,61 @@ fn draw_main(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut ClientApp) {
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
         .split(area);
 
-    draw_timeline(frame, panes[0], app);
+    draw_browser(frame, panes[0], app);
     draw_detail_panes(frame, panes[1], app);
 }
 
-fn draw_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut ClientApp) {
+fn draw_browser(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut ClientApp) {
+    match app.browse_tab {
+        BrowseTab::Memories => draw_memory_list(frame, area, app),
+        BrowseTab::Timeline => draw_timeline_list(frame, area, app),
+    }
+}
+
+fn draw_memory_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut ClientApp) {
+    let items = if app.memories.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            "No memories yet. Press 'c' to create one.",
+            Style::default().fg(COLOR_MUTED),
+        )]))]
+    } else {
+        app.memories
+            .iter()
+            .map(|memory| {
+                let title = format!(
+                    "{} / {}  {}",
+                    memory_kind_label(memory.kind),
+                    memory_subtype_label(memory.subtype),
+                    memory.updated_at.format("%Y-%m-%d %H:%M")
+                );
+                ListItem::new(vec![
+                    Line::from(Span::styled(
+                        title,
+                        Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        truncate(&memory.display_text, 56),
+                        Style::default().fg(COLOR_MUTED),
+                    )),
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let title = browser_title(app.browse_tab, app.memories.len(), app.timeline.len());
+    let list = List::new(items)
+        .block(browser_block(title))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(35, 52, 80))
+                .fg(COLOR_TEXT)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, area, &mut app.memory_state);
+}
+
+fn draw_timeline_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut ClientApp) {
     let items = if app.timeline.is_empty() {
         vec![ListItem::new(Line::from(vec![Span::styled(
             "No entries yet. Press 'c' to create one.",
@@ -970,19 +1408,9 @@ fn draw_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut ClientApp
             .collect::<Vec<_>>()
     };
 
+    let title = browser_title(app.browse_tab, app.memories.len(), app.timeline.len());
     let list = List::new(items)
-        .block(
-            Block::bordered()
-                .title(" Timeline ")
-                .title_style(
-                    Style::default()
-                        .fg(COLOR_ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER))
-                .style(Style::default().bg(COLOR_PANEL_ALT)),
-        )
+        .block(browser_block(title))
         .highlight_style(
             Style::default()
                 .bg(Color::Rgb(35, 52, 80))
@@ -993,18 +1421,49 @@ fn draw_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut ClientApp
     frame.render_stateful_widget(list, area, &mut app.timeline_state);
 }
 
+fn browser_title(active_tab: BrowseTab, memory_count: usize, timeline_count: usize) -> String {
+    let memory_label = match active_tab {
+        BrowseTab::Memories => format!("[Memories {memory_count}]"),
+        BrowseTab::Timeline => format!(" Memories {memory_count} "),
+    };
+    let timeline_label = match active_tab {
+        BrowseTab::Timeline => format!("[Timeline {timeline_count}]"),
+        BrowseTab::Memories => format!(" Timeline {timeline_count} "),
+    };
+    format!(" {memory_label}  {timeline_label} ")
+}
+
+fn browser_block(title: String) -> Block<'static> {
+    Block::bordered()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(COLOR_BORDER))
+        .style(Style::default().bg(COLOR_PANEL_ALT))
+}
+
 fn draw_detail_panes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    let detail_text = selected_entry_text(app.selected_entry());
+    let (detail_title, detail_text) = match app.browse_tab {
+        BrowseTab::Memories => (
+            " Memory Detail ",
+            selected_memory_text(app.selected_memory()),
+        ),
+        BrowseTab::Timeline => (" Entry Detail ", selected_entry_text(app.selected_entry())),
+    };
     let detail = Paragraph::new(detail_text)
         .wrap(Wrap { trim: false })
         .block(
             Block::bordered()
-                .title(" Entry Detail ")
+                .title(detail_title)
                 .title_style(
                     Style::default()
                         .fg(COLOR_ACCENT_WARM)
@@ -1081,6 +1540,8 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
             Line::from(vec![
                 keycap("j/k"),
                 Span::styled(" move  ", Style::default().fg(COLOR_MUTED)),
+                keycap("tab"),
+                Span::styled(" switch view  ", Style::default().fg(COLOR_MUTED)),
                 keycap("r"),
                 Span::styled(" refresh  ", Style::default().fg(COLOR_MUTED)),
                 keycap("m"),
@@ -1095,7 +1556,7 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
                 Span::styled(" quit", Style::default().fg(COLOR_MUTED)),
             ]),
             Line::from(Span::styled(
-                "Select an entry to inspect its raw text, metadata, and asset linkage.",
+                "Select a memory to inspect the durable recall record, or switch to Timeline for raw entries and chat turns.",
                 Style::default().fg(COLOR_TEXT),
             )),
         ]),
@@ -1328,6 +1789,103 @@ fn memory_subtype_label(subtype: MemorySubtype) -> &'static str {
     }
 }
 
+fn selected_memory_text(memory: Option<&MemoryRecord>) -> Text<'static> {
+    let Some(memory) = memory else {
+        return Text::from(vec![
+            Line::from(Span::styled(
+                "No memory selected.",
+                Style::default().fg(COLOR_MUTED),
+            )),
+            Line::from(Span::styled(
+                "Use 'c' to capture a durable memory and 'Tab' to switch to the raw timeline.",
+                Style::default().fg(COLOR_TEXT),
+            )),
+        ]);
+    };
+
+    Text::from(vec![
+        Line::from(vec![
+            Span::styled("Kind: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                memory_kind_label(memory.kind),
+                Style::default()
+                    .fg(COLOR_ACCENT_WARM)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Subtype: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                memory_subtype_label(memory.subtype),
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("State: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{:?}", memory.state).to_lowercase(),
+                Style::default().fg(COLOR_TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Updated: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                memory
+                    .updated_at
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string(),
+                Style::default().fg(COLOR_TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Confidence: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{:.2}", memory.confidence),
+                Style::default().fg(COLOR_TEXT),
+            ),
+            Span::raw("  "),
+            Span::styled("Salience: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{:.2}", memory.salience),
+                Style::default().fg(COLOR_TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Thread: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                memory
+                    .thread_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "(none)".to_string()),
+                Style::default().fg(COLOR_TEXT),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Display text",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            memory.display_text.clone(),
+            Style::default().fg(COLOR_TEXT),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Retrieval text",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            memory.retrieval_text.clone(),
+            Style::default().fg(COLOR_TEXT),
+        )),
+    ])
+}
+
 fn selected_entry_text(entry: Option<&Entry>) -> Text<'static> {
     let Some(entry) = entry else {
         return Text::from(vec![
@@ -1437,6 +1995,22 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_quits_from_any_mode() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        assert!(matches!(app.handle_key(key), ClientAction::Quit));
+
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        app.mode = InputMode::Ask;
+        assert!(matches!(app.handle_key(key), ClientAction::Quit));
+
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        app.mode = InputMode::ModelPicker;
+        assert!(matches!(app.handle_key(key), ClientAction::Quit));
+    }
+
+    #[test]
     fn ask_mode_renders_full_input_line() {
         let mut app = ClientApp::new("http://example.test:3000".to_string());
         app.mode = InputMode::Ask;
@@ -1467,6 +2041,16 @@ mod tests {
         let screen = render_screen(&mut app);
 
         assert!(screen.contains("What am I building right now?"));
+    }
+
+    #[test]
+    fn memory_browser_is_the_default_view() {
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+
+        let screen = render_screen(&mut app);
+
+        assert!(screen.contains("[Memories 0]"));
+        assert!(screen.contains("No memory selected."));
     }
 
     #[test]
@@ -1536,17 +2120,112 @@ mod tests {
     fn request_error_updates_status_and_response_pane() {
         let mut app = ClientApp::new("http://example.test:3000".to_string());
         app.set_request_error(
-            "Chat request failed for Kimi K2 Thinking.",
-            "Chat Error [Kimi K2 Thinking]",
+            "Chat request failed for Kimi K2.5.",
+            "Chat Error [Kimi K2.5]",
             "Q: hello\n\n502 Bad Gateway: upstream model failed",
         );
 
         assert_eq!(app.status.kind, StatusKind::Error);
-        assert_eq!(app.response_title, "Chat Error [Kimi K2 Thinking]");
+        assert_eq!(app.response_title, "Chat Error [Kimi K2.5]");
         assert!(
             app.response_body
                 .contains("502 Bad Gateway: upstream model failed")
         );
+    }
+
+    #[test]
+    fn parse_stream_line_decodes_ndjson_events() {
+        let trace_id = Uuid::new_v4();
+        let event = parse_stream_line(
+            &format!(
+                "{{\"type\":\"done\",\"answer\":\"Hello\",\"trace_id\":\"{trace_id}\",\"model_id\":\"moonshotai.kimi-k2.5\",\"stop_reason\":\"end_turn\"}}"
+            ),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            ChatStreamEvent::Done {
+                answer,
+                model_id: Some(model_id),
+                ..
+            } if answer == "Hello" && model_id == "moonshotai.kimi-k2.5"
+        ));
+    }
+
+    #[test]
+    fn draining_stream_events_updates_response_incrementally() {
+        let trace_id = Uuid::new_v4();
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        app.apply_chat_models(ChatModelsResponse {
+            backend: "bedrock".to_string(),
+            default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            models: vec![ChatModelOption {
+                label: "Kimi K2.5".to_string(),
+                model_id: "moonshotai.kimi-k2.5".to_string(),
+                description: None,
+                thinking_mode: None,
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+            }],
+        });
+        let (tx, rx) = mpsc::channel(8);
+        app.begin_chat_stream("What am I building?".to_string(), rx);
+
+        tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Start {
+            trace_id,
+            model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            injected_context: Some(
+                "Relevant personal context:\n- You are building Ancilla.".to_string(),
+            ),
+            selected_memories: vec![MemoryRecord {
+                id: Uuid::new_v4(),
+                lineage_id: Uuid::new_v4(),
+                kind: MemoryKind::Semantic,
+                subtype: MemorySubtype::Project,
+                display_text: "You are building Ancilla.".to_string(),
+                retrieval_text: "building Ancilla".to_string(),
+                attrs: empty_object(),
+                observed_at: Some(now_utc()),
+                valid_from: now_utc(),
+                valid_to: None,
+                confidence: 0.9,
+                salience: 0.8,
+                state: MemoryState::Accepted,
+                embedding: None,
+                source_artifact_ids: Vec::new(),
+                thread_id: None,
+                parent_id: None,
+                path: None,
+                created_at: now_utc(),
+                updated_at: now_utc(),
+            }],
+        }))
+        .unwrap();
+        tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Delta {
+            delta: "You are building ".to_string(),
+        }))
+        .unwrap();
+        tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Delta {
+            delta: "Ancilla.".to_string(),
+        }))
+        .unwrap();
+        tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Done {
+            answer: "You are building Ancilla.".to_string(),
+            trace_id,
+            model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            stop_reason: Some("end_turn".to_string()),
+        }))
+        .unwrap();
+
+        app.drain_stream_events();
+
+        assert!(app.response_title.contains("Kimi K2.5"));
+        assert!(app.response_body.contains("You are building Ancilla."));
+        assert!(app.stream_receiver.is_none());
+        assert!(app.active_stream.is_none());
+        assert_eq!(app.recent_turns.len(), 2);
     }
 
     fn render_screen(app: &mut ClientApp) -> String {
