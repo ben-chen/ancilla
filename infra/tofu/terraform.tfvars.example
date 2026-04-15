@@ -1,9 +1,9 @@
-aws_region              = "us-west-2"
+aws_region              = "us-east-1"
 aws_profile             = "ancilla-dev"
 name_prefix             = "ancilla"
 app_env                 = "production"
 create_network          = true
-availability_zones      = ["us-west-2a", "us-west-2b"]
+availability_zones      = ["us-east-1a", "us-east-1b"]
 vpc_cidr                = "10.42.0.0/16"
 public_subnet_cidrs     = ["10.42.0.0/24", "10.42.1.0/24"]
 private_app_subnet_cidrs = ["10.42.10.0/24", "10.42.11.0/24"] # reserved for future private services
@@ -13,12 +13,29 @@ enable_https_listener    = false
 basic_auth_enabled       = false
 basic_auth_username      = "ancilla"
 bedrock_chat_model_id    = "moonshotai.kimi-k2.5"
-bedrock_gate_model_id    = "moonshotai.kimi-k2.5"
+bedrock_gate_model_id    = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 bedrock_chat_models = [
   {
     label       = "Kimi K2.5"
     model_id    = "moonshotai.kimi-k2.5"
     description = "Moonshot general-purpose model"
+  },
+  {
+    label       = "Claude Haiku 4.5"
+    model_id    = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    description = "Fastest Claude responses"
+  },
+  {
+    label         = "Claude Sonnet 4.6"
+    model_id      = "us.anthropic.claude-sonnet-4-6"
+    description   = "Balanced reasoning and speed"
+    thinking_mode = "adaptive"
+  },
+  {
+    label         = "Claude Opus 4.6"
+    model_id      = "us.anthropic.claude-opus-4-6-v1"
+    description   = "Deepest reasoning"
+    thinking_mode = "adaptive"
   },
 ]
 container_image_tag      = "latest"

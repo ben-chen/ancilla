@@ -7,7 +7,7 @@ use crate::config::{
     init_user_config, load_toml_path, merge_optional_path, merge_optional_string,
     redact_database_url, redact_secret, user_config_file,
 };
-use crate::model::{ChatModelOption, ChatModelsResponse, ChatThinkingMode};
+use crate::model::{ChatModelOption, ChatModelPricing, ChatModelsResponse, ChatThinkingMode};
 
 const SERVER_CONFIG_DIR_NAME: &str = "ancilla";
 const SERVER_CONFIG_FILE_NAME: &str = "server.toml";
@@ -191,7 +191,7 @@ impl ServerConfig {
             basic_auth_password: None,
             embedder_base_url: None,
             embedder_timeout_seconds: 30,
-            aws_region: "us-west-2".to_string(),
+            aws_region: "us-east-1".to_string(),
             aws_profile: None,
             aws_config_file: None,
             aws_shared_credentials_file: None,
@@ -315,10 +315,7 @@ impl ServerConfig {
             ),
         )
         .max(1);
-        if let Some(value) = env_var("ANCILLA_SERVER_AWS_REGION")
-            .or_else(|| env_var("AWS_REGION"))
-            .or_else(|| env_var("AWS_DEFAULT_REGION"))
-        {
+        if let Some(value) = env_var("AWS_REGION").or_else(|| env_var("AWS_DEFAULT_REGION")) {
             self.aws_region = value;
         }
         if let Some(value) =
@@ -486,13 +483,17 @@ fn normalize_chat_models(chat_models: Vec<ChatModelOption>) -> Vec<ChatModelOpti
         .into_iter()
         .filter_map(|model| {
             let model_id = crate::config::normalize_string(Some(model.model_id))?;
+            let canonical_model_id = canonicalize_chat_model_id(&model_id);
             Some(ChatModelOption {
                 label: crate::config::normalize_string(Some(model.label))?,
-                model_id: canonicalize_chat_model_id(&model_id),
+                model_id: canonical_model_id.clone(),
                 description: crate::config::normalize_string(model.description),
                 thinking_mode: model.thinking_mode,
                 thinking_effort: model.thinking_effort,
                 thinking_budget_tokens: model.thinking_budget_tokens,
+                pricing: model
+                    .pricing
+                    .or_else(|| pricing_for_chat_model_id(&canonical_model_id)),
             })
         })
         .collect()
@@ -500,6 +501,7 @@ fn normalize_chat_models(chat_models: Vec<ChatModelOption>) -> Vec<ChatModelOpti
 
 fn synthesized_chat_model(model_id: &str) -> ChatModelOption {
     let model_id = canonicalize_chat_model_id(model_id);
+    let pricing = pricing_for_chat_model_id(&model_id);
     match model_id.as_str() {
         "moonshotai.kimi-k2.5" => ChatModelOption {
             label: "Kimi K2.5".to_string(),
@@ -508,6 +510,7 @@ fn synthesized_chat_model(model_id: &str) -> ChatModelOption {
             thinking_mode: None,
             thinking_effort: None,
             thinking_budget_tokens: None,
+            pricing,
         },
         "us.anthropic.claude-opus-4-6-v1" | "global.anthropic.claude-opus-4-6-v1" => {
             ChatModelOption {
@@ -517,6 +520,7 @@ fn synthesized_chat_model(model_id: &str) -> ChatModelOption {
                 thinking_mode: Some(ChatThinkingMode::Adaptive),
                 thinking_effort: None,
                 thinking_budget_tokens: None,
+                pricing,
             }
         }
         "us.anthropic.claude-sonnet-4-6" | "global.anthropic.claude-sonnet-4-6" => {
@@ -527,6 +531,7 @@ fn synthesized_chat_model(model_id: &str) -> ChatModelOption {
                 thinking_mode: Some(ChatThinkingMode::Adaptive),
                 thinking_effort: None,
                 thinking_budget_tokens: None,
+                pricing,
             }
         }
         "us.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -537,6 +542,7 @@ fn synthesized_chat_model(model_id: &str) -> ChatModelOption {
             thinking_mode: None,
             thinking_effort: None,
             thinking_budget_tokens: None,
+            pricing,
         },
         _ => ChatModelOption {
             label: model_id.to_string(),
@@ -545,11 +551,12 @@ fn synthesized_chat_model(model_id: &str) -> ChatModelOption {
             thinking_mode: None,
             thinking_effort: None,
             thinking_budget_tokens: None,
+            pricing,
         },
     }
 }
 
-fn canonicalize_chat_model_id(model_id: &str) -> String {
+pub(crate) fn canonicalize_chat_model_id(model_id: &str) -> String {
     match model_id {
         "anthropic.claude-opus-4-6-v1" => "us.anthropic.claude-opus-4-6-v1".to_string(),
         "anthropic.claude-sonnet-4-6" => "us.anthropic.claude-sonnet-4-6".to_string(),
@@ -557,6 +564,72 @@ fn canonicalize_chat_model_id(model_id: &str) -> String {
             "us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()
         }
         _ => model_id.to_string(),
+    }
+}
+
+pub(crate) fn pricing_for_chat_model_id(model_id: &str) -> Option<ChatModelPricing> {
+    match model_id {
+        "moonshotai.kimi-k2-thinking" => Some(ChatModelPricing {
+            input_usd_per_million_tokens: 0.60,
+            output_usd_per_million_tokens: 2.50,
+            batch_input_usd_per_million_tokens: None,
+            batch_output_usd_per_million_tokens: None,
+            cache_write_5m_input_usd_per_million_tokens: None,
+            cache_write_1h_input_usd_per_million_tokens: None,
+            cache_read_input_usd_per_million_tokens: None,
+        }),
+        "moonshotai.kimi-k2.5" => Some(ChatModelPricing {
+            input_usd_per_million_tokens: 0.60,
+            output_usd_per_million_tokens: 3.00,
+            batch_input_usd_per_million_tokens: None,
+            batch_output_usd_per_million_tokens: None,
+            cache_write_5m_input_usd_per_million_tokens: None,
+            cache_write_1h_input_usd_per_million_tokens: None,
+            cache_read_input_usd_per_million_tokens: None,
+        }),
+        "us.anthropic.claude-sonnet-4-6" | "global.anthropic.claude-sonnet-4-6" => {
+            Some(anthropic_pricing(3.00, 15.00, 1.50, 7.50, 3.75, Some(6.00), 0.30))
+        }
+        "us.anthropic.claude-opus-4-6-v1" | "global.anthropic.claude-opus-4-6-v1" => {
+            Some(anthropic_pricing(5.00, 25.00, 2.50, 12.50, 6.25, Some(10.00), 0.50))
+        }
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        | "global.anthropic.claude-haiku-4-5-20251001-v1:0" => {
+            Some(anthropic_pricing(1.00, 5.00, 0.50, 2.50, 1.25, Some(2.00), 0.10))
+        }
+        "us.anthropic.claude-opus-4-5"
+        | "global.anthropic.claude-opus-4-5" => {
+            Some(anthropic_pricing(5.00, 25.00, 2.50, 12.50, 6.25, Some(10.00), 0.50))
+        }
+        "us.anthropic.claude-sonnet-4-5"
+        | "global.anthropic.claude-sonnet-4-5" => {
+            Some(anthropic_pricing(3.00, 15.00, 1.50, 7.50, 3.75, Some(6.00), 0.30))
+        }
+        "us.anthropic.claude-sonnet-4"
+        | "global.anthropic.claude-sonnet-4" => {
+            Some(anthropic_pricing(3.00, 15.00, 1.50, 7.50, 3.75, None, 0.30))
+        }
+        _ => None,
+    }
+}
+
+fn anthropic_pricing(
+    input: f64,
+    output: f64,
+    batch_input: f64,
+    batch_output: f64,
+    cache_write_5m: f64,
+    cache_write_1h: Option<f64>,
+    cache_read: f64,
+) -> ChatModelPricing {
+    ChatModelPricing {
+        input_usd_per_million_tokens: input,
+        output_usd_per_million_tokens: output,
+        batch_input_usd_per_million_tokens: Some(batch_input),
+        batch_output_usd_per_million_tokens: Some(batch_output),
+        cache_write_5m_input_usd_per_million_tokens: Some(cache_write_5m),
+        cache_write_1h_input_usd_per_million_tokens: cache_write_1h,
+        cache_read_input_usd_per_million_tokens: Some(cache_read),
     }
 }
 
@@ -573,18 +646,35 @@ data_file = ".ancilla/state.json"
 # basic_auth_password = "replace-me"
 # embedder_base_url = "http://10.42.0.50:4000"
 # embedder_timeout_seconds = 30
-aws_region = "us-west-2"
+aws_region = "us-east-1"
 # aws_profile = "ancilla-dev"
 # aws_config_file = "~/path/to/ancilla/.aws/config"
 # aws_shared_credentials_file = "~/path/to/ancilla/.aws/credentials"
 # aws_bearer_token_bedrock = "bedrock-api-key-..."
 # bedrock_chat_model_id = "moonshotai.kimi-k2.5"
-# bedrock_gate_model_id = "moonshotai.kimi-k2.5"
+# bedrock_gate_model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 #
 # [[chat_models]]
 # label = "Kimi K2.5"
 # model_id = "moonshotai.kimi-k2.5"
 # description = "Moonshot general-purpose model"
+#
+# [[chat_models]]
+# label = "Claude Haiku 4.5"
+# model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+# description = "Fastest Claude responses"
+#
+# [[chat_models]]
+# label = "Claude Sonnet 4.6"
+# model_id = "us.anthropic.claude-sonnet-4-6"
+# description = "Balanced reasoning and speed"
+# thinking_mode = "adaptive"
+#
+# [[chat_models]]
+# label = "Claude Opus 4.6"
+# model_id = "us.anthropic.claude-opus-4-6-v1"
+# description = "Deepest reasoning"
+# thinking_mode = "adaptive"
 bedrock_chat_max_tokens = 800
 bedrock_chat_temperature = 0.2
 accept_client_embeddings = true
@@ -613,7 +703,7 @@ mod tests {
         assert!(config.basic_auth_username.is_none());
         assert!(config.basic_auth_password.is_none());
         assert_eq!(config.embedder_timeout_seconds, 30);
-        assert_eq!(config.aws_region, "us-west-2");
+        assert_eq!(config.aws_region, "us-east-1");
         assert!(config.accept_client_embeddings);
         assert!(config.accept_client_transcripts);
     }
@@ -628,7 +718,7 @@ mod tests {
             env::set_var("ANCILLA_SERVER_BASIC_AUTH_PASSWORD", "secret-value");
             env::set_var("ANCILLA_SERVER_EMBEDDER_BASE_URL", "http://10.42.0.50:4000");
             env::set_var("ANCILLA_SERVER_EMBEDDER_TIMEOUT_SECONDS", "45");
-            env::set_var("ANCILLA_SERVER_AWS_REGION", "eu-west-1");
+            env::set_var("AWS_REGION", "eu-west-1");
             env::set_var("ANCILLA_SERVER_AWS_PROFILE", "ancilla-dev");
             env::set_var("ANCILLA_SERVER_AWS_CONFIG_FILE", "/tmp/project/.aws/config");
             env::set_var(
@@ -773,21 +863,51 @@ aws_region = "eu-central-1"
             basic_auth_password: Some("supersecretpassword".to_string()),
             embedder_base_url: Some("http://10.42.0.50:4000".to_string()),
             embedder_timeout_seconds: 30,
-            aws_region: "us-west-2".to_string(),
+            aws_region: "us-east-1".to_string(),
             aws_profile: Some("ancilla-dev".to_string()),
             aws_config_file: Some(PathBuf::from("/tmp/project/.aws/config")),
             aws_shared_credentials_file: Some(PathBuf::from("/tmp/project/.aws/credentials")),
             aws_bearer_token_bedrock: Some("bedrock-api-key-example".to_string()),
-            bedrock_chat_model_id: Some("us.anthropic.claude-opus-4-6-v1".to_string()),
+            bedrock_chat_model_id: Some("moonshotai.kimi-k2.5".to_string()),
             bedrock_gate_model_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
-            chat_models: vec![ChatModelOption {
-                label: "Claude Opus 4.6".to_string(),
-                model_id: "us.anthropic.claude-opus-4-6-v1".to_string(),
-                description: Some("Deepest reasoning".to_string()),
-                thinking_mode: Some(ChatThinkingMode::Adaptive),
-                thinking_effort: None,
-                thinking_budget_tokens: None,
-            }],
+            chat_models: vec![
+                ChatModelOption {
+                    label: "Kimi K2.5".to_string(),
+                    model_id: "moonshotai.kimi-k2.5".to_string(),
+                    description: Some("Moonshot general-purpose model".to_string()),
+                    thinking_mode: None,
+                    thinking_effort: None,
+                    thinking_budget_tokens: None,
+                    pricing: None,
+                },
+                ChatModelOption {
+                    label: "Claude Haiku 4.5".to_string(),
+                    model_id: "us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+                    description: Some("Fastest Claude responses".to_string()),
+                    thinking_mode: None,
+                    thinking_effort: None,
+                    thinking_budget_tokens: None,
+                    pricing: None,
+                },
+                ChatModelOption {
+                    label: "Claude Sonnet 4.6".to_string(),
+                    model_id: "us.anthropic.claude-sonnet-4-6".to_string(),
+                    description: Some("Balanced reasoning and speed".to_string()),
+                    thinking_mode: Some(ChatThinkingMode::Adaptive),
+                    thinking_effort: None,
+                    thinking_budget_tokens: None,
+                    pricing: None,
+                },
+                ChatModelOption {
+                    label: "Claude Opus 4.6".to_string(),
+                    model_id: "us.anthropic.claude-opus-4-6-v1".to_string(),
+                    description: Some("Deepest reasoning".to_string()),
+                    thinking_mode: Some(ChatThinkingMode::Adaptive),
+                    thinking_effort: None,
+                    thinking_budget_tokens: None,
+                    pricing: None,
+                },
+            ],
             bedrock_chat_max_tokens: 800,
             bedrock_chat_temperature: 0.2,
             accept_client_embeddings: true,
@@ -804,7 +924,7 @@ aws_region = "eu-central-1"
             view.basic_auth_password.as_deref(),
             Some("supersecretp...word")
         );
-        assert_eq!(view.chat_models.len(), 1);
+        assert_eq!(view.chat_models.len(), 4);
         assert_eq!(
             view.embedder_base_url.as_deref(),
             Some("http://10.42.0.50:4000")
@@ -830,15 +950,32 @@ aws_region = "eu-central-1"
         unsafe {
             env::set_var(
                 "ANCILLA_SERVER_BEDROCK_CHAT_MODELS_JSON",
-                r#"[{"label":"Claude Opus 4.6","model_id":"us.anthropic.claude-opus-4-6-v1","thinking_mode":"adaptive"},{"label":"Claude Haiku 4.5","model_id":"us.anthropic.claude-haiku-4-5-20251001-v1:0"}]"#,
+                r#"[{"label":"Kimi K2.5","model_id":"moonshotai.kimi-k2.5"},{"label":"Claude Haiku 4.5","model_id":"anthropic.claude-haiku-4-5-20251001-v1:0"},{"label":"Claude Sonnet 4.6","model_id":"anthropic.claude-sonnet-4-6","thinking_mode":"adaptive"},{"label":"Claude Opus 4.6","model_id":"anthropic.claude-opus-4-6-v1","thinking_mode":"adaptive"}]"#,
             );
         }
 
         let config = ServerConfig::from_env().unwrap();
-        assert_eq!(config.chat_models.len(), 2);
-        assert_eq!(config.chat_models[0].label, "Claude Opus 4.6");
+        assert_eq!(config.chat_models.len(), 4);
+        assert_eq!(config.chat_models[0].label, "Kimi K2.5");
         assert_eq!(
-            config.chat_models[0].thinking_mode,
+            config.chat_models[1].model_id,
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        );
+        assert_eq!(config.chat_models[1].thinking_mode, None);
+        assert_eq!(
+            config.chat_models[2].model_id,
+            "us.anthropic.claude-sonnet-4-6"
+        );
+        assert_eq!(
+            config.chat_models[2].thinking_mode,
+            Some(ChatThinkingMode::Adaptive)
+        );
+        assert_eq!(
+            config.chat_models[3].model_id,
+            "us.anthropic.claude-opus-4-6-v1"
+        );
+        assert_eq!(
+            config.chat_models[3].thinking_mode,
             Some(ChatThinkingMode::Adaptive)
         );
     }
@@ -851,6 +988,26 @@ aws_region = "eu-central-1"
         assert!(config.validate().is_err());
     }
 
+    #[test]
+    fn synthesized_models_include_pricing() {
+        let kimi = synthesized_chat_model("moonshotai.kimi-k2.5");
+        let haiku = synthesized_chat_model("us.anthropic.claude-haiku-4-5-20251001-v1:0");
+
+        assert_eq!(
+            kimi.pricing
+                .expect("kimi pricing should be available")
+                .output_usd_per_million_tokens,
+            3.0
+        );
+        assert_eq!(
+            haiku
+                .pricing
+                .expect("haiku pricing should be available")
+                .input_usd_per_million_tokens,
+            1.0
+        );
+    }
+
     fn clear_env() {
         for key in [
             "ANCILLA_SERVER_APP_ENV",
@@ -860,7 +1017,6 @@ aws_region = "eu-central-1"
             "ANCILLA_SERVER_BASIC_AUTH_PASSWORD",
             "ANCILLA_SERVER_EMBEDDER_BASE_URL",
             "ANCILLA_SERVER_EMBEDDER_TIMEOUT_SECONDS",
-            "ANCILLA_SERVER_AWS_REGION",
             "ANCILLA_SERVER_AWS_PROFILE",
             "ANCILLA_SERVER_AWS_CONFIG_FILE",
             "ANCILLA_SERVER_AWS_SHARED_CREDENTIALS_FILE",

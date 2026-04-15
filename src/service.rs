@@ -18,8 +18,8 @@ use crate::{
         Artifact, ArtifactKind, AssembleContextRequest, AssembleContextResponse,
         CaptureEntryResponse, ChatModelsResponse, ChatRespondRequest, ChatResponse,
         ConversationRole, CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest,
-        EmbeddingVector, Entry, EntryKind, GenerateMemoriesRequest, MemoryKind, MemoryRecord,
-        MemoryState, PatchMemoryRequest, PersistedState, PreparedArtifactInput,
+        EmbeddingVector, Entry, EntryKind, GenerateMemoriesRequest, LlmCallMetrics, MemoryKind,
+        MemoryRecord, MemoryState, PatchMemoryRequest, PersistedState, PreparedArtifactInput,
         PreparedMemoryInput, ProfileBlock, RetrievalTrace, ScoredMemory, SearchMemoriesRequest,
         Thread, ThreadKind, ThreadStatus, empty_object, now_utc,
     },
@@ -62,6 +62,8 @@ pub struct ChatResponseStream {
     pub injected_context: Option<String>,
     pub selected_memories: Vec<MemoryRecord>,
     pub model_id: Option<String>,
+    pub gate_metrics: Option<LlmCallMetrics>,
+    pub chat_metrics: Option<LlmCallMetrics>,
     pub receiver: tokio::sync::mpsc::Receiver<anyhow::Result<ChatCompletionStreamEvent>>,
 }
 
@@ -70,6 +72,19 @@ struct ServiceChatToolExecutor {
     service: AppService,
     request: ChatRespondRequest,
     remember_used: Arc<Mutex<bool>>,
+    llm_metrics: Arc<Mutex<Option<LlmCallMetrics>>>,
+}
+
+#[derive(Clone, Debug)]
+struct RememberCurrentConversationResult {
+    memories: Vec<MemoryRecord>,
+    metrics: Option<LlmCallMetrics>,
+}
+
+#[derive(Clone, Debug)]
+struct GatedCandidates {
+    result: crate::retrieval::GateResult,
+    metrics: Option<LlmCallMetrics>,
 }
 
 impl AppService {
@@ -354,14 +369,17 @@ impl AppService {
         &self,
         request: &ChatRespondRequest,
         reason: Option<String>,
-    ) -> anyhow::Result<Vec<MemoryRecord>> {
+    ) -> anyhow::Result<RememberCurrentConversationResult> {
         let context_text = build_conversation_memory_context(request);
         let extraction = self
             .extract_memory_documents(context_text, request.model_id.clone())
             .await?;
 
         if extraction.memories.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RememberCurrentConversationResult {
+                memories: Vec::new(),
+                metrics: extraction.metrics,
+            });
         }
 
         let observed_at = Some(now_utc());
@@ -392,11 +410,16 @@ impl AppService {
             })
             .collect::<Vec<_>>();
 
-        self.persist_memories_without_entry(
+        let memories = self
+            .persist_memories_without_entry(
             prepared_memories,
             &format!("tool/remember_current_conversation/{}", Uuid::new_v4()),
         )
-        .await
+        .await?;
+        Ok(RememberCurrentConversationResult {
+            memories,
+            metrics: extraction.metrics,
+        })
     }
 
     pub async fn list_timeline(&self) -> Vec<Entry> {
@@ -481,7 +504,8 @@ impl AppService {
         let gate = self
             .gate_candidates(&request, &candidates, max_injected)
             .await?;
-        let context = build_context_bundle(&gate.selected, &state.entries, &state.artifacts);
+        let context =
+            build_context_bundle(&gate.result.selected, &state.entries, &state.artifacts);
         let recent_context =
             collapse_recent_context(&request.recent_turns, request.recent_context.clone());
         let trace = build_trace(
@@ -489,7 +513,7 @@ impl AppService {
             recent_context,
             request.conversation_id,
             request.active_thread_id,
-            &gate,
+            &gate.result,
             context.clone(),
             &candidates,
             now,
@@ -503,11 +527,13 @@ impl AppService {
 
         Ok(AssembleContextResponse {
             trace_id,
-            decision: gate.decision,
-            gate_confidence: gate.confidence,
-            gate_reason: gate.reason,
+            decision: gate.result.decision,
+            gate_confidence: gate.result.confidence,
+            gate_reason: gate.result.reason,
+            gate_metrics: gate.metrics,
             context,
             selected_memories: gate
+                .result
                 .selected
                 .into_iter()
                 .map(|candidate| candidate.memory)
@@ -614,6 +640,7 @@ impl AppService {
             service: self.clone(),
             request: request.clone(),
             remember_used: Arc::new(Mutex::new(false)),
+            llm_metrics: Arc::new(Mutex::new(None)),
         };
         let completion = self
             .chat_backend
@@ -630,6 +657,10 @@ impl AppService {
                 &tool_executor,
             )
             .await?;
+        let chat_metrics = LlmCallMetrics::merged(
+            completion.metrics,
+            tool_executor.take_llm_metrics().await,
+        );
 
         self.store
             .write_with(|state| {
@@ -657,6 +688,8 @@ impl AppService {
             injected_context: context.context,
             selected_memories: context.selected_memories,
             model_id: completion.model_id,
+            gate_metrics: context.gate_metrics,
+            chat_metrics,
         })
     }
 
@@ -686,6 +719,7 @@ impl AppService {
             service: self.clone(),
             request: request.clone(),
             remember_used: Arc::new(Mutex::new(false)),
+            llm_metrics: Arc::new(Mutex::new(None)),
         };
         let completion = self
             .chat_backend
@@ -702,6 +736,10 @@ impl AppService {
                 &tool_executor,
             )
             .await?;
+        let chat_metrics = LlmCallMetrics::merged(
+            completion.metrics.clone(),
+            tool_executor.take_llm_metrics().await,
+        );
         let model_id = completion.model_id.clone();
         let answer = completion.answer.clone();
         let (tx, receiver) = tokio::sync::mpsc::channel(8);
@@ -748,6 +786,8 @@ impl AppService {
             injected_context: context.context,
             selected_memories: context.selected_memories,
             model_id,
+            gate_metrics: context.gate_metrics,
+            chat_metrics,
             receiver,
         })
     }
@@ -821,8 +861,11 @@ impl AppService {
         request: &AssembleContextRequest,
         candidates: &[ScoredMemory],
         max_injected: usize,
-    ) -> anyhow::Result<crate::retrieval::GateResult> {
-        let fallback = || deterministic_gate_candidates(&request.query, candidates, max_injected);
+    ) -> anyhow::Result<GatedCandidates> {
+        let fallback = || GatedCandidates {
+            result: deterministic_gate_candidates(&request.query, candidates, max_injected),
+            metrics: None,
+        };
 
         let Some(gate_backend) = &self.gate_backend else {
             return Ok(fallback());
@@ -895,6 +938,12 @@ impl AppService {
     }
 }
 
+impl ServiceChatToolExecutor {
+    async fn take_llm_metrics(&self) -> Option<LlmCallMetrics> {
+        self.llm_metrics.lock().await.take()
+    }
+}
+
 #[async_trait::async_trait]
 impl ChatToolExecutor for ServiceChatToolExecutor {
     async fn search_memories(
@@ -950,15 +999,21 @@ impl ChatToolExecutor for ServiceChatToolExecutor {
         *guard = true;
         drop(guard);
 
-        let memories = self
+        let result = self
             .service
             .remember_current_conversation(&self.request, reason.clone())
             .await?;
+        let created_count = result.memories.len();
+        {
+            let mut metrics = self.llm_metrics.lock().await;
+            *metrics = LlmCallMetrics::merged(metrics.take(), result.metrics);
+        }
 
         Ok(json!({
             "reason": reason,
-            "created_count": memories.len(),
-            "memories": memories
+            "created_count": created_count,
+            "memories": result
+                .memories
                 .into_iter()
                 .map(|memory| {
                     let memory = memory.without_embedding();
@@ -1288,7 +1343,7 @@ fn stream_answer_chunks(answer: &str) -> Vec<String> {
 fn hydrate_gate_result(
     candidates: &[ScoredMemory],
     result: ContextGateResult,
-) -> anyhow::Result<crate::retrieval::GateResult> {
+) -> anyhow::Result<GatedCandidates> {
     let candidate_map = candidates
         .iter()
         .map(|candidate| (candidate.memory.id, candidate.clone()))
@@ -1304,11 +1359,14 @@ fn hydrate_gate_result(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    Ok(crate::retrieval::GateResult {
-        decision: result.decision,
-        confidence: result.confidence,
-        reason: result.reason,
-        selected,
+    Ok(GatedCandidates {
+        result: crate::retrieval::GateResult {
+            decision: result.decision,
+            confidence: result.confidence,
+            reason: result.reason,
+            selected,
+        },
+        metrics: result.metrics,
     })
 }
 
@@ -1435,6 +1493,7 @@ mod tests {
             Ok(crate::bedrock::ChatCompletionResult {
                 answer: format!("bedrock-mock: {}", request.message),
                 model_id: request.model_id.clone(),
+                metrics: None,
             })
         }
 
@@ -1479,6 +1538,7 @@ mod tests {
                     }]
                 },
                 model_id: request.model_id.clone(),
+                metrics: None,
             })
         }
 
@@ -1529,6 +1589,7 @@ mod tests {
             Ok(crate::bedrock::MemoryCreationResult {
                 memories,
                 model_id: request.model_id.clone(),
+                metrics: None,
             })
         }
 
@@ -1573,6 +1634,7 @@ mod tests {
                     search_count, remember_count, request.message
                 ),
                 model_id: request.model_id.clone(),
+                metrics: None,
             })
         }
     }

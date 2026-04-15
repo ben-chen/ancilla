@@ -18,7 +18,7 @@ use aws_sdk_bedrockruntime::{
     types::{
         AutoToolChoice, ContentBlock, ConversationRole, InferenceConfiguration, Message,
         SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-        ToolResultContentBlock, ToolSpecification,
+        ToolResultContentBlock, ToolSpecification, TokenUsage,
     },
 };
 use aws_smithy_types::{Document, Number};
@@ -32,7 +32,7 @@ use crate::{
     memory_markdown::{MemoryDocument, parse_memory_list_json},
     model::{
         ChatModelOption, ChatModelsResponse, ChatThinkingMode, ConversationTurn, GateDecision,
-        MemoryRecord, ScoredMemory,
+        LlmCallMetrics, LlmCostBreakdown, LlmTokenUsage, MemoryRecord, ScoredMemory,
     },
     server_config::ServerConfig,
 };
@@ -52,10 +52,11 @@ pub struct ChatCompletionRequest {
     pub trace_id: Uuid,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChatCompletionResult {
     pub answer: String,
     pub model_id: Option<String>,
+    pub metrics: Option<LlmCallMetrics>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,10 +79,11 @@ pub struct MemoryCreationRequest {
     pub trace_id: Uuid,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MemoryCreationResult {
     pub memories: Vec<MemoryDocument>,
     pub model_id: Option<String>,
+    pub metrics: Option<LlmCallMetrics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +150,7 @@ pub struct ContextGateResult {
     pub reason: String,
     pub selected_memory_ids: Vec<Uuid>,
     pub model_id: Option<String>,
+    pub metrics: Option<LlmCallMetrics>,
 }
 
 #[async_trait]
@@ -291,12 +294,11 @@ impl BedrockChatBackend {
             .model_id(&model.model_id)
             .set_system(Some(vec![SystemContentBlock::Text(system_prompt)]))
             .set_messages(Some(messages))
-            .inference_config(
-                InferenceConfiguration::builder()
-                    .max_tokens(self.settings.max_tokens)
-                    .temperature(self.settings.temperature)
-                    .build(),
-            )
+            .inference_config(build_chat_inference_config(
+                model,
+                self.settings.max_tokens,
+                self.settings.temperature,
+            ))
             .set_request_metadata(Some(HashMap::from([(
                 "trace_id".to_string(),
                 trace_id.to_string(),
@@ -471,6 +473,7 @@ impl ChatCompletionBackend for BedrockChatBackend {
         Ok(ChatCompletionResult {
             answer: extract_text_response(&response)?,
             model_id: Some(model.model_id.clone()),
+            metrics: usage_metrics_for_model(model, response.usage()),
         })
     }
 
@@ -493,12 +496,11 @@ impl ChatCompletionBackend for BedrockChatBackend {
             .model_id(&model_id)
             .set_system(Some(vec![SystemContentBlock::Text(system_prompt)]))
             .set_messages(Some(messages))
-            .inference_config(
-                InferenceConfiguration::builder()
-                    .max_tokens(self.settings.max_tokens)
-                    .temperature(self.settings.temperature)
-                    .build(),
-            )
+            .inference_config(build_chat_inference_config(
+                model,
+                self.settings.max_tokens,
+                self.settings.temperature,
+            ))
             .set_request_metadata(Some(HashMap::from([(
                 "trace_id".to_string(),
                 request.trace_id.to_string(),
@@ -612,6 +614,7 @@ impl ChatCompletionBackend for BedrockChatBackend {
         Ok(MemoryCreationResult {
             memories,
             model_id: Some(model_id),
+            metrics: usage_metrics_for_model(model, response.usage()),
         })
     }
 
@@ -633,6 +636,7 @@ impl ChatCompletionBackend for BedrockChatBackend {
         );
         let mut messages = build_bedrock_messages(&request.recent_turns, &request.message);
         let tool_config = build_chat_tool_config()?;
+        let mut metrics = None;
 
         for _ in 0..6 {
             let response = self
@@ -644,6 +648,10 @@ impl ChatCompletionBackend for BedrockChatBackend {
                     request.trace_id,
                 )
                 .await?;
+            metrics = LlmCallMetrics::merged(
+                metrics,
+                usage_metrics_for_model(model, response.usage()),
+            );
 
             let Some(output) = response.output() else {
                 bail!("bedrock converse response had no output")
@@ -666,6 +674,7 @@ impl ChatCompletionBackend for BedrockChatBackend {
             return Ok(ChatCompletionResult {
                 answer: extract_text_response(&response)?,
                 model_id: Some(model.model_id.clone()),
+                metrics,
             });
         }
 
@@ -707,7 +716,9 @@ impl ContextGateBackend for BedrockContextGateBackend {
             .map_err(|error| bedrock_request_error("gate", &model_id, &error))?;
 
         let raw = extract_text_response(&response)?;
-        parse_gate_response(&raw, request, &model_id)
+        let mut result = parse_gate_response(&raw, request, &model_id)?;
+        result.metrics = usage_metrics_for_model_id(&model_id, None, response.usage());
+        Ok(result)
     }
 }
 
@@ -723,6 +734,7 @@ impl ChatCompletionBackend for SyntheticChatBackend {
         Ok(ChatCompletionResult {
             answer: synthesize_answer(&request.message, &request.selected_memories),
             model_id: None,
+            metrics: None,
         })
     }
 
@@ -766,6 +778,7 @@ impl ChatCompletionBackend for SyntheticChatBackend {
         Ok(MemoryCreationResult {
             memories,
             model_id: None,
+            metrics: None,
         })
     }
 
@@ -1081,6 +1094,24 @@ fn build_bedrock_messages(recent_turns: &[ConversationTurn], message: &str) -> V
     messages
 }
 
+fn build_chat_inference_config(
+    model: &ChatModelOption,
+    max_tokens: i32,
+    configured_temperature: f32,
+) -> InferenceConfiguration {
+    // Anthropic thinking mode on Bedrock currently requires temperature=1.
+    let temperature = if model.thinking_mode.is_some() {
+        1.0
+    } else {
+        configured_temperature
+    };
+
+    InferenceConfiguration::builder()
+        .max_tokens(max_tokens)
+        .temperature(temperature)
+        .build()
+}
+
 fn build_additional_model_request_fields(
     model: &ChatModelOption,
 ) -> anyhow::Result<Option<Document>> {
@@ -1116,6 +1147,64 @@ fn build_additional_model_request_fields(
         "thinking".to_string(),
         Document::Object(thinking),
     )]))))
+}
+
+fn usage_metrics_for_model(
+    model: &ChatModelOption,
+    usage: Option<&TokenUsage>,
+) -> Option<LlmCallMetrics> {
+    usage_metrics_for_model_id(
+        &model.model_id,
+        model.pricing,
+        usage,
+    )
+}
+
+fn usage_metrics_for_model_id(
+    model_id: &str,
+    pricing: Option<crate::model::ChatModelPricing>,
+    usage: Option<&TokenUsage>,
+) -> Option<LlmCallMetrics> {
+    let usage = usage?;
+    let usage = LlmTokenUsage {
+        input_tokens: usage.input_tokens().max(0) as u32,
+        output_tokens: usage.output_tokens().max(0) as u32,
+        total_tokens: usage.total_tokens().max(0) as u32,
+        cache_read_input_tokens: usage
+            .cache_read_input_tokens()
+            .map(|value| value.max(0) as u32),
+        cache_write_input_tokens: usage
+            .cache_write_input_tokens()
+            .map(|value| value.max(0) as u32),
+    };
+    let pricing = pricing.or_else(|| {
+        let canonical = crate::server_config::canonicalize_chat_model_id(model_id);
+        crate::server_config::pricing_for_chat_model_id(&canonical)
+    })?;
+
+    let input_usd =
+        (usage.input_tokens as f64 / 1_000_000.0) * pricing.input_usd_per_million_tokens;
+    let output_usd =
+        (usage.output_tokens as f64 / 1_000_000.0) * pricing.output_usd_per_million_tokens;
+    let cache_read_input_usd = usage.cache_read_input_tokens.map(|tokens| {
+        (tokens as f64 / 1_000_000.0)
+            * pricing
+                .cache_read_input_usd_per_million_tokens
+                .unwrap_or_default()
+    });
+    let total_usd = input_usd + output_usd + cache_read_input_usd.unwrap_or_default();
+
+    Some(LlmCallMetrics {
+        model_id: Some(model_id.to_string()),
+        usage,
+        cost: LlmCostBreakdown {
+            input_usd,
+            output_usd,
+            cache_read_input_usd,
+            cache_write_input_usd: None,
+            total_usd,
+        },
+    })
 }
 
 fn extract_text_response(
@@ -1231,6 +1320,7 @@ fn parse_gate_response(
             .to_string(),
         selected_memory_ids,
         model_id: Some(model_id.to_string()),
+        metrics: None,
     })
 }
 
@@ -1374,7 +1464,7 @@ mod tests {
     #[test]
     fn custom_profile_files_use_explicit_paths_and_default_counterpart() {
         let settings = BedrockChatSettings {
-            region: "us-west-2".to_string(),
+            region: "us-east-1".to_string(),
             profile: Some("ancilla-dev".to_string()),
             config_file: Some(PathBuf::from("/tmp/project/.aws/config")),
             shared_credentials_file: None,
@@ -1387,6 +1477,7 @@ mod tests {
                 thinking_mode: None,
                 thinking_effort: None,
                 thinking_budget_tokens: None,
+                pricing: None,
             }],
             max_tokens: 800,
             temperature: 0.2,
@@ -1418,6 +1509,7 @@ mod tests {
             thinking_mode: Some(ChatThinkingMode::Adaptive),
             thinking_effort: Some(ChatThinkingEffort::High),
             thinking_budget_tokens: None,
+            pricing: None,
         })
         .unwrap()
         .unwrap();
@@ -1440,8 +1532,47 @@ mod tests {
             thinking_mode: Some(ChatThinkingMode::Enabled),
             thinking_effort: None,
             thinking_budget_tokens: None,
+            pricing: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("thinking_budget_tokens"));
+    }
+
+    #[test]
+    fn thinking_models_force_temperature_to_one() {
+        let config = build_chat_inference_config(
+            &ChatModelOption {
+                label: "Claude Sonnet 4.6".to_string(),
+                model_id: "us.anthropic.claude-sonnet-4-6".to_string(),
+                description: None,
+                thinking_mode: Some(ChatThinkingMode::Adaptive),
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+                pricing: None,
+            },
+            800,
+            0.2,
+        );
+
+        assert_eq!(config.temperature(), Some(1.0));
+    }
+
+    #[test]
+    fn non_thinking_models_keep_configured_temperature() {
+        let config = build_chat_inference_config(
+            &ChatModelOption {
+                label: "Kimi K2.5".to_string(),
+                model_id: "moonshotai.kimi-k2.5".to_string(),
+                description: None,
+                thinking_mode: None,
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+                pricing: None,
+            },
+            800,
+            0.2,
+        );
+
+        assert_eq!(config.temperature(), Some(0.2));
     }
 }

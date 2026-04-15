@@ -29,6 +29,7 @@ target
 .env.local
 .envrc
 .ancilla/
+.local/
 .venv/
 __pycache__/
 *.pyc

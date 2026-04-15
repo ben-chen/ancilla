@@ -46,8 +46,8 @@ Recommended shell setup:
 export AWS_CONFIG_FILE="$PWD/.aws/config"
 export AWS_SHARED_CREDENTIALS_FILE="$PWD/.aws/credentials"
 export AWS_PROFILE=ancilla-dev
-export AWS_REGION=us-west-2
-export AWS_DEFAULT_REGION=us-west-2
+export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION=us-east-1
 ```
 
 Do not commit real AWS credentials into this repository.
@@ -120,12 +120,29 @@ aws_config_file = "~/workspace/ancilla/.aws/config"
 aws_shared_credentials_file = "~/workspace/ancilla/.aws/credentials"
 # aws_bearer_token_bedrock = "bedrock-api-key-..."
 bedrock_chat_model_id = "moonshotai.kimi-k2.5"
-bedrock_gate_model_id = "moonshotai.kimi-k2.5"
+bedrock_gate_model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 [[chat_models]]
 label = "Kimi K2.5"
 model_id = "moonshotai.kimi-k2.5"
 description = "Moonshot general-purpose model"
+
+[[chat_models]]
+label = "Claude Haiku 4.5"
+model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+description = "Fastest Claude responses"
+
+[[chat_models]]
+label = "Claude Sonnet 4.6"
+model_id = "us.anthropic.claude-sonnet-4-6"
+description = "Balanced reasoning and speed"
+thinking_mode = "adaptive"
+
+[[chat_models]]
+label = "Claude Opus 4.6"
+model_id = "us.anthropic.claude-opus-4-6-v1"
+description = "Deepest reasoning"
+thinking_mode = "adaptive"
 
 bedrock_chat_max_tokens = 800
 bedrock_chat_temperature = 0.2
@@ -154,6 +171,9 @@ If `embedder_base_url` is set, the server asks the embedder service for live que
 While Anthropic approval is pending, the recommended temporary config is:
 
 - Kimi K2.5
+- Claude Haiku 4.5
+- Claude Sonnet 4.6
+- Claude Opus 4.6
 
 For the deployed AWS service, the live `DATABASE_URL` is not stored in this repo. OpenTofu builds it in [`infra/tofu/main.tf`](infra/tofu/main.tf), stores it in AWS Secrets Manager, and ECS injects it into the container as `DATABASE_URL`.
 
@@ -509,8 +529,8 @@ Manual flow:
 export AWS_CONFIG_FILE="$PWD/.aws/config"
 export AWS_SHARED_CREDENTIALS_FILE="$PWD/.aws/credentials"
 export AWS_PROFILE=ancilla-dev
-export AWS_REGION=us-west-2
-export AWS_DEFAULT_REGION=us-west-2
+export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION=us-east-1
 ```
 
 2. Install or verify required tools.
@@ -521,7 +541,7 @@ export AWS_DEFAULT_REGION=us-west-2
 - `psql`
 - `session-manager-plugin` if you want `aws ecs execute-command`
 
-Also verify the AWS account has non-zero EC2 GPU quota in `us-west-2` if you want to enable the dedicated embedder host:
+Also verify the AWS account has non-zero EC2 GPU quota in `us-east-1` if you want to enable the dedicated embedder host:
 
 - `Running On-Demand G and VT instances`
 - `All G and VT Spot Instance Requests`
@@ -534,7 +554,7 @@ The checked-in low-cost default is:
 - `embedder_accelerator = "cpu"`
 - `embedder_instance_type = "t3.large"`
 
-When GPU quota is available, the intended low-cost GPU upgrade is `g6f.large` in `us-west-2`. That is currently the smallest Linux GPU instance in the region and is materially cheaper than `g4dn.xlarge`, so the embedder defaults also use a conservative `batch_size = 2` and `max_length = 8192`.
+When GPU quota is available, the intended low-cost GPU upgrade is `g6f.large` in `us-east-1`. That is currently the smallest Linux GPU instance in the region and is materially cheaper than `g4dn.xlarge`, so the embedder defaults also use a conservative `batch_size = 2` and `max_length = 8192`.
 
 3. Create deploy inputs.
 

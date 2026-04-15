@@ -62,7 +62,7 @@ variable "vpc_cidr" {
 variable "availability_zones" {
   description = "Availability zones for the created network. Use at least two AZs."
   type        = list(string)
-  default     = ["us-west-2a", "us-west-2b"]
+  default     = ["us-east-1a", "us-east-1b"]
 }
 
 variable "public_subnet_cidrs" {

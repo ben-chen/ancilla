@@ -8,7 +8,7 @@ use crate::{
     model::{
         ApiErrorBody, AssembleContextRequest, AssembleContextResponse, CaptureEntryResponse,
         ChatModelOption, ChatModelsResponse, ChatRespondRequest, ChatResponse, ChatStreamEvent,
-        ConversationRole, ConversationTurn, Entry, EntryKind, GateDecision,
+        ConversationRole, ConversationTurn, Entry, EntryKind, GateDecision, LlmCallMetrics,
         GenerateMemoriesRequest, MemoryKind, MemoryRecord, empty_object,
     },
 };
@@ -510,6 +510,8 @@ struct ClientApp {
     chat_models: Vec<ChatModelOption>,
     model_state: ListState,
     selected_model_id: Option<String>,
+    running_gate_cost_usd: f64,
+    running_chat_cost_usd: f64,
     stream_receiver: Option<mpsc::Receiver<RemoteChatUpdate>>,
     active_stream: Option<ActiveChatStream>,
 }
@@ -544,6 +546,8 @@ impl ClientApp {
             chat_models: Vec::new(),
             model_state: ListState::default(),
             selected_model_id: None,
+            running_gate_cost_usd: 0.0,
+            running_chat_cost_usd: 0.0,
             stream_receiver: None,
             active_stream: None,
         }
@@ -649,9 +653,11 @@ impl ClientApp {
                         ChatStreamEvent::Start {
                             trace_id,
                             model_id,
+                            gate_metrics,
                             injected_context,
                             selected_memories,
                         } => {
+                            self.record_gate_metrics(gate_metrics.as_ref());
                             let model_label = model_id
                                 .as_deref()
                                 .and_then(|value| self.model_label(value))
@@ -683,8 +689,10 @@ impl ClientApp {
                             answer,
                             trace_id,
                             model_id,
+                            chat_metrics,
                             ..
                         } => {
+                            self.record_chat_metrics(chat_metrics.as_ref());
                             if let Some(stream) = self.active_stream.take() {
                                 self.set_chat_response(
                                     stream.prompt,
@@ -694,6 +702,8 @@ impl ClientApp {
                                         injected_context: stream.injected_context,
                                         selected_memories: stream.selected_memories,
                                         model_id,
+                                        gate_metrics: None,
+                                        chat_metrics: None,
                                     },
                                 );
                                 self.set_success("Answer received.");
@@ -969,6 +979,8 @@ impl ClientApp {
     }
 
     fn set_chat_response(&mut self, prompt: String, response: ChatResponse) {
+        self.record_gate_metrics(response.gate_metrics.as_ref());
+        self.record_chat_metrics(response.chat_metrics.as_ref());
         self.recent_turns.push(ConversationTurn {
             role: ConversationRole::User,
             text: prompt.clone(),
@@ -998,6 +1010,7 @@ impl ClientApp {
     }
 
     fn set_context_preview(&mut self, prompt: String, response: AssembleContextResponse) {
+        self.record_gate_metrics(response.gate_metrics.as_ref());
         self.response_title = format!(
             "Context [{} | {} selected | {} candidates | trace {}]",
             gate_decision_label(response.decision),
@@ -1107,6 +1120,18 @@ impl ClientApp {
             .iter()
             .find(|model| model.model_id == model_id)
             .map(|model| model.label.as_str())
+    }
+
+    fn record_gate_metrics(&mut self, metrics: Option<&LlmCallMetrics>) {
+        if let Some(metrics) = metrics {
+            self.running_gate_cost_usd += metrics.cost.total_usd;
+        }
+    }
+
+    fn record_chat_metrics(&mut self, metrics: Option<&LlmCallMetrics>) {
+        if let Some(metrics) = metrics {
+            self.running_chat_cost_usd += metrics.cost.total_usd;
+        }
     }
 
     fn select_next(&mut self) {
@@ -1531,7 +1556,13 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
             Span::styled(app.status.message.as_str(), status_style),
         ]),
         Line::from(Span::styled(
-            format!("Updated {} ms ago", age_ms),
+            format!(
+                "Updated {} ms ago  |  Gate {}  |  Chat {}  |  Total {}",
+                age_ms,
+                format_usd(app.running_gate_cost_usd),
+                format_usd(app.running_chat_cost_usd),
+                format_usd(app.running_gate_cost_usd + app.running_chat_cost_usd),
+            ),
             Style::default().fg(COLOR_MUTED),
         )),
     ])
@@ -1686,6 +1717,19 @@ fn draw_model_picker(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut Clien
                     Style::default().fg(COLOR_ACCENT_WARM),
                 ));
             }
+            if let Some(pricing) = model.pricing {
+                if !second_line.is_empty() {
+                    second_line.push(Span::raw("  "));
+                }
+                second_line.push(Span::styled(
+                    format!(
+                        "{} in / {} out per 1M",
+                        format_usd(pricing.input_usd_per_million_tokens),
+                        format_usd(pricing.output_usd_per_million_tokens),
+                    ),
+                    Style::default().fg(COLOR_SUCCESS),
+                ));
+            }
             if second_line.is_empty() {
                 second_line.push(Span::styled(
                     model.model_id.clone(),
@@ -1754,6 +1798,16 @@ fn thinking_effort_label(effort: crate::model::ChatThinkingEffort) -> &'static s
         crate::model::ChatThinkingEffort::Medium => "medium",
         crate::model::ChatThinkingEffort::High => "high",
         crate::model::ChatThinkingEffort::Max => "max",
+    }
+}
+
+fn format_usd(value: f64) -> String {
+    if value >= 1.0 {
+        format!("${value:.2}")
+    } else if value >= 0.01 {
+        format!("${value:.3}")
+    } else {
+        format!("${value:.4}")
     }
 }
 
@@ -1980,7 +2034,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::memory_markdown::markdown_from_plain_text;
-    use crate::model::{GateDecision, MemoryState, ScoredMemory, now_utc};
+    use crate::model::{ChatThinkingMode, GateDecision, MemoryState, ScoredMemory, now_utc};
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
@@ -2091,6 +2145,7 @@ mod tests {
                 decision: GateDecision::InjectCompact,
                 gate_confidence: 0.88,
                 gate_reason: "project memory available".to_string(),
+                gate_metrics: None,
                 context: Some(
                     "Relevant personal context:\n- You are building Ancilla.".to_string(),
                 ),
@@ -2197,6 +2252,7 @@ mod tests {
                 thinking_mode: None,
                 thinking_effort: None,
                 thinking_budget_tokens: None,
+                pricing: None,
             }],
         });
         let (tx, rx) = mpsc::channel(8);
@@ -2205,6 +2261,7 @@ mod tests {
         tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Start {
             trace_id,
             model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            gate_metrics: None,
             injected_context: Some(
                 "Relevant personal context:\n- You are building Ancilla.".to_string(),
             ),
@@ -2224,6 +2281,7 @@ mod tests {
             trace_id,
             model_id: Some("moonshotai.kimi-k2.5".to_string()),
             stop_reason: Some("end_turn".to_string()),
+            chat_metrics: None,
         }))
         .unwrap();
 
@@ -2234,6 +2292,122 @@ mod tests {
         assert!(app.stream_receiver.is_none());
         assert!(app.active_stream.is_none());
         assert_eq!(app.recent_turns.len(), 2);
+    }
+
+    #[test]
+    fn stream_events_accumulate_gate_and_chat_costs() {
+        let trace_id = Uuid::new_v4();
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let (tx, rx) = mpsc::channel(8);
+        app.begin_chat_stream("What am I building?".to_string(), rx);
+
+        tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Start {
+            trace_id,
+            model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            gate_metrics: Some(crate::model::LlmCallMetrics {
+                model_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
+                usage: crate::model::LlmTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 25,
+                    total_tokens: 125,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                },
+                cost: crate::model::LlmCostBreakdown {
+                    input_usd: 0.0001,
+                    output_usd: 0.0002,
+                    cache_read_input_usd: None,
+                    cache_write_input_usd: None,
+                    total_usd: 0.0003,
+                },
+            }),
+            injected_context: None,
+            selected_memories: Vec::new(),
+        }))
+        .unwrap();
+        tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Done {
+            answer: "Ancilla.".to_string(),
+            trace_id,
+            model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            stop_reason: Some("end_turn".to_string()),
+            chat_metrics: Some(crate::model::LlmCallMetrics {
+                model_id: Some("moonshotai.kimi-k2.5".to_string()),
+                usage: crate::model::LlmTokenUsage {
+                    input_tokens: 200,
+                    output_tokens: 50,
+                    total_tokens: 250,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                },
+                cost: crate::model::LlmCostBreakdown {
+                    input_usd: 0.0002,
+                    output_usd: 0.0008,
+                    cache_read_input_usd: None,
+                    cache_write_input_usd: None,
+                    total_usd: 0.0010,
+                },
+            }),
+        }))
+        .unwrap();
+
+        app.drain_stream_events();
+
+        assert!((app.running_gate_cost_usd - 0.0003).abs() < 1e-9);
+        assert!((app.running_chat_cost_usd - 0.0010).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_chat_models_preserves_explicit_selection_in_mixed_catalog() {
+        let mut app = ClientApp::new("http://example.test:3000".to_string());
+        let models = vec![
+            ChatModelOption {
+                label: "Kimi K2.5".to_string(),
+                model_id: "moonshotai.kimi-k2.5".to_string(),
+                description: Some("Moonshot general-purpose model".to_string()),
+                thinking_mode: None,
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+                pricing: None,
+            },
+            ChatModelOption {
+                label: "Claude Sonnet 4.6".to_string(),
+                model_id: "us.anthropic.claude-sonnet-4-6".to_string(),
+                description: Some("Balanced reasoning and speed".to_string()),
+                thinking_mode: Some(ChatThinkingMode::Adaptive),
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+                pricing: None,
+            },
+            ChatModelOption {
+                label: "Claude Opus 4.6".to_string(),
+                model_id: "us.anthropic.claude-opus-4-6-v1".to_string(),
+                description: Some("Deepest reasoning".to_string()),
+                thinking_mode: Some(ChatThinkingMode::Adaptive),
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+                pricing: None,
+            },
+        ];
+
+        app.apply_chat_models(ChatModelsResponse {
+            backend: "bedrock".to_string(),
+            default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            models: models.clone(),
+        });
+        app.selected_model_id = Some("us.anthropic.claude-opus-4-6-v1".to_string());
+
+        app.apply_chat_models(ChatModelsResponse {
+            backend: "bedrock".to_string(),
+            default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            models,
+        });
+
+        assert_eq!(
+            app.selected_model_id.as_deref(),
+            Some("us.anthropic.claude-opus-4-6-v1")
+        );
+        assert_eq!(app.selected_model_label(), Some("Claude Opus 4.6"));
+        assert_eq!(app.selected_model_index(), Some(2));
     }
 
     fn render_screen(app: &mut ClientApp) -> String {

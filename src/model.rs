@@ -150,7 +150,23 @@ pub enum ChatThinkingEffort {
     Max,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ChatModelPricing {
+    pub input_usd_per_million_tokens: f64,
+    pub output_usd_per_million_tokens: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_input_usd_per_million_tokens: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_output_usd_per_million_tokens: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m_input_usd_per_million_tokens: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_input_usd_per_million_tokens: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_usd_per_million_tokens: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChatModelOption {
     pub label: String,
     pub model_id: String,
@@ -162,9 +178,11 @@ pub struct ChatModelOption {
     pub thinking_effort: Option<ChatThinkingEffort>,
     #[serde(default)]
     pub thinking_budget_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ChatModelPricing>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChatModelsResponse {
     pub backend: String,
     #[serde(default)]
@@ -286,6 +304,36 @@ pub struct RetrievalTrace {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LlmTokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LlmCostBreakdown {
+    pub input_usd: f64,
+    pub output_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_usd: Option<f64>,
+    pub total_usd: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LlmCallMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    pub usage: LlmTokenUsage,
+    pub cost: LlmCostBreakdown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CaptureEntryResponse {
     pub entry: Entry,
     pub artifacts: Vec<Artifact>,
@@ -315,6 +363,8 @@ pub struct AssembleContextResponse {
     pub decision: GateDecision,
     pub gate_confidence: f32,
     pub gate_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_metrics: Option<LlmCallMetrics>,
     pub context: Option<String>,
     pub selected_memories: Vec<MemoryRecord>,
     pub candidates: Vec<ScoredMemory>,
@@ -328,6 +378,10 @@ pub struct ChatResponse {
     pub selected_memories: Vec<MemoryRecord>,
     #[serde(default)]
     pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_metrics: Option<LlmCallMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_metrics: Option<LlmCallMetrics>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -337,6 +391,8 @@ pub enum ChatStreamEvent {
         trace_id: Uuid,
         #[serde(default)]
         model_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gate_metrics: Option<LlmCallMetrics>,
         injected_context: Option<String>,
         #[serde(default)]
         selected_memories: Vec<MemoryRecord>,
@@ -351,6 +407,8 @@ pub enum ChatStreamEvent {
         model_id: Option<String>,
         #[serde(default)]
         stop_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_metrics: Option<LlmCallMetrics>,
     },
     Error {
         error: String,
@@ -463,6 +521,75 @@ impl ChatStreamEvent {
                 .collect();
         }
         self
+    }
+}
+
+impl LlmCostBreakdown {
+    pub fn merged(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(Self {
+                input_usd: left.input_usd + right.input_usd,
+                output_usd: left.output_usd + right.output_usd,
+                cache_read_input_usd: merge_optional_f64(
+                    left.cache_read_input_usd,
+                    right.cache_read_input_usd,
+                ),
+                cache_write_input_usd: merge_optional_f64(
+                    left.cache_write_input_usd,
+                    right.cache_write_input_usd,
+                ),
+                total_usd: left.total_usd + right.total_usd,
+            }),
+            (Some(metrics), None) | (None, Some(metrics)) => Some(metrics),
+            (None, None) => None,
+        }
+    }
+}
+
+impl LlmCallMetrics {
+    pub fn merged(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(Self {
+                model_id: match (left.model_id, right.model_id) {
+                    (Some(left), Some(right)) if left == right => Some(left),
+                    (Some(model_id), None) | (None, Some(model_id)) => Some(model_id),
+                    _ => None,
+                },
+                usage: LlmTokenUsage {
+                    input_tokens: left.usage.input_tokens + right.usage.input_tokens,
+                    output_tokens: left.usage.output_tokens + right.usage.output_tokens,
+                    total_tokens: left.usage.total_tokens + right.usage.total_tokens,
+                    cache_read_input_tokens: merge_optional_u32(
+                        left.usage.cache_read_input_tokens,
+                        right.usage.cache_read_input_tokens,
+                    ),
+                    cache_write_input_tokens: merge_optional_u32(
+                        left.usage.cache_write_input_tokens,
+                        right.usage.cache_write_input_tokens,
+                    ),
+                },
+                cost: LlmCostBreakdown::merged(Some(left.cost), Some(right.cost))
+                    .expect("merged cost should exist"),
+            }),
+            (Some(metrics), None) | (None, Some(metrics)) => Some(metrics),
+            (None, None) => None,
+        }
+    }
+}
+
+fn merge_optional_f64(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn merge_optional_u32(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 

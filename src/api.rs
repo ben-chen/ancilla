@@ -277,6 +277,8 @@ async fn chat_respond_stream(
         injected_context,
         selected_memories,
         model_id,
+        gate_metrics,
+        chat_metrics,
         receiver,
     } = stream;
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
@@ -285,6 +287,7 @@ async fn chat_respond_stream(
         let start = ChatStreamEvent::Start {
             trace_id,
             model_id: model_id.clone(),
+            gate_metrics,
             injected_context,
             selected_memories,
         }
@@ -313,6 +316,7 @@ async fn chat_respond_stream(
                         trace_id,
                         model_id: model_id.clone(),
                         stop_reason,
+                        chat_metrics,
                     };
                     let _ = send_stream_event(&tx, &done).await;
                     return;

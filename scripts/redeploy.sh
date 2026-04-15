@@ -103,7 +103,7 @@ TFVARS="$INFRA_DIR/terraform.tfvars"
 AWS_CONFIG_PATH="${AWS_CONFIG_FILE:-$REPO_ROOT/.aws/config}"
 AWS_CREDENTIALS_PATH="${AWS_SHARED_CREDENTIALS_FILE:-$REPO_ROOT/.aws/credentials}"
 AWS_PROFILE_VALUE="${AWS_PROFILE:-$(read_tfvar_string aws_profile ancilla-dev)}"
-AWS_REGION_VALUE="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(read_tfvar_string aws_region us-west-2)}}"
+AWS_REGION_VALUE="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(read_tfvar_string aws_region us-east-1)}}"
 EMBEDDER_ENABLED="$(read_tfvar_bool embedder_enabled true)"
 EMBEDDER_ACCELERATOR="$(read_tfvar_string embedder_accelerator gpu)"
 
