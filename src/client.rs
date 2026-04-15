@@ -1,5 +1,8 @@
 use std::{
+    env, fs,
     io,
+    path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -51,6 +54,16 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
     let mut terminal = TerminalSession::enter()?;
     loop {
         app.drain_stream_events();
+        if app.needs_browse_refresh {
+            app.needs_browse_refresh = false;
+            if let Err(error) = app.refresh_browse_data_silent(&api).await {
+                app.set_request_error(
+                    "Chat succeeded but refresh failed.",
+                    "Refresh Error",
+                    error.to_string(),
+                );
+            }
+        }
         terminal.draw(|frame| draw(frame, &mut app))?;
 
         if !event::poll(Duration::from_millis(125))? {
@@ -92,7 +105,7 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                     .unwrap_or("server default")
                     .to_string();
                 match api
-                    .assemble_context(&message, None, app.conversation_id, &app.recent_turns)
+                    .assemble_context(&message, None, None, &app.recent_turns)
                     .await
                 {
                     Ok(response) => {
@@ -130,9 +143,69 @@ pub async fn run(base_url_override: Option<String>, config: &ClientConfig) -> an
                     ),
                 }
             }
+            ClientAction::EditMemory(memory) => {
+                app.set_info(format!("Opening editor for \"{}\"...", memory.title));
+                if let Err(error) = edit_memory_in_editor(&mut terminal, &api, &mut app, memory).await
+                {
+                    app.set_request_error("Memory edit failed.", "Edit Error", error.to_string());
+                }
+            }
+            ClientAction::DeleteMemory(memory) => {
+                app.set_info(format!("Deleting \"{}\"...", memory.title));
+                if let Err(error) = delete_memory(&api, &mut app, memory).await {
+                    app.set_request_error(
+                        "Memory delete failed.",
+                        "Delete Error",
+                        error.to_string(),
+                    );
+                }
+            }
         }
     }
 
+    Ok(())
+}
+
+async fn edit_memory_in_editor(
+    terminal: &mut TerminalSession,
+    api: &RemoteApi,
+    app: &mut ClientApp,
+    memory: MemoryRecord,
+) -> anyhow::Result<()> {
+    let path = temp_memory_edit_path(memory.id);
+    fs::write(&path, memory.content_markdown.as_bytes())
+        .with_context(|| format!("failed to write temporary memory file {}", path.display()))?;
+
+    let run_result = terminal.run_external_command(&mut editor_command(&path));
+    let edited = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read temporary memory file {}", path.display()));
+    let _ = fs::remove_file(&path);
+
+    run_result?;
+    let edited = edited?;
+
+    if edited == memory.content_markdown {
+        app.set_info("Memory unchanged.");
+        return Ok(());
+    }
+    if edited.trim().is_empty() {
+        bail!("edited memory markdown cannot be empty");
+    }
+
+    let updated = api.patch_memory_markdown(memory.id, &edited).await?;
+    app.refresh_browse_data_silent(api).await?;
+    app.set_success(format!("Saved \"{}\".", updated.title));
+    Ok(())
+}
+
+async fn delete_memory(
+    api: &RemoteApi,
+    app: &mut ClientApp,
+    memory: MemoryRecord,
+) -> anyhow::Result<()> {
+    let deleted = api.delete_memory(memory.id).await?;
+    app.refresh_browse_data_silent(api).await?;
+    app.set_success(format!("Deleted \"{}\".", deleted.title));
     Ok(())
 }
 
@@ -247,7 +320,7 @@ impl RemoteApi {
         &self,
         message: &str,
         gate_model_id: Option<&str>,
-        conversation_id: Uuid,
+        conversation_id: Option<Uuid>,
         recent_turns: &[ConversationTurn],
     ) -> anyhow::Result<AssembleContextResponse> {
         self.post_json(
@@ -257,7 +330,7 @@ impl RemoteApi {
                 recent_turns: recent_turns.to_vec(),
                 recent_context: None,
                 gate_model_id: gate_model_id.map(ToOwned::to_owned),
-                conversation_id: Some(conversation_id),
+                conversation_id,
                 active_thread_id: None,
                 focus_from: None,
                 focus_to: None,
@@ -267,6 +340,28 @@ impl RemoteApi {
             },
         )
         .await
+    }
+
+    async fn patch_memory_markdown(
+        &self,
+        memory_id: Uuid,
+        content_markdown: &str,
+    ) -> anyhow::Result<MemoryRecord> {
+        self.patch_json(
+            &format!("/v1/memories/{memory_id}"),
+            &crate::model::PatchMemoryRequest {
+                content_markdown: Some(content_markdown.to_string()),
+                attrs: None,
+                valid_to: None,
+                state: None,
+                thread_id: None,
+            },
+        )
+        .await
+    }
+
+    async fn delete_memory(&self, memory_id: Uuid) -> anyhow::Result<MemoryRecord> {
+        self.delete_json(&format!("/v1/memories/{memory_id}")).await
     }
 
     async fn get_json<T>(&self, path: &str) -> anyhow::Result<T>
@@ -294,6 +389,34 @@ impl RemoteApi {
             .send()
             .await
             .with_context(|| format!("request failed for POST {path}"))?;
+        parse_json_response(response).await
+    }
+
+    async fn patch_json<T, B>(&self, path: &str, body: &B) -> anyhow::Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        B: serde::Serialize,
+    {
+        let response = self
+            .http
+            .patch(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("request failed for PATCH {path}"))?;
+        parse_json_response(response).await
+    }
+
+    async fn delete_json<T>(&self, path: &str) -> anyhow::Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let response = self
+            .http
+            .delete(self.url(path))
+            .send()
+            .await
+            .with_context(|| format!("request failed for DELETE {path}"))?;
         parse_json_response(response).await
     }
 
@@ -440,6 +563,42 @@ impl TerminalSession {
             .context("failed to draw terminal")?;
         Ok(())
     }
+
+    fn run_external_command(&mut self, command: &mut Command) -> anyhow::Result<()> {
+        self.terminal
+            .show_cursor()
+            .context("failed to show cursor before launching external command")?;
+        disable_raw_mode().context("failed to disable raw mode for external command")?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
+            .context("failed to leave alternate screen for external command")?;
+
+        let status_result = command
+            .status()
+            .context("failed to launch external command");
+
+        let reenter_result = (|| -> anyhow::Result<()> {
+            execute!(self.terminal.backend_mut(), EnterAlternateScreen)
+                .context("failed to re-enter alternate screen after external command")?;
+            enable_raw_mode().context("failed to re-enable raw mode after external command")?;
+            self.terminal
+                .hide_cursor()
+                .context("failed to hide cursor after external command")?;
+            self.terminal
+                .clear()
+                .context("failed to clear terminal after external command")?;
+            Ok(())
+        })();
+
+        if let Err(error) = reenter_result {
+            return Err(error);
+        }
+
+        let status = status_result?;
+        if !status.success() {
+            bail!("external command exited with status {status}");
+        }
+        Ok(())
+    }
 }
 
 impl Drop for TerminalSession {
@@ -512,6 +671,8 @@ struct ClientApp {
     selected_model_id: Option<String>,
     running_gate_cost_usd: f64,
     running_chat_cost_usd: f64,
+    pending_delete_memory_id: Option<Uuid>,
+    needs_browse_refresh: bool,
     stream_receiver: Option<mpsc::Receiver<RemoteChatUpdate>>,
     active_stream: Option<ActiveChatStream>,
 }
@@ -548,6 +709,8 @@ impl ClientApp {
             selected_model_id: None,
             running_gate_cost_usd: 0.0,
             running_chat_cost_usd: 0.0,
+            pending_delete_memory_id: None,
+            needs_browse_refresh: false,
             stream_receiver: None,
             active_stream: None,
         }
@@ -559,8 +722,7 @@ impl ClientApp {
     }
 
     async fn refresh_browse_data(&mut self, api: &RemoteApi) -> anyhow::Result<()> {
-        self.refresh_memories(api).await?;
-        self.refresh_timeline(api).await?;
+        self.refresh_browse_data_silent(api).await?;
         self.set_success(format!(
             "Loaded {} memories and {} entries from {}.",
             self.memories.len(),
@@ -570,8 +732,19 @@ impl ClientApp {
         Ok(())
     }
 
+    async fn refresh_browse_data_silent(&mut self, api: &RemoteApi) -> anyhow::Result<()> {
+        self.refresh_memories(api).await?;
+        self.refresh_timeline(api).await?;
+        Ok(())
+    }
+
     async fn refresh_memories(&mut self, api: &RemoteApi) -> anyhow::Result<()> {
-        let memories = api.get_memories().await?;
+        let memories = api
+            .get_memories()
+            .await?
+            .into_iter()
+            .filter(|memory| memory.state != crate::model::MemoryState::Deleted)
+            .collect::<Vec<_>>();
         self.memories = memories;
         let next_selected = match self.memory_state.selected() {
             Some(index) if !self.memories.is_empty() => Some(index.min(self.memories.len() - 1)),
@@ -579,6 +752,7 @@ impl ClientApp {
             _ => Some(0),
         };
         self.memory_state.select(next_selected);
+        self.pending_delete_memory_id = None;
         Ok(())
     }
 
@@ -818,11 +992,19 @@ impl ClientApp {
         if self.has_active_stream()
             && matches!(
                 key.code,
-                KeyCode::Char('a') | KeyCode::Char('c') | KeyCode::Char('r') | KeyCode::Char('s')
+                KeyCode::Char('a')
+                    | KeyCode::Char('c')
+                    | KeyCode::Char('e')
+                    | KeyCode::Char('r')
+                    | KeyCode::Char('s')
+                    | KeyCode::Char('x')
             )
         {
             self.set_error("Wait for the current streamed response to finish.");
             return ClientAction::None;
+        }
+        if key.code != KeyCode::Char('x') {
+            self.pending_delete_memory_id = None;
         }
         match key.code {
             KeyCode::Char('q') => ClientAction::Quit,
@@ -859,6 +1041,38 @@ impl ClientApp {
                     self.set_info("Model picker. Use j/k and Enter.");
                 }
                 ClientAction::None
+            }
+            KeyCode::Char('e') => {
+                if self.browse_tab != BrowseTab::Memories {
+                    self.set_error("Switch to the memory browser to edit a memory.");
+                    return ClientAction::None;
+                }
+                let Some(memory) = self.selected_memory().cloned() else {
+                    self.set_error("No memory selected.");
+                    return ClientAction::None;
+                };
+                ClientAction::EditMemory(memory)
+            }
+            KeyCode::Char('x') => {
+                if self.browse_tab != BrowseTab::Memories {
+                    self.set_error("Switch to the memory browser to delete a memory.");
+                    return ClientAction::None;
+                }
+                let Some(memory) = self.selected_memory().cloned() else {
+                    self.set_error("No memory selected.");
+                    return ClientAction::None;
+                };
+                if self.pending_delete_memory_id == Some(memory.id) {
+                    self.pending_delete_memory_id = None;
+                    ClientAction::DeleteMemory(memory)
+                } else {
+                    self.pending_delete_memory_id = Some(memory.id);
+                    self.set_info(format!(
+                        "Press 'x' again to delete \"{}\".",
+                        truncate(&memory.title, 48)
+                    ));
+                    ClientAction::None
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.select_next();
@@ -1007,6 +1221,7 @@ impl ClientApp {
             response.trace_id
         );
         self.response_body = format!("Q: {prompt}\n\n{}", response.answer);
+        self.needs_browse_refresh = true;
     }
 
     fn set_context_preview(&mut self, prompt: String, response: AssembleContextResponse) {
@@ -1144,6 +1359,7 @@ impl ClientApp {
                 let current = self.memory_state.selected().unwrap_or(0);
                 let next = (current + 1).min(self.memories.len() - 1);
                 self.memory_state.select(Some(next));
+                self.pending_delete_memory_id = None;
             }
             BrowseTab::Timeline => {
                 if self.timeline.is_empty() {
@@ -1167,6 +1383,7 @@ impl ClientApp {
                 let current = self.memory_state.selected().unwrap_or(0);
                 let next = current.saturating_sub(1);
                 self.memory_state.select(Some(next));
+                self.pending_delete_memory_id = None;
             }
             BrowseTab::Timeline => {
                 if self.timeline.is_empty() {
@@ -1188,6 +1405,7 @@ impl ClientApp {
                 } else {
                     self.memory_state.select(Some(0));
                 }
+                self.pending_delete_memory_id = None;
             }
             BrowseTab::Timeline => {
                 if self.timeline.is_empty() {
@@ -1207,6 +1425,7 @@ impl ClientApp {
                 } else {
                     self.memory_state.select(Some(self.memories.len() - 1));
                 }
+                self.pending_delete_memory_id = None;
             }
             BrowseTab::Timeline => {
                 if self.timeline.is_empty() {
@@ -1223,6 +1442,7 @@ impl ClientApp {
             BrowseTab::Memories => BrowseTab::Timeline,
             BrowseTab::Timeline => BrowseTab::Memories,
         };
+        self.pending_delete_memory_id = None;
         let label = match self.browse_tab {
             BrowseTab::Memories => "Memory browser",
             BrowseTab::Timeline => "Timeline browser",
@@ -1259,6 +1479,8 @@ enum ClientAction {
     None,
     Quit,
     Refresh,
+    EditMemory(MemoryRecord),
+    DeleteMemory(MemoryRecord),
     SubmitAsk {
         message: String,
         model_id: Option<String>,
@@ -1588,6 +1810,10 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
                 Span::styled(" move  ", Style::default().fg(COLOR_MUTED)),
                 keycap("tab"),
                 Span::styled(" switch view  ", Style::default().fg(COLOR_MUTED)),
+                keycap("e"),
+                Span::styled(" edit memory  ", Style::default().fg(COLOR_MUTED)),
+                keycap("x"),
+                Span::styled(" delete memory  ", Style::default().fg(COLOR_MUTED)),
                 keycap("r"),
                 Span::styled(" refresh  ", Style::default().fg(COLOR_MUTED)),
                 keycap("m"),
@@ -2028,6 +2254,34 @@ fn truncate(value: &str, max_chars: usize) -> String {
             .collect::<String>();
         format!("{truncated}...")
     }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn resolve_editor() -> String {
+    env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env::var("EDITOR").ok().filter(|value| !value.trim().is_empty()))
+        .unwrap_or_else(|| "vi".to_string())
+}
+
+fn temp_memory_edit_path(memory_id: Uuid) -> PathBuf {
+    env::temp_dir().join(format!("ancilla-memory-{memory_id}.md"))
+}
+
+fn editor_command(path: &Path) -> Command {
+    let editor = resolve_editor();
+    let command = format!(
+        "{} {}",
+        editor,
+        shell_single_quote(&path.to_string_lossy())
+    );
+    let mut child = Command::new("sh");
+    child.arg("-lc").arg(command);
+    child
 }
 
 #[cfg(test)]
