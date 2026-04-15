@@ -28,6 +28,7 @@ target
 # Local environment and cloud credentials
 .env.local
 .envrc
+.ancilla/
 .venv/
 __pycache__/
 *.pyc

@@ -421,7 +421,7 @@ async fn ensure_parent_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-const DEFAULT_ARTIFACT_EMBEDDING_MODEL: &str = "perplexity-ai/pplx-embed-context-v1-0.6b";
+const DEFAULT_ARTIFACT_EMBEDDING_MODEL: &str = "perplexity-ai/pplx-embed-v1-0.6b";
 const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "perplexity-ai/pplx-embed-v1-0.6b";
 const DEFAULT_EMBEDDING_VERSION: &str = "client-prepared-v1";
 const DEFAULT_QUERY_EMBEDDING_MODEL: &str = "client_or_placeholder";

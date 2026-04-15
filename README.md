@@ -91,7 +91,6 @@ Relevant server settings:
 - `accept_client_embeddings`
 - `accept_client_transcripts`
 - `local_embed_model`
-- `local_context_embed_model`
 
 Server-specific env vars use the `ANCILLA_SERVER_...` prefix. The server also accepts the standard deploy/runtime env vars already used elsewhere, including:
 
@@ -132,7 +131,6 @@ bedrock_chat_temperature = 0.2
 accept_client_embeddings = true
 accept_client_transcripts = true
 local_embed_model = "perplexity-ai/pplx-embed-v1-0.6b"
-local_context_embed_model = "perplexity-ai/pplx-embed-context-v1-0.6b"
 ```
 
 Inspect the effective server config:

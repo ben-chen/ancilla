@@ -36,7 +36,6 @@ pub struct ServerConfig {
     pub accept_client_embeddings: bool,
     pub accept_client_transcripts: bool,
     pub local_embed_model: String,
-    pub local_context_embed_model: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -68,7 +67,6 @@ pub struct EffectiveServerConfigView {
     pub accept_client_embeddings: bool,
     pub accept_client_transcripts: bool,
     pub local_embed_model: String,
-    pub local_context_embed_model: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -94,7 +92,6 @@ struct FileConfig {
     pub accept_client_embeddings: Option<bool>,
     pub accept_client_transcripts: Option<bool>,
     pub local_embed_model: Option<String>,
-    pub local_context_embed_model: Option<String>,
 }
 
 impl ServerConfig {
@@ -182,7 +179,6 @@ impl ServerConfig {
             accept_client_embeddings: self.accept_client_embeddings,
             accept_client_transcripts: self.accept_client_transcripts,
             local_embed_model: self.local_embed_model.clone(),
-            local_context_embed_model: self.local_context_embed_model.clone(),
         }
     }
 
@@ -208,7 +204,6 @@ impl ServerConfig {
             accept_client_embeddings: true,
             accept_client_transcripts: true,
             local_embed_model: "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
-            local_context_embed_model: "perplexity-ai/pplx-embed-context-v1-0.6b".to_string(),
         }
     }
 
@@ -278,10 +273,6 @@ impl ServerConfig {
         }
         if let Some(value) = crate::config::normalize_string(file_config.local_embed_model) {
             self.local_embed_model = value;
-        }
-        if let Some(value) = crate::config::normalize_string(file_config.local_context_embed_model)
-        {
-            self.local_context_embed_model = value;
         }
     }
 
@@ -395,11 +386,6 @@ impl ServerConfig {
             .or_else(|| env_var("ANCILLA_LOCAL_EMBED_MODEL"))
         {
             self.local_embed_model = value;
-        }
-        if let Some(value) = env_var("ANCILLA_SERVER_LOCAL_CONTEXT_EMBED_MODEL")
-            .or_else(|| env_var("ANCILLA_LOCAL_CONTEXT_EMBED_MODEL"))
-        {
-            self.local_context_embed_model = value;
         }
         Ok(())
     }
@@ -612,7 +598,6 @@ bedrock_chat_temperature = 0.2
 accept_client_embeddings = true
 accept_client_transcripts = true
 local_embed_model = "perplexity-ai/pplx-embed-v1-0.6b"
-local_context_embed_model = "perplexity-ai/pplx-embed-context-v1-0.6b"
 "#
 }
 
@@ -816,7 +801,6 @@ aws_region = "eu-central-1"
             accept_client_embeddings: true,
             accept_client_transcripts: true,
             local_embed_model: "embed".to_string(),
-            local_context_embed_model: "context".to_string(),
         };
 
         let view = config.to_view(false);
@@ -897,7 +881,6 @@ aws_region = "eu-central-1"
             "ANCILLA_SERVER_ACCEPT_CLIENT_EMBEDDINGS",
             "ANCILLA_SERVER_ACCEPT_CLIENT_TRANSCRIPTS",
             "ANCILLA_SERVER_LOCAL_EMBED_MODEL",
-            "ANCILLA_SERVER_LOCAL_CONTEXT_EMBED_MODEL",
             "ANCILLA_APP_ENV",
             "ANCILLA_DATA_FILE",
             "DATABASE_URL",
@@ -919,7 +902,6 @@ aws_region = "eu-central-1"
             "ANCILLA_ACCEPT_CLIENT_EMBEDDINGS",
             "ANCILLA_ACCEPT_CLIENT_TRANSCRIPTS",
             "ANCILLA_LOCAL_EMBED_MODEL",
-            "ANCILLA_LOCAL_CONTEXT_EMBED_MODEL",
             "XDG_CONFIG_HOME",
         ] {
             unsafe { env::remove_var(key) };

@@ -4,10 +4,7 @@ This turns the spec into a storage and retrieval shape that is practical on Auro
 
 ## Embedding Choice
 
-The v1 spec now assumes the Perplexity `pplx-embed` 0.6B family rather than Titan:
-
-- `perplexity-ai/pplx-embed-v1-0.6b` for query embeddings and compact `memory_records`
-- `perplexity-ai/pplx-embed-context-v1-0.6b` for `artifacts` / chunk-level evidence retrieval
+The v1 spec now assumes the Perplexity `pplx-embed-v1-0.6b` model rather than Titan for query embeddings, compact `memory_records`, and any artifact embeddings we persist today.
 
 That changes a few important storage assumptions:
 
@@ -28,7 +25,7 @@ Raw text or asset references land there and never change.
 Transcripts, chunks, summaries, and reflections live here so extraction can be replayed without mutating source data.
 
 `artifact_embeddings` is separate from `memory_embeddings`.
-That keeps contextual chunk embeddings in their own lane instead of mixing them into the recall index for compact memories.
+That keeps chunk-level evidence embeddings in their own lane instead of mixing them into the recall index for compact memories, even though both currently use the same base model.
 
 `memory_records` is the recall plane.
 Only compact, explainable memory units are retrieved into conversation context.
@@ -73,7 +70,7 @@ Per turn:
 6. Persist the trace and selected memories.
 
 Artifact-level retrieval is a separate path.
-Use the contextual model for evidence reads, timeline drill-down, and future `personal_context.read_evidence` style tool calls, not for the primary memory injection index.
+Use the same embed model for evidence reads, timeline drill-down, and future `personal_context.read_evidence` style tool calls, not for the primary memory injection index.
 
 ## Deterministic Rules After The Gate
 
@@ -119,5 +116,4 @@ That gives enough diversity for the gate without dragging too much irrelevant co
 
 ## One Important Constraint
 
-The schema now assumes the `pplx-embed` 0.6B family at `1024` dimensions.
-Do not mix `pplx-embed-v1-0.6b` and `pplx-embed-context-v1-0.6b` inside the same ANN index just because the dimensions match; they serve different roles in the retrieval design.
+The schema now assumes `pplx-embed-v1-0.6b` at `1024` dimensions. If you swap models later, rebuild embeddings consistently rather than mixing embedding spaces inside the same ANN index.
