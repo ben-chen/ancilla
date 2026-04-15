@@ -15,11 +15,16 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_bedrockruntime::{
     Client,
     config::Token,
-    types::{ContentBlock, ConversationRole, InferenceConfiguration, Message, SystemContentBlock},
+    types::{
+        AutoToolChoice, ContentBlock, ConversationRole, InferenceConfiguration, Message,
+        SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+        ToolResultContentBlock, ToolSpecification,
+    },
 };
 use aws_smithy_types::{Document, Number};
 use aws_types::region::Region;
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -32,7 +37,7 @@ use crate::{
     server_config::ServerConfig,
 };
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are Ancilla, a personal AI assistant. You are speaking with a specific user over a harness that may provide background memories about that user when they seem relevant. Treat injected memory context as potentially helpful user background, not as guaranteed ground truth about every question. Use it when it is relevant, ignore it when it is not, and never invent personalized facts that were not provided. Answer directly, naturally, and helpfully. In the future this harness may let you search the memory bank or create new explicit memories, but those tools are not available in this turn.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are Ancilla, a personal AI assistant. You are speaking with a specific user over a harness that may provide background memories about that user when they seem relevant. Treat injected memory context as potentially helpful user background, not as guaranteed ground truth about every question. Use it when it is relevant, ignore it when it is not, and never invent personalized facts that were not provided. Answer directly, naturally, and helpfully.\n\nYou may have access to these tools:\n- search_memories: search the user's explicit memory bank when you need more user-specific context.\n- remember_current_conversation: store durable, important facts from the current conversation when they are important enough that a thoughtful friend would remember them later.\n\nUse search_memories when the question depends on the user's preferences, projects, identity, plans, or past details and the injected context is insufficient. If the user explicitly asks you to search or check their memories, call search_memories rather than pretending to know. Use remember_current_conversation sparingly. It is completely fine to not store anything. If the user explicitly asks you to remember or save something durable about them, call remember_current_conversation. Do not store generic chit-chat, weak guesses, or low-value transient details.";
 const DEFAULT_GATE_SYSTEM_PROMPT: &str = "You are Ancilla's memory gate. Your job is to decide whether candidate stored memories are actually relevant to the user's latest query and recent conversation context. Prefer the smallest useful subset, and prefer no memories when the candidates are weak, redundant, or off-topic. Only select memories that would materially help the assistant answer better. Return strict JSON only with keys decision, confidence, reason, and selected_ids.";
 const MEMORY_CREATION_SYSTEM_PROMPT: &str = include_str!("../prompts/memory_creation.md");
 
@@ -51,6 +56,19 @@ pub struct ChatCompletionRequest {
 pub struct ChatCompletionResult {
     pub answer: String,
     pub model_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatToolUseRequest {
+    pub tool_use_id: String,
+    pub name: String,
+    pub input: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatToolUseResult {
+    pub tool_use_id: String,
+    pub output: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +114,20 @@ pub trait ChatCompletionBackend: Send + Sync {
         request: &MemoryCreationRequest,
     ) -> anyhow::Result<MemoryCreationResult>;
     fn models(&self) -> ChatModelsResponse;
+    async fn complete_with_tools(
+        &self,
+        request: &ChatCompletionRequest,
+        tools: &dyn ChatToolExecutor,
+    ) -> anyhow::Result<ChatCompletionResult> {
+        let _ = tools;
+        self.complete(request).await
+    }
+}
+
+#[async_trait]
+pub trait ChatToolExecutor: Send + Sync {
+    async fn search_memories(&self, query: String, limit: usize) -> anyhow::Result<Value>;
+    async fn remember_current_conversation(&self, reason: Option<String>) -> anyhow::Result<Value>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -243,6 +275,40 @@ impl BedrockChatBackend {
             .iter()
             .find(|model| model.model_id == resolved_id)
             .with_context(|| format!("model `{resolved_id}` is not available on this server"))
+    }
+
+    async fn converse_with_optional_tools(
+        &self,
+        model: &ChatModelOption,
+        system_prompt: String,
+        messages: Vec<Message>,
+        tool_config: Option<ToolConfiguration>,
+        trace_id: Uuid,
+    ) -> anyhow::Result<aws_sdk_bedrockruntime::operation::converse::ConverseOutput> {
+        let mut converse = self
+            .client
+            .converse()
+            .model_id(&model.model_id)
+            .set_system(Some(vec![SystemContentBlock::Text(system_prompt)]))
+            .set_messages(Some(messages))
+            .inference_config(
+                InferenceConfiguration::builder()
+                    .max_tokens(self.settings.max_tokens)
+                    .temperature(self.settings.temperature)
+                    .build(),
+            )
+            .set_request_metadata(Some(HashMap::from([(
+                "trace_id".to_string(),
+                trace_id.to_string(),
+            )])))
+            .set_tool_config(tool_config);
+        if let Some(additional_fields) = build_additional_model_request_fields(model)? {
+            converse = converse.additional_model_request_fields(additional_fields);
+        }
+        converse
+            .send()
+            .await
+            .map_err(|error| bedrock_request_error("chat", &model.model_id, &error))
     }
 }
 
@@ -398,29 +464,9 @@ impl ChatCompletionBackend for BedrockChatBackend {
             request.trace_id,
         );
         let messages = build_bedrock_messages(&request.recent_turns, &request.message);
-        let mut converse = self
-            .client
-            .converse()
-            .model_id(&model.model_id)
-            .set_system(Some(vec![SystemContentBlock::Text(system_prompt)]))
-            .set_messages(Some(messages))
-            .inference_config(
-                InferenceConfiguration::builder()
-                    .max_tokens(self.settings.max_tokens)
-                    .temperature(self.settings.temperature)
-                    .build(),
-            )
-            .set_request_metadata(Some(HashMap::from([(
-                "trace_id".to_string(),
-                request.trace_id.to_string(),
-            )])));
-        if let Some(additional_fields) = build_additional_model_request_fields(model)? {
-            converse = converse.additional_model_request_fields(additional_fields);
-        }
-        let response = converse
-            .send()
-            .await
-            .map_err(|error| bedrock_request_error("chat", &model.model_id, &error))?;
+        let response = self
+            .converse_with_optional_tools(model, system_prompt, messages, None, request.trace_id)
+            .await?;
 
         Ok(ChatCompletionResult {
             answer: extract_text_response(&response)?,
@@ -572,6 +618,59 @@ impl ChatCompletionBackend for BedrockChatBackend {
     fn models(&self) -> ChatModelsResponse {
         self.catalog.clone()
     }
+
+    async fn complete_with_tools(
+        &self,
+        request: &ChatCompletionRequest,
+        tools: &dyn ChatToolExecutor,
+    ) -> anyhow::Result<ChatCompletionResult> {
+        let model = self.resolve_model(request.model_id.as_deref())?;
+        let system_prompt = compose_system_prompt(
+            DEFAULT_SYSTEM_PROMPT,
+            request.injected_context.as_deref(),
+            request.recent_context.as_deref(),
+            request.trace_id,
+        );
+        let mut messages = build_bedrock_messages(&request.recent_turns, &request.message);
+        let tool_config = build_chat_tool_config()?;
+
+        for _ in 0..6 {
+            let response = self
+                .converse_with_optional_tools(
+                    model,
+                    system_prompt.clone(),
+                    messages.clone(),
+                    Some(tool_config.clone()),
+                    request.trace_id,
+                )
+                .await?;
+
+            let Some(output) = response.output() else {
+                bail!("bedrock converse response had no output")
+            };
+            let Ok(message) = output.as_message() else {
+                bail!("bedrock converse response did not contain a message output")
+            };
+            messages.push(message.clone());
+
+            if response.stop_reason().as_str() == "tool_use" {
+                let tool_requests = parse_tool_use_requests(message)?;
+                if tool_requests.is_empty() {
+                    bail!("bedrock returned stop_reason=tool_use without any toolUse blocks");
+                }
+                let tool_results = execute_tool_requests(&tool_requests, tools).await;
+                messages.push(build_tool_result_message(&tool_results)?);
+                continue;
+            }
+
+            return Ok(ChatCompletionResult {
+                answer: extract_text_response(&response)?,
+                model_id: Some(model.model_id.clone()),
+            });
+        }
+
+        bail!("bedrock chat exceeded tool iteration limit")
+    }
 }
 
 #[async_trait]
@@ -690,6 +789,204 @@ pub fn synthesize_answer(message: &str, memories: &[MemoryRecord]) -> String {
             .join(" ");
         format!("Respond to: {message}. Use these memories: {facts}")
     }
+}
+
+fn build_chat_tool_config() -> anyhow::Result<ToolConfiguration> {
+    let search_schema = json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Focused search query for the user's explicit memory bank."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of memories to return.",
+                "minimum": 1,
+                "maximum": 10
+            }
+        },
+        "required": ["query"]
+    });
+    let remember_schema = json!({
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "Short reason why the current conversation is worth remembering."
+            }
+        }
+    });
+
+    Ok(ToolConfiguration::builder()
+        .tools(Tool::ToolSpec(
+            ToolSpecification::builder()
+                .name("search_memories")
+                .description(
+                    "Search the user's explicit memory bank for relevant durable facts, preferences, projects, and plans.",
+                )
+                .input_schema(ToolInputSchema::Json(json_to_document(search_schema)?))
+                .build()
+                .expect("search_memories tool specification should build"),
+        ))
+        .tools(Tool::ToolSpec(
+            ToolSpecification::builder()
+                .name("remember_current_conversation")
+                .description(
+                    "Store durable, important facts from the current conversation in the user's memory bank. Use sparingly.",
+                )
+                .input_schema(ToolInputSchema::Json(json_to_document(remember_schema)?))
+                .build()
+                .expect("remember_current_conversation tool specification should build"),
+        ))
+        .tool_choice(ToolChoice::Auto(AutoToolChoice::builder().build()))
+        .build()
+        .expect("chat tool configuration should build"))
+}
+
+fn parse_tool_use_requests(message: &Message) -> anyhow::Result<Vec<ChatToolUseRequest>> {
+    let mut requests = Vec::new();
+    for block in &message.content {
+        if let ContentBlock::ToolUse(tool_use) = block {
+            requests.push(ChatToolUseRequest {
+                tool_use_id: tool_use.tool_use_id().to_string(),
+                name: tool_use.name().to_string(),
+                input: document_to_json(tool_use.input())?,
+            });
+        }
+    }
+    Ok(requests)
+}
+
+async fn execute_tool_requests(
+    tool_requests: &[ChatToolUseRequest],
+    tools: &dyn ChatToolExecutor,
+) -> Vec<ChatToolUseResult> {
+    let mut results = Vec::new();
+    for request in tool_requests {
+        let output = match request.name.as_str() {
+            "search_memories" => {
+                let query = request
+                    .input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let limit = request
+                    .input
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.clamp(1, 10) as usize)
+                    .unwrap_or(5);
+                match tools.search_memories(query, limit).await {
+                    Ok(value) => json!({ "ok": true, "result": value }),
+                    Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                }
+            }
+            "remember_current_conversation" => {
+                let reason = request
+                    .input
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned);
+                match tools.remember_current_conversation(reason).await {
+                    Ok(value) => json!({ "ok": true, "result": value }),
+                    Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                }
+            }
+            other => json!({
+                "ok": false,
+                "error": format!("unknown tool `{other}`"),
+            }),
+        };
+
+        results.push(ChatToolUseResult {
+            tool_use_id: request.tool_use_id.clone(),
+            output,
+        });
+    }
+    results
+}
+
+fn build_tool_result_message(results: &[ChatToolUseResult]) -> anyhow::Result<Message> {
+    let mut builder = Message::builder().role(ConversationRole::User);
+    for result in results {
+        let tool_result = ToolResultBlock::builder()
+            .tool_use_id(result.tool_use_id.clone())
+            .content(ToolResultContentBlock::Json(json_to_document(
+                result.output.clone(),
+            )?))
+            .build()
+            .expect("tool result block should build");
+        builder = builder.content(ContentBlock::ToolResult(tool_result));
+    }
+    builder
+        .build()
+        .with_context(|| "failed to build Bedrock toolResult message")
+}
+
+fn json_to_document(value: Value) -> anyhow::Result<Document> {
+    Ok(match value {
+        Value::Null => Document::Null,
+        Value::Bool(boolean) => Document::Bool(boolean),
+        Value::String(string) => Document::String(string),
+        Value::Array(items) => Document::Array(
+            items
+                .into_iter()
+                .map(json_to_document)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ),
+        Value::Object(map) => Document::Object(
+            map.into_iter()
+                .map(|(key, value)| Ok((key, json_to_document(value)?)))
+                .collect::<anyhow::Result<HashMap<_, _>>>()?,
+        ),
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                Document::Number(Number::PosInt(value))
+            } else if let Some(value) = number.as_i64() {
+                if value >= 0 {
+                    Document::Number(Number::PosInt(value as u64))
+                } else {
+                    Document::Number(Number::NegInt(value))
+                }
+            } else if let Some(value) = number.as_f64() {
+                Document::Number(Number::Float(value))
+            } else {
+                bail!("unsupported JSON number for Bedrock tool document")
+            }
+        }
+    })
+}
+
+fn document_to_json(document: &Document) -> anyhow::Result<Value> {
+    Ok(match document {
+        Document::Null => Value::Null,
+        Document::Bool(boolean) => Value::Bool(*boolean),
+        Document::String(string) => Value::String(string.clone()),
+        Document::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(document_to_json)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ),
+        Document::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| Ok((key.clone(), document_to_json(value)?)))
+                .collect::<anyhow::Result<serde_json::Map<_, _>>>()?,
+        ),
+        Document::Number(number) => match *number {
+            Number::PosInt(value) => Value::Number(serde_json::Number::from(value)),
+            Number::NegInt(value) => Value::Number(serde_json::Number::from(value)),
+            Number::Float(value) => Value::Number(
+                serde_json::Number::from_f64(value)
+                    .with_context(|| "non-finite float in Bedrock tool document")?,
+            ),
+        },
+    })
 }
 
 fn compose_system_prompt(

@@ -3,13 +3,14 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
     bedrock::{
-        ChatCompletionBackend, ChatCompletionRequest, ChatCompletionStream,
-        ChatCompletionStreamEvent, ContextGateBackend, ContextGateRequest, ContextGateResult,
-        MemoryCreationRequest, SyntheticChatBackend,
+        ChatCompletionBackend, ChatCompletionRequest, ChatCompletionStreamEvent, ChatToolExecutor,
+        ContextGateBackend, ContextGateRequest, ContextGateResult, MemoryCreationRequest,
+        SyntheticChatBackend,
     },
     embedder_client::Embedder,
     memory_markdown::{derive_search_text, markdown_from_parts, parse_memory_document},
@@ -62,6 +63,13 @@ pub struct ChatResponseStream {
     pub selected_memories: Vec<MemoryRecord>,
     pub model_id: Option<String>,
     pub receiver: tokio::sync::mpsc::Receiver<anyhow::Result<ChatCompletionStreamEvent>>,
+}
+
+#[derive(Clone)]
+struct ServiceChatToolExecutor {
+    service: AppService,
+    request: ChatRespondRequest,
+    remember_used: Arc<Mutex<bool>>,
 }
 
 impl AppService {
@@ -271,6 +279,123 @@ impl AppService {
                 }),
             ),
         })
+        .await
+    }
+
+    async fn extract_memory_documents(
+        &self,
+        context_text: String,
+        model_id: Option<String>,
+    ) -> anyhow::Result<crate::bedrock::MemoryCreationResult> {
+        let trimmed = context_text.trim().to_string();
+        if trimmed.is_empty() {
+            bail!("memory context_text cannot be empty");
+        }
+
+        self.chat_backend
+            .extract_memories(&MemoryCreationRequest {
+                context_text: trimmed,
+                model_id,
+                trace_id: Uuid::new_v4(),
+            })
+            .await
+    }
+
+    async fn persist_memories_without_entry(
+        &self,
+        prepared_memories: Vec<PreparedMemoryInput>,
+        path_prefix: &str,
+    ) -> anyhow::Result<Vec<MemoryRecord>> {
+        let prepared_memories = self.hydrate_prepared_memories(prepared_memories).await?;
+        let now = now_utc();
+        self.store
+            .write_with(move |state| -> anyhow::Result<Vec<MemoryRecord>> {
+                let mut created = Vec::new();
+                for (index, prepared) in prepared_memories.into_iter().enumerate() {
+                    let document = parse_memory_document(&prepared.content_markdown)?;
+                    let thread_id = if let Some(title) = &prepared.thread_title {
+                        Some(resolve_thread(state, title, now))
+                    } else {
+                        None
+                    };
+                    let memory = MemoryRecord {
+                        id: Uuid::new_v4(),
+                        lineage_id: Uuid::new_v4(),
+                        kind: prepared.kind,
+                        title: document.title,
+                        tags: document.tags,
+                        content_markdown: prepared.content_markdown.clone(),
+                        search_text: derive_search_text(&prepared.content_markdown)?,
+                        attrs: prepared.attrs,
+                        observed_at: prepared.observed_at,
+                        valid_from: prepared.valid_from.unwrap_or(now),
+                        valid_to: prepared.valid_to,
+                        state: prepared.state.unwrap_or(MemoryState::Accepted),
+                        embedding: prepared.embedding,
+                        source_artifact_ids: Vec::new(),
+                        thread_id,
+                        parent_id: None,
+                        path: Some(format!("{path_prefix}/{index}")),
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    enforce_temporal_exclusivity(state, &memory)?;
+                    state.memories.insert(memory.id, memory.clone());
+                    created.push(memory);
+                }
+                state.profile_blocks =
+                    rebuild_profile_blocks(&state.memories, &state.threads, now_utc());
+                Ok(created)
+            })
+            .await?
+    }
+
+    async fn remember_current_conversation(
+        &self,
+        request: &ChatRespondRequest,
+        reason: Option<String>,
+    ) -> anyhow::Result<Vec<MemoryRecord>> {
+        let context_text = build_conversation_memory_context(request);
+        let extraction = self
+            .extract_memory_documents(context_text, request.model_id.clone())
+            .await?;
+
+        if extraction.memories.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let observed_at = Some(now_utc());
+        let creation_model_id = extraction.model_id.clone();
+        let reason_value = reason.clone();
+        let prepared_memories = extraction
+            .memories
+            .into_iter()
+            .map(|memory| PreparedMemoryInput {
+                kind: MemoryKind::Semantic,
+                content_markdown: markdown_from_parts(
+                    &memory.title,
+                    &memory.tags,
+                    &memory.body_markdown,
+                ),
+                attrs: json!({
+                    "capture_type": "remember_current_conversation",
+                    "memory_creation_model_id": creation_model_id.clone(),
+                    "reason": reason_value.clone(),
+                }),
+                observed_at,
+                valid_from: observed_at,
+                valid_to: None,
+                state: Some(MemoryState::Accepted),
+                embedding: None,
+                thread_title: None,
+                source_artifact_ordinals: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        self.persist_memories_without_entry(
+            prepared_memories,
+            &format!("tool/remember_current_conversation/{}", Uuid::new_v4()),
+        )
         .await
     }
 
@@ -485,17 +610,25 @@ impl AppService {
             })
             .await?;
 
+        let tool_executor = ServiceChatToolExecutor {
+            service: self.clone(),
+            request: request.clone(),
+            remember_used: Arc::new(Mutex::new(false)),
+        };
         let completion = self
             .chat_backend
-            .complete(&ChatCompletionRequest {
-                message: request.message.clone(),
-                model_id: request.model_id.clone(),
-                recent_turns: request.recent_turns.clone(),
-                recent_context,
-                injected_context: context.context.clone(),
-                selected_memories: context.selected_memories.clone(),
-                trace_id: context.trace_id,
-            })
+            .complete_with_tools(
+                &ChatCompletionRequest {
+                    message: request.message.clone(),
+                    model_id: request.model_id.clone(),
+                    recent_turns: request.recent_turns.clone(),
+                    recent_context,
+                    injected_context: context.context.clone(),
+                    selected_memories: context.selected_memories.clone(),
+                    trace_id: context.trace_id,
+                },
+                &tool_executor,
+            )
             .await?;
 
         self.store
@@ -549,18 +682,46 @@ impl AppService {
             })
             .await?;
 
-        let ChatCompletionStream { model_id, receiver } = self
+        let tool_executor = ServiceChatToolExecutor {
+            service: self.clone(),
+            request: request.clone(),
+            remember_used: Arc::new(Mutex::new(false)),
+        };
+        let completion = self
             .chat_backend
-            .start_stream(&ChatCompletionRequest {
-                message: request.message.clone(),
-                model_id: request.model_id.clone(),
-                recent_turns: request.recent_turns.clone(),
-                recent_context,
-                injected_context: context.context.clone(),
-                selected_memories: context.selected_memories.clone(),
-                trace_id: context.trace_id,
-            })
+            .complete_with_tools(
+                &ChatCompletionRequest {
+                    message: request.message.clone(),
+                    model_id: request.model_id.clone(),
+                    recent_turns: request.recent_turns.clone(),
+                    recent_context,
+                    injected_context: context.context.clone(),
+                    selected_memories: context.selected_memories.clone(),
+                    trace_id: context.trace_id,
+                },
+                &tool_executor,
+            )
             .await?;
+        let model_id = completion.model_id.clone();
+        let answer = completion.answer.clone();
+        let (tx, receiver) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            for chunk in stream_answer_chunks(&answer) {
+                if tx
+                    .send(Ok(ChatCompletionStreamEvent::Delta(chunk)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = tx
+                .send(Ok(ChatCompletionStreamEvent::Done {
+                    answer,
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
 
         self.store
             .write_with(|state| {
@@ -731,6 +892,85 @@ impl AppService {
             })
             .await??;
         Ok(result)
+    }
+}
+
+#[async_trait::async_trait]
+impl ChatToolExecutor for ServiceChatToolExecutor {
+    async fn search_memories(
+        &self,
+        query: String,
+        limit: usize,
+    ) -> anyhow::Result<serde_json::Value> {
+        let results = self
+            .service
+            .search_memories(SearchMemoriesRequest {
+                query: query.clone(),
+                recent_context: None,
+                conversation_id: self.request.conversation_id,
+                focus_from: self.request.focus_from,
+                focus_to: self.request.focus_to,
+                active_thread_id: self.request.active_thread_id,
+                kind: None,
+                query_embedding: None,
+                limit: Some(limit.clamp(1, 10)),
+            })
+            .await?;
+
+        Ok(json!({
+            "query": query,
+            "memories": results
+                .into_iter()
+                .map(|candidate| {
+                    let memory = candidate.memory.without_embedding();
+                    json!({
+                        "id": memory.id,
+                        "title": memory.title,
+                        "tags": memory.tags,
+                        "content_markdown": memory.content_markdown,
+                        "excerpt": memory.excerpt(240),
+                        "score": candidate.final_score,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    async fn remember_current_conversation(
+        &self,
+        reason: Option<String>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut guard = self.remember_used.lock().await;
+        if *guard {
+            return Ok(json!({
+                "created_count": 0,
+                "message": "remember_current_conversation was already used in this assistant turn"
+            }));
+        }
+        *guard = true;
+        drop(guard);
+
+        let memories = self
+            .service
+            .remember_current_conversation(&self.request, reason.clone())
+            .await?;
+
+        Ok(json!({
+            "reason": reason,
+            "created_count": memories.len(),
+            "memories": memories
+                .into_iter()
+                .map(|memory| {
+                    let memory = memory.without_embedding();
+                    json!({
+                        "id": memory.id,
+                        "title": memory.title,
+                        "tags": memory.tags,
+                        "content_markdown": memory.content_markdown,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }))
     }
 }
 
@@ -1009,6 +1249,42 @@ fn build_query_embedding_text(request: &AssembleContextRequest) -> String {
     tokens[start..].join(" ")
 }
 
+fn build_conversation_memory_context(request: &ChatRespondRequest) -> String {
+    let mut lines = request
+        .recent_turns
+        .iter()
+        .map(|turn| {
+            format!(
+                "{}: {}",
+                match turn.role {
+                    ConversationRole::User => "User",
+                    ConversationRole::Assistant => "Assistant",
+                },
+                turn.text.trim()
+            )
+        })
+        .collect::<Vec<_>>();
+    if !request.message.trim().is_empty() {
+        lines.push(format!("User: {}", request.message.trim()));
+    }
+    lines
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn stream_answer_chunks(answer: &str) -> Vec<String> {
+    let chars = answer.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![answer.to_string()];
+    }
+    chars
+        .chunks(72)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
+}
+
 fn hydrate_gate_result(
     candidates: &[ScoredMemory],
     result: ContextGateResult,
@@ -1212,6 +1488,92 @@ mod tests {
                 default_model_id: Some("anthropic.claude-opus-4-6-v1".to_string()),
                 models: Vec::new(),
             }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ToolCallingBackend {
+        invocations: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ChatCompletionBackend for ToolCallingBackend {
+        async fn complete(
+            &self,
+            _request: &ChatCompletionRequest,
+        ) -> anyhow::Result<crate::bedrock::ChatCompletionResult> {
+            bail!("complete should not be used when tool support is enabled")
+        }
+
+        async fn start_stream(
+            &self,
+            _request: &ChatCompletionRequest,
+        ) -> anyhow::Result<crate::bedrock::ChatCompletionStream> {
+            bail!("start_stream should not be used when tool support is enabled")
+        }
+
+        async fn extract_memories(
+            &self,
+            request: &crate::bedrock::MemoryCreationRequest,
+        ) -> anyhow::Result<crate::bedrock::MemoryCreationResult> {
+            let text = request.context_text.trim();
+            let memories = if text.to_ascii_lowercase().contains("pour-over coffee") {
+                vec![crate::memory_markdown::MemoryDocument {
+                    title: "Coffee Preference".to_string(),
+                    tags: vec!["preference".to_string(), "coffee".to_string()],
+                    body_markdown: "The user prefers pour-over coffee.".to_string(),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(crate::bedrock::MemoryCreationResult {
+                memories,
+                model_id: request.model_id.clone(),
+            })
+        }
+
+        fn models(&self) -> ChatModelsResponse {
+            ChatModelsResponse {
+                backend: "bedrock".to_string(),
+                default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
+                models: Vec::new(),
+            }
+        }
+
+        async fn complete_with_tools(
+            &self,
+            request: &ChatCompletionRequest,
+            tools: &dyn ChatToolExecutor,
+        ) -> anyhow::Result<crate::bedrock::ChatCompletionResult> {
+            let search = tools
+                .search_memories("san francisco".to_string(), 3)
+                .await?;
+            self.invocations
+                .lock()
+                .unwrap()
+                .push("search_memories".to_string());
+            let remembered = tools
+                .remember_current_conversation(Some(
+                    "the user explicitly asked to remember a durable preference".to_string(),
+                ))
+                .await?;
+            self.invocations
+                .lock()
+                .unwrap()
+                .push("remember_current_conversation".to_string());
+
+            let search_count = search["memories"]
+                .as_array()
+                .map(|items| items.len())
+                .unwrap_or(0);
+            let remember_count = remembered["created_count"].as_u64().unwrap_or(0);
+            Ok(crate::bedrock::ChatCompletionResult {
+                answer: format!(
+                    "tools-used search={} remember={} for {}",
+                    search_count, remember_count, request.message
+                ),
+                model_id: request.model_id.clone(),
+            })
         }
     }
 
@@ -1489,6 +1851,104 @@ mod tests {
                 .unwrap()
                 .contains("personal memory system")
         );
+    }
+
+    #[tokio::test]
+    async fn chat_response_can_use_search_and_remember_tools() {
+        let backend = ToolCallingBackend::default();
+        let service = AppService::new_in_memory_with_chat_backend(Arc::new(backend.clone()));
+        service
+            .create_memory(CreateMemoryRequest {
+                content_markdown: memory_markdown("You live in San Francisco.", &["identity"]),
+                kind: MemoryKind::Semantic,
+                captured_at: None,
+                timezone: None,
+                source_app: None,
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let response = service
+            .chat_respond(ChatRespondRequest {
+                message: "Please remember that I prefer pour-over coffee.".to_string(),
+                model_id: Some("moonshotai.kimi-k2.5".to_string()),
+                gate_model_id: None,
+                recent_turns: vec![crate::model::ConversationTurn {
+                    role: ConversationRole::Assistant,
+                    text: "What kind of coffee do you usually like?".to_string(),
+                }],
+                recent_context: None,
+                conversation_id: Some(Uuid::new_v4()),
+                active_thread_id: None,
+                focus_from: None,
+                focus_to: None,
+                query_embedding: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(response.answer.contains("search=1"));
+        assert!(response.answer.contains("remember=1"));
+        assert_eq!(
+            backend.invocations.lock().unwrap().as_slice(),
+            &[
+                "search_memories".to_string(),
+                "remember_current_conversation".to_string()
+            ]
+        );
+
+        let memories = service.review_memories().await;
+        assert_eq!(memories.len(), 2);
+        assert!(memories.iter().any(|memory| {
+            memory.content_markdown.contains("pour-over coffee")
+                && memory
+                    .attrs
+                    .get("capture_type")
+                    .and_then(|value| value.as_str())
+                    == Some("remember_current_conversation")
+        }));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_uses_tool_aware_completion_path() {
+        let backend = ToolCallingBackend::default();
+        let service = AppService::new_in_memory_with_chat_backend(Arc::new(backend));
+
+        let stream = service
+            .chat_respond_stream(ChatRespondRequest {
+                message: "Please remember that I prefer pour-over coffee.".to_string(),
+                model_id: Some("moonshotai.kimi-k2.5".to_string()),
+                gate_model_id: None,
+                recent_turns: Vec::new(),
+                recent_context: None,
+                conversation_id: Some(Uuid::new_v4()),
+                active_thread_id: None,
+                focus_from: None,
+                focus_to: None,
+                query_embedding: None,
+            })
+            .await
+            .unwrap();
+
+        let mut answer = String::new();
+        let mut receiver = stream.receiver;
+        while let Some(event) = receiver.recv().await {
+            match event.unwrap() {
+                ChatCompletionStreamEvent::Delta(delta) => answer.push_str(&delta),
+                ChatCompletionStreamEvent::Done { answer: done, .. } => {
+                    assert_eq!(done, answer);
+                    break;
+                }
+            }
+        }
+
+        assert!(answer.contains("remember=1"));
     }
 
     #[tokio::test]
