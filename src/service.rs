@@ -562,6 +562,17 @@ impl AppService {
         memory_id: Uuid,
         request: PatchMemoryRequest,
     ) -> anyhow::Result<MemoryRecord> {
+        let content_update = if let Some(content_markdown) = request.content_markdown.as_ref() {
+            let content_markdown = content_markdown.trim().to_string();
+            if content_markdown.is_empty() {
+                bail!("memory content_markdown cannot be empty");
+            }
+            let document = parse_memory_document(&content_markdown)?;
+            let search_text = derive_search_text(&content_markdown)?;
+            Some((document.title, document.tags, content_markdown, search_text))
+        } else {
+            None
+        };
         let updated = self
             .store
             .write_with(|state| -> anyhow::Result<MemoryRecord> {
@@ -569,12 +580,13 @@ impl AppService {
                     .memories
                     .get_mut(&memory_id)
                     .with_context(|| format!("memory {memory_id} not found"))?;
-                if let Some(content_markdown) = request.content_markdown {
-                    let document = parse_memory_document(&content_markdown)?;
-                    memory.title = document.title;
-                    memory.tags = document.tags;
-                    memory.content_markdown = content_markdown;
-                    memory.search_text = derive_search_text(&memory.content_markdown)?;
+                if let Some((title, tags, content_markdown, search_text)) = content_update.as_ref()
+                {
+                    memory.title = title.clone();
+                    memory.tags = tags.clone();
+                    memory.content_markdown = content_markdown.clone();
+                    memory.search_text = search_text.clone();
+                    memory.embedding = None;
                 }
                 if let Some(attrs) = request.attrs {
                     memory.attrs = attrs;
@@ -595,6 +607,9 @@ impl AppService {
                 Ok(updated)
             })
             .await??;
+        if content_update.is_some() {
+            self.spawn_memory_reembed(memory_id);
+        }
         Ok(updated)
     }
 
@@ -867,6 +882,63 @@ impl AppService {
             .await
             .with_context(|| "failed to embed retrieval query")?;
         Ok(embeddings.pop())
+    }
+
+    fn spawn_memory_reembed(&self, memory_id: Uuid) {
+        if self.embedder.is_none() {
+            return;
+        }
+
+        let service = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = service.reembed_memory(memory_id).await {
+                eprintln!("failed to re-embed edited memory {memory_id}: {error:#}");
+            }
+        });
+    }
+
+    async fn reembed_memory(&self, memory_id: Uuid) -> anyhow::Result<()> {
+        let Some(embedder) = &self.embedder else {
+            return Ok(());
+        };
+
+        let (expected_updated_at, search_text) = {
+            let state = self.store.read_clone().await;
+            let memory = state
+                .memories
+                .get(&memory_id)
+                .with_context(|| format!("memory {memory_id} not found"))?;
+            (memory.updated_at, memory.search_text.clone())
+        };
+
+        if search_text.trim().is_empty() {
+            return Ok(());
+        }
+
+        let mut embeddings = embedder
+            .embed_texts(&self.embedding_model, &[search_text.clone()], false)
+            .await
+            .with_context(|| format!("failed to re-embed memory {memory_id}"))?;
+        let Some(embedding) = embeddings.pop() else {
+            bail!("embedder returned no embedding for memory {memory_id}");
+        };
+
+        self.store
+            .write_with(|state| -> anyhow::Result<()> {
+                let memory = state
+                    .memories
+                    .get_mut(&memory_id)
+                    .with_context(|| format!("memory {memory_id} not found"))?;
+                if memory.updated_at != expected_updated_at || memory.search_text != search_text {
+                    return Ok(());
+                }
+                memory.embedding = Some(embedding);
+                memory.updated_at = now_utc();
+                Ok(())
+            })
+            .await??;
+
+        Ok(())
     }
 
     async fn gate_candidates(
@@ -1444,6 +1516,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{Duration, TimeZone};
     use tempfile::tempdir;
+    use tokio::time::sleep;
 
     use crate::memory_markdown::markdown_from_plain_text;
     use crate::model::{ConversationTurn, GateDecision, ProfileLabel, SearchMemoriesRequest};
@@ -1561,6 +1634,32 @@ mod tests {
                 default_model_id: Some("anthropic.claude-opus-4-6-v1".to_string()),
                 models: Vec::new(),
             }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingEmbedder {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed_texts(
+            &self,
+            model_id: &str,
+            texts: &[String],
+            _normalize: bool,
+        ) -> anyhow::Result<Vec<EmbeddingVector>> {
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
+            Ok(texts
+                .iter()
+                .map(|text| EmbeddingVector {
+                    values: vec![text.len() as f32, text.bytes().map(f32::from).sum::<f32>()],
+                    model: Some(model_id.to_string()),
+                    device: Some("test".to_string()),
+                    source: Some("recording-embedder".to_string()),
+                })
+                .collect())
         }
     }
 
@@ -1866,6 +1965,82 @@ mod tests {
 
         let deleted = service.delete_memory(memory.id).await.unwrap();
         assert_eq!(deleted.state, MemoryState::Deleted);
+    }
+
+    #[tokio::test]
+    async fn patch_memory_reembeds_in_background() {
+        let embedder = RecordingEmbedder::default();
+        let service = AppService {
+            store: SharedStore::new_in_memory(),
+            chat_backend: Arc::new(SyntheticChatBackend),
+            gate_backend: None,
+            embedder: Some(Arc::new(embedder.clone())),
+            embedding_model: "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
+        };
+
+        let created = service
+            .create_memory(CreateMemoryRequest {
+                content_markdown: memory_markdown("You prefer Rust.", &["preference"]),
+                kind: MemoryKind::Semantic,
+                captured_at: None,
+                timezone: None,
+                source_app: None,
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        let memory = created.memories.first().unwrap().clone();
+        let original_embedding = memory.embedding.clone().unwrap();
+
+        let patched = service
+            .patch_memory(
+                memory.id,
+                PatchMemoryRequest {
+                    content_markdown: Some(memory_markdown(
+                        "You prefer Rust and Axum.",
+                        &["preference"],
+                    )),
+                    attrs: None,
+                    valid_to: None,
+                    state: None,
+                    thread_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(patched.embedding.is_none());
+
+        let reembedded = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let state = service.store.read_clone().await;
+                let current = state.memories.get(&memory.id).unwrap().clone();
+                if current.embedding.is_some() {
+                    break current;
+                }
+                drop(state);
+                sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("memory should be re-embedded");
+
+        let new_embedding = reembedded.embedding.unwrap();
+        assert_ne!(new_embedding.values, original_embedding.values);
+        assert!(reembedded.content_markdown.contains("Axum"));
+        assert!(
+            embedder
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text.contains("Axum"))
+        );
     }
 
     #[tokio::test]
