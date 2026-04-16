@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -689,6 +689,7 @@ impl AppService {
                 if let Some(thread_id) = request.thread_id {
                     memory.thread_id = thread_id;
                 }
+                normalize_memory_temporal_window(memory, now_utc())?;
                 memory.updated_at = now_utc();
                 let updated = memory.clone();
                 state.profile_blocks =
@@ -710,9 +711,11 @@ impl AppService {
                     .memories
                     .get_mut(&memory_id)
                     .with_context(|| format!("memory {memory_id} not found"))?;
+                let now = now_utc();
                 memory.state = MemoryState::Deleted;
-                memory.valid_to = Some(now_utc());
-                memory.updated_at = now_utc();
+                memory.valid_to = Some(now);
+                normalize_memory_temporal_window(memory, now)?;
+                memory.updated_at = now;
                 let deleted = memory.clone();
                 state.profile_blocks =
                     rebuild_profile_blocks(&state.memories, &state.threads, now_utc());
@@ -1598,6 +1601,31 @@ fn intervals_overlap(
     left_from <= right_to && right_from <= left_to
 }
 
+fn normalize_memory_temporal_window(
+    memory: &mut MemoryRecord,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    if memory.state == MemoryState::Deleted && memory.valid_to.is_none() {
+        memory.valid_to = Some(now);
+    }
+
+    if let Some(valid_to) = memory.valid_to {
+        if valid_to <= memory.valid_from {
+            if memory.state == MemoryState::Deleted {
+                memory.valid_to = Some(memory.valid_from + Duration::microseconds(1));
+            } else {
+                bail!(
+                    "memory valid_to must be later than valid_from (valid_from={}, valid_to={})",
+                    memory.valid_from,
+                    valid_to
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn collapse_recent_context(
     recent_turns: &[crate::model::ConversationTurn],
     explicit_context: Option<String>,
@@ -2081,6 +2109,119 @@ mod tests {
 
         let deleted = service.delete_memory(memory.id).await.unwrap();
         assert_eq!(deleted.state, MemoryState::Deleted);
+    }
+
+    #[tokio::test]
+    async fn deleting_future_dated_memory_keeps_temporal_window_valid() {
+        let service = AppService::new_in_memory();
+        let future_start = now_utc() + Duration::days(2);
+        let created = service
+            .create_memory(CreateMemoryRequest {
+                content_markdown: memory_markdown(
+                    "You will start the new role next week.",
+                    &["career"],
+                ),
+                kind: MemoryKind::Semantic,
+                captured_at: Some(future_start),
+                timezone: None,
+                source_app: None,
+                attrs: json!({}),
+                observed_at: Some(future_start),
+                valid_from: Some(future_start),
+                valid_to: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let deleted = service.delete_memory(created.memories[0].id).await.unwrap();
+        assert_eq!(deleted.state, MemoryState::Deleted);
+        assert!(deleted.valid_to.is_some());
+        assert!(deleted.valid_to.unwrap() > deleted.valid_from);
+    }
+
+    #[tokio::test]
+    async fn patching_future_dated_memory_to_deleted_normalizes_valid_to() {
+        let service = AppService::new_in_memory();
+        let future_start = now_utc() + Duration::days(3);
+        let created = service
+            .create_memory(CreateMemoryRequest {
+                content_markdown: memory_markdown(
+                    "You will move apartments next month.",
+                    &["housing"],
+                ),
+                kind: MemoryKind::Semantic,
+                captured_at: Some(future_start),
+                timezone: None,
+                source_app: None,
+                attrs: json!({}),
+                observed_at: Some(future_start),
+                valid_from: Some(future_start),
+                valid_to: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let patched = service
+            .patch_memory(
+                created.memories[0].id,
+                PatchMemoryRequest {
+                    content_markdown: None,
+                    attrs: None,
+                    valid_to: None,
+                    state: Some(MemoryState::Deleted),
+                    thread_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(patched.state, MemoryState::Deleted);
+        assert!(patched.valid_to.is_some());
+        assert!(patched.valid_to.unwrap() > patched.valid_from);
+    }
+
+    #[tokio::test]
+    async fn patching_non_deleted_memory_with_invalid_valid_to_is_rejected() {
+        let service = AppService::new_in_memory();
+        let now = now_utc();
+        let created = service
+            .create_memory(CreateMemoryRequest {
+                content_markdown: memory_markdown("You prefer Axum.", &["preference"]),
+                kind: MemoryKind::Semantic,
+                captured_at: Some(now),
+                timezone: None,
+                source_app: None,
+                attrs: json!({}),
+                observed_at: Some(now),
+                valid_from: Some(now),
+                valid_to: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let error = service
+            .patch_memory(
+                created.memories[0].id,
+                PatchMemoryRequest {
+                    content_markdown: None,
+                    attrs: None,
+                    valid_to: Some(Some(now - Duration::seconds(1))),
+                    state: None,
+                    thread_id: None,
+                },
+            )
+            .await
+            .expect_err("invalid temporal window should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("memory valid_to must be later than valid_from")
+        );
     }
 
     #[tokio::test]

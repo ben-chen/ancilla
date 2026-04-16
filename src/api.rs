@@ -454,6 +454,8 @@ impl From<anyhow::Error> for ApiError {
             Self::BadRequest(message)
         } else if message.contains("not found") {
             Self::BadRequest(message)
+        } else if message.contains("memory valid_to must be later than valid_from") {
+            Self::BadRequest(message)
         } else if message.contains("bedrock ")
             || message.contains("failed to embed retrieval query")
             || message.contains("embedder")
