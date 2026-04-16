@@ -278,6 +278,12 @@ function App() {
     setDraftMarkdown(memory.content_markdown)
   }
 
+  function resetMemoryEditor() {
+    setSelectedMemoryId(null)
+    setDraftKind('semantic')
+    setDraftMarkdown(DEFAULT_MEMORY_TEMPLATE)
+  }
+
   function stopSpeech() {
     audioRef.current?.pause()
     audioRef.current = null
@@ -349,6 +355,7 @@ function App() {
 
   async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await fetch(path, {
+      cache: init?.cache ?? 'no-store',
       credentials: 'same-origin',
       ...init,
       headers: {
@@ -464,15 +471,15 @@ function App() {
     if (!window.confirm(`Delete "${selectedMemory.title}"?`)) {
       return
     }
+    const deletedId = selectedMemory.id
     setSavingMemory(true)
     try {
-      await apiRequest<MemoryRecord>(`/v1/memories/${selectedMemory.id}`, {
+      await apiRequest<MemoryRecord>(`/v1/memories/${deletedId}`, {
         method: 'DELETE',
       })
-      setSelectedMemoryId(null)
-      setDraftKind('semantic')
-      setDraftMarkdown(DEFAULT_MEMORY_TEMPLATE)
-      await loadMemories(undefined)
+      resetMemoryEditor()
+      setMemories((current) => current.filter((memory) => memory.id !== deletedId))
+      await loadMemories(null)
       setStatus('Deleted')
     } catch (error) {
       setStatus(
@@ -596,9 +603,7 @@ function App() {
   }
 
   function startNewMemory() {
-    setSelectedMemoryId(null)
-    setDraftKind('semantic')
-    setDraftMarkdown(DEFAULT_MEMORY_TEMPLATE)
+    resetMemoryEditor()
   }
 
   function startNewConversation() {

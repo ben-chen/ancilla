@@ -76,6 +76,8 @@ pub struct ChatToolUseResult {
 pub struct MemoryCreationRequest {
     pub context_text: String,
     pub model_id: Option<String>,
+    pub captured_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub timezone: Option<String>,
     pub trace_id: Uuid,
 }
 
@@ -591,7 +593,7 @@ impl ChatCompletionBackend for BedrockChatBackend {
             .set_messages(Some(vec![
                 Message::builder()
                     .role(ConversationRole::User)
-                    .content(ContentBlock::Text(request.context_text.clone()))
+                    .content(ContentBlock::Text(format_memory_creation_input(request)))
                     .build()
                     .expect("memory creation message build should not fail"),
             ]))
@@ -678,6 +680,22 @@ impl ChatCompletionBackend for BedrockChatBackend {
 
         bail!("bedrock chat exceeded tool iteration limit")
     }
+}
+
+fn format_memory_creation_input(request: &MemoryCreationRequest) -> String {
+    let captured_at = request
+        .captured_at
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| "unknown".to_string());
+    let timezone = request
+        .timezone
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown");
+    format!(
+        "Capture metadata (authoritative for resolving relative time):\n- captured_at_utc: {captured_at}\n- timezone: {timezone}\n\nUse the capture metadata above as ground truth when rewriting phrases like \"today\", \"yesterday\", or \"tomorrow\". Do not guess or invent dates.\n\nContext to extract memories from:\n{}",
+        request.context_text.trim()
+    )
 }
 
 #[async_trait]
@@ -1339,6 +1357,8 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    use chrono::TimeZone;
+
     use crate::{
         memory_markdown::markdown_from_plain_text,
         model::{ChatThinkingEffort, ConversationRole, MemoryKind, MemoryState, now_utc},
@@ -1436,6 +1456,28 @@ mod tests {
         let prompt = build_gate_prompt(&request).unwrap();
         assert!(prompt.contains("relevant to the latest user query"));
         assert!(prompt.contains("\"selected_ids\""));
+    }
+
+    #[test]
+    fn memory_creation_input_includes_capture_metadata() {
+        let request = MemoryCreationRequest {
+            context_text: "Today I started a new job at OpenAI.".to_string(),
+            model_id: None,
+            captured_at: Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 4, 16, 19, 0, 0)
+                    .single()
+                    .unwrap(),
+            ),
+            timezone: Some("America/Los_Angeles".to_string()),
+            trace_id: Uuid::new_v4(),
+        };
+
+        let input = format_memory_creation_input(&request);
+        assert!(input.contains("captured_at_utc: 2026-04-16T19:00:00+00:00"));
+        assert!(input.contains("timezone: America/Los_Angeles"));
+        assert!(input.contains("Context to extract memories from:"));
+        assert!(input.contains("Today I started a new job at OpenAI."));
     }
 
     #[test]

@@ -271,6 +271,8 @@ impl AppService {
             .extract_memories(&MemoryCreationRequest {
                 context_text: context_text.clone(),
                 model_id: request.model_id.clone(),
+                captured_at: request.captured_at,
+                timezone: request.timezone.clone(),
                 trace_id: Uuid::new_v4(),
             })
             .await?;
@@ -318,6 +320,8 @@ impl AppService {
         &self,
         context_text: String,
         model_id: Option<String>,
+        captured_at: Option<DateTime<Utc>>,
+        timezone: Option<String>,
     ) -> anyhow::Result<crate::bedrock::MemoryCreationResult> {
         let trimmed = context_text.trim().to_string();
         if trimmed.is_empty() {
@@ -328,6 +332,8 @@ impl AppService {
             .extract_memories(&MemoryCreationRequest {
                 context_text: trimmed,
                 model_id,
+                captured_at,
+                timezone,
                 trace_id: Uuid::new_v4(),
             })
             .await
@@ -389,7 +395,12 @@ impl AppService {
     ) -> anyhow::Result<RememberCurrentConversationResult> {
         let context_text = build_conversation_memory_context(request);
         let extraction = self
-            .extract_memory_documents(context_text, request.model_id.clone())
+            .extract_memory_documents(
+                context_text,
+                request.model_id.clone(),
+                Some(now_utc()),
+                Some("UTC".to_string()),
+            )
             .await?;
 
         if extraction.memories.is_empty() {

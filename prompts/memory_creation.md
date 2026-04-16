@@ -33,4 +33,8 @@ Rules:
 - `title` must be short and concrete.
 - `tags` should be short lowercase topical tags.
 - `markdown_body` should contain only the body content, not the title line.
+- Treat any provided capture timestamp and timezone as authoritative ground truth for resolving relative time.
+- Rewrite relative temporal language into absolute time whenever the context makes that possible. For example, convert phrases like "today", "yesterday", "last week", or "tomorrow" into the actual calendar date or dated time range implied by the capture timestamp and timezone.
+- Do not preserve vague relative time words in the stored memory when you can anchor them to an absolute date.
+- Never invent or guess approximate dates. If the exact date cannot be derived from the text plus the provided capture metadata, keep the statement factual without adding a guessed date.
 - Do not include any text outside the JSON object.
