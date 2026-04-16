@@ -6,12 +6,16 @@ use axum::{
     extract::{Path, State},
     http::{HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, patch, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use thiserror::Error;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    services::ServeDir,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -61,8 +65,14 @@ pub fn router(service: AppService, basic_auth: Option<BasicAuthConfig>) -> Route
         service: Arc::new(service),
         basic_auth,
     };
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let protected = Router::new()
+        .route("/", get(frontend_index))
+        .nest_service("/assets", ServeDir::new("web/dist/assets"))
         .route("/v1/entries/text", post(create_text_entry))
         .route("/v1/entries/audio", post(create_audio_entry))
         .route("/v1/memories", get(get_memories).post(create_memory))
@@ -93,11 +103,21 @@ pub fn router(service: AppService, basic_auth: Option<BasicAuthConfig>) -> Route
     Router::new()
         .route("/healthz", get(health))
         .merge(protected)
+        .layer(cors)
         .with_state(state)
 }
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+async fn frontend_index() -> Html<String> {
+    let html = tokio::fs::read_to_string("web/dist/index.html")
+        .await
+        .unwrap_or_else(|_| {
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Ancilla</title></head><body><main style=\"font-family:sans-serif;padding:2rem\"><h1>Ancilla</h1><p>The frontend has not been built yet.</p></main></body></html>".to_string()
+        });
+    Html(html)
 }
 
 async fn basic_auth_middleware(

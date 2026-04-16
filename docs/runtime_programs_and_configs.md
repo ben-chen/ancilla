@@ -30,9 +30,12 @@ Responsibilities:
 - talk to a running server over HTTP
 - optionally send HTTP Basic auth from client config
 - browse durable memories by default, with a switchable raw-entry timeline
+- edit memories in the terminal editor and soft-delete them from the browser
 - preview retrieval/context assembly without invoking the chat model
 - stream chat answers from the server into the response pane
-- fetch the server-advertised model catalog and let the user pick from it
+- fetch the server-advertised model catalog and let the user pick separate chat and gate models from it
+- persist the selected chat/gate model IDs in `~/.config/ancilla/client.toml`
+- expose `?` help for the full hotkey list
 - never read the database directly
 - never require AWS credentials or Bedrock settings
 
@@ -40,7 +43,7 @@ Config file:
 
 - `~/.config/ancilla/client.toml`
 
-This program is local-only and points at either a local server or the deployed ECS task IP.
+This program is local-only and points at either a local server or the deployed API domain.
 
 ## Config Boundary
 
@@ -58,13 +61,14 @@ The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be ext
 ## Operational Consequences
 
 - redeploying the server does not mutate client config
-- the deploy script prints the live task IP and leaves it to the operator to update `ancilla-client` if needed
+- the stable deployed client target is `https://api.ancillabot.com`
 - ECS only needs the `ancilla-server` binary in the container image
 - the optional `ancilla-embedder` runtime is a separate service with its own image
 - local TUI testing only needs `base_url` unless the server has Basic auth enabled
 - the TUI now treats the memory browser as the primary view and keeps the timeline as a secondary provenance view
 - chat streaming is additive; `/v1/chat/respond` stays available while the TUI uses `/v1/chat/respond/stream`
 - `capture` in the TUI and CLI now targets the generated-memory path, while explicit markdown writes stay available through `POST /v1/memories`
+- after a memory edit, the patch returns immediately and the server re-embeds the memory asynchronously in the background
 
 ## Recommended Local Setup
 
@@ -76,6 +80,6 @@ The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be ext
 For deployed testing:
 
 1. Redeploy the server.
-2. Set `base_url = "https://ancillabot.com"` or the current ALB DNS name in `~/.config/ancilla/client.toml`.
+2. Set `base_url = "https://api.ancillabot.com"` in `~/.config/ancilla/client.toml`.
 3. If the server has Basic auth enabled, also set `basic_auth_username` and `basic_auth_password` in `~/.config/ancilla/client.toml`.
 4. Run `ancilla-client`.

@@ -6,4 +6,6 @@ target
 infra/tofu/.terraform
 infra/tofu/*.tfstate
 infra/tofu/*.tfstate.*
+web/node_modules
+web/dist
 **/.DS_Store

@@ -213,9 +213,11 @@ The client config is intentionally small. Its job is to know which server to cal
 Example `~/.config/ancilla/client.toml`:
 
 ```toml
-base_url = "http://127.0.0.1:3000"
+base_url = "https://api.ancillabot.com"
 # basic_auth_username = "ancilla"
 # basic_auth_password = "replace-me"
+selected_chat_model_id = "moonshotai.kimi-k2.5"
+selected_gate_model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 ```
 
 When the deployed server has HTTP Basic auth enabled, put the same username/password in `client.toml`. `ancilla-client` will send the `Authorization` header automatically.
@@ -326,12 +328,18 @@ The client UI supports:
 
 - memory browsing by default, with `Tab` to switch to the raw timeline
 - memory inspection and entry inspection
-- model selection from the server-advertised catalog with `m`
+- editing selected memories in `$VISUAL`, `$EDITOR`, or `vi` with `e`
+- soft-deleting selected memories with `x`
+- chat model selection from the server-advertised catalog with `m`
+- gate model selection from the server-advertised catalog with `v`
+- inline help with `?`
 - retrieval/context preview with `s`, calling `POST /v1/context/assemble`; when the server has a gate model configured this still uses the Bedrock gate, but it does not generate a final chat answer
 - sending chat questions to the live server with streamed answer rendering from `POST /v1/chat/respond/stream`
 - capturing new memories on the live server
+- refreshing memories/timeline automatically after chat-created memories land
 
 The client does not define its own model list. It fetches the catalog from `GET /v1/chat/models` and sends the selected `model_id` with each ask request.
+It persists `selected_chat_model_id` and `selected_gate_model_id` in `~/.config/ancilla/client.toml`.
 
 ## Local vs Deployed Runtime
 
@@ -425,6 +433,13 @@ I am building Ancilla, a personal memory system.
 
 `POST /v1/context/assemble` and `POST /v1/chat/respond` accept either a client-supplied `query_embedding` or recent conversation turns. When the client omits `query_embedding` and the server has `embedder_base_url` configured, the server asks the embedder for a query embedding directly.
 
+The main chat path also exposes two app-owned tools to the model:
+
+- `search_memories`
+- `remember_current_conversation`
+
+`search_memories` lets the model explicitly search the durable memory bank when injected memories are insufficient. `remember_current_conversation` runs the model-backed memory generator against the current conversation window and may store zero memories if nothing is important enough to keep.
+
 If the client supplies embeddings:
 
 - the server stores them
@@ -475,7 +490,9 @@ Current runtime notes:
 - the Postgres path reads and writes the normalized tables directly
 - `entries.kind` is normalized to `text`, `chat_turn`, or `import`; source modality like `text` vs `audio` lives in `entries.metadata.source_modality`
 - memory content is stored as markdown, while `search_text` is derived plain text used for lexical search and embeddings
-- candidate retrieval currently runs from the in-memory state view built from Postgres, using derived-text lexical search plus cosine similarity ranking
+- candidate retrieval now prefers a Postgres-backed hybrid search query using full-text search plus pgvector similarity, with the older in-memory ranker kept only as a fallback when Postgres is unavailable
+- query embeddings are built from the current user query text only
+- editing a memory updates markdown and lexical search text immediately, clears the old vector, and then re-embeds asynchronously in the background
 - when `BEDROCK_CHAT_MODEL_ID` is configured, `POST /v1/chat/respond` calls Bedrock `Converse`
 - the JSON file path remains available as a fallback when `DATABASE_URL` is unset
 - the Postgres path expects `pgvector` to be available in the target database
@@ -498,11 +515,21 @@ The default side-project shape uses:
 Fast path:
 
 ```bash
-scripts/redeploy.sh
+scripts/deploy-app.sh
 ```
 
-That script builds a new immutable ARM64 server image and, when enabled, an AMD64 embedder image, pushes the needed images to ECR, updates `infra/tofu/terraform.tfvars`, runs `tofu apply`, waits for ECS to stabilize, prints the current task IP, and runs `/healthz`.
-If `embedder_enabled = false`, the script skips the embedder image entirely. If the embedder is enabled, the script builds the embedder image for the selected accelerator mode.
+Targeted deploy scripts:
+
+- `scripts/deploy-app.sh`
+  Builds the ARM64 server image, including the embedded web UI, updates `container_image_tag`, runs `tofu apply`, waits for ECS to stabilize, and checks `/healthz`.
+- `scripts/deploy-embedder.sh`
+  Builds the AMD64 embedder image, updates `embedder_image_tag`, and runs `tofu apply`.
+- `scripts/deploy-infra.sh`
+  Runs `tofu apply` with no image build step.
+
+`scripts/redeploy.sh` remains as a backward-compatible wrapper that deploys the embedder first when enabled, then deploys the app with the same immutable tag.
+
+The stable deployed API hostname is `https://api.ancillabot.com`. The deploy script now targets the current ECS service behind the ALB rather than relying on a changing public task IP.
 
 The deploy script stays separate from app runtime config:
 
@@ -510,16 +537,18 @@ The deploy script stays separate from app runtime config:
 - `AWS_PROFILE` and `AWS_REGION` come from env if set, otherwise `infra/tofu/terraform.tfvars`
 - it does not read or modify either program’s config file
 
-If you want the client to target the new deploy, copy the printed IP into `~/.config/ancilla/client.toml`:
+If you want the client to target the deployed service, set `~/.config/ancilla/client.toml` to the stable API hostname:
 
 ```toml
-base_url = "http://<app-ip>:3000"
+base_url = "https://api.ancillabot.com"
 ```
 
 Useful options:
 
-- `scripts/redeploy.sh --tag deploy-20260414-1530`
-- `scripts/redeploy.sh --skip-healthcheck`
+- `scripts/deploy-app.sh --tag deploy-20260414-1530`
+- `scripts/deploy-app.sh --skip-healthcheck`
+- `scripts/deploy-embedder.sh --tag deploy-20260414-1530`
+- `scripts/deploy-infra.sh --skip-healthcheck`
 
 Manual flow:
 

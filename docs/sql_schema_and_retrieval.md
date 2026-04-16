@@ -66,18 +66,20 @@ The runtime prompt explicitly allows returning zero memories. That is intentiona
 
 ## Retrieval Flow
 
-Current retrieval is application-driven rather than SQL-driven:
+Current retrieval prefers a Postgres-backed hybrid search path:
 
-1. Build the query text from the latest user message and recent turns.
-2. If available, derive a query embedding from the live embedder service.
-3. Score candidate memories using:
-   - lexical overlap against `search_text`
-   - cosine similarity against `memory_embeddings`
-4. Send the top shortlist to the gate model when configured.
-5. Fall back to a small deterministic gate when the model gate is unavailable.
-6. Persist retrieval traces for audit/debugging.
+1. Build lexical query material from the current message plus recent conversation/thread context.
+2. Build the semantic query embedding from the current user query text only.
+3. If Postgres is active, run the hybrid candidate query in [`sql/hybrid_memory_candidates.sql`](../sql/hybrid_memory_candidates.sql):
+   - full-text search over `memory_records.search_vector`
+   - cosine similarity over `memory_embeddings`
+   - conversation-level reinjection filtering
+4. If Postgres is unavailable, fall back to the older in-process ranker.
+5. Send the shortlisted candidates to the configured gate model when available.
+6. Fall back to a deterministic gate when the model gate is unavailable.
+7. Persist retrieval traces for audit/debugging.
 
-The stored SQL schema still matters for persistence and indexing, but the primary candidate ranking logic now lives in application code.
+So the main ranking path is now SQL-backed, with the application ranker kept as a fallback rather than the default.
 
 ## Embedding Choice
 
@@ -90,3 +92,15 @@ Important assumptions:
 - the same base embedding space is used for stored memories and live query embeddings
 
 If that model changes later, embeddings should be rebuilt consistently rather than mixed within the same index.
+
+## Memory Edits And Embeddings
+
+Editing a memory updates:
+
+- `content_markdown`
+- parsed title/tags
+- derived `search_text`
+
+Immediately.
+
+The old memory embedding is cleared on save so the system never keeps a stale vector. Ancilla then re-embeds the edited memory asynchronously in the background and writes the new vector back once it is ready.

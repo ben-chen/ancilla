@@ -1,3 +1,14 @@
+FROM node:24-bookworm AS web-builder
+WORKDIR /app/web
+
+RUN corepack enable
+
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY web ./
+RUN pnpm build
+
 FROM rust:1.91-bookworm AS builder
 WORKDIR /app
 
@@ -20,6 +31,7 @@ COPY --from=builder /app/target/release/ancilla-server /usr/local/bin/ancilla-se
 COPY --from=builder /app/migrations /app/migrations
 COPY --from=builder /app/prompts /app/prompts
 COPY --from=builder /app/sql /app/sql
+COPY --from=web-builder /app/web/dist /app/web/dist
 
 EXPOSE 3000
 

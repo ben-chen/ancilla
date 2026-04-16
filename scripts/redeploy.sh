@@ -1,64 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_NAME="$(basename "$0")"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy-common.sh"
+
 usage() {
   cat <<'EOF'
 Usage: scripts/redeploy.sh [--tag TAG] [--skip-healthcheck]
 
-Builds a new app image and, when enabled, an embedder image, pushes them to ECR, updates
-infra/tofu/terraform.tfvars, applies the stack, waits for ECS to stabilize,
-prints the current task public IP, and optionally runs /healthz.
+Backward-compatible wrapper that deploys the embedder first when enabled, then
+deploys the main app image. Prefer the more targeted scripts directly:
 
-AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE override credential file paths.
-AWS_PROFILE / AWS_REGION override deploy target selection.
+  scripts/deploy-app.sh
+  scripts/deploy-embedder.sh
+  scripts/deploy-infra.sh
 EOF
-}
-
-log() {
-  printf '[redeploy] %s\n' "$*"
-}
-
-fail() {
-  printf '[redeploy] error: %s\n' "$*" >&2
-  exit 1
-}
-
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
-}
-
-read_tfvar_string() {
-  local key="$1"
-  local fallback="$2"
-  local value
-  value="$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\"[[:space:]]*$/\\1/p" "$TFVARS" | head -n1)"
-  if [[ -n "$value" ]]; then
-    printf '%s\n' "$value"
-  else
-    printf '%s\n' "$fallback"
-  fi
-}
-
-read_tfvar_bool() {
-  local key="$1"
-  local fallback="$2"
-  local value
-  value="$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\\1/ip" "$TFVARS" | head -n1 | tr '[:upper:]' '[:lower:]')"
-  if [[ -n "$value" ]]; then
-    printf '%s\n' "$value"
-  else
-    printf '%s\n' "$fallback"
-  fi
-}
-
-update_tfvar_string() {
-  local key="$1"
-  local value="$2"
-  if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$TFVARS"; then
-    perl -0pi -e 's/^(\s*'"$key"'\s*=\s*)".*"$/\1"'"$value"'"/m' "$TFVARS"
-  else
-    printf '\n%s = "%s"\n' "$key" "$value" >>"$TFVARS"
-  fi
 }
 
 skip_healthcheck=0
@@ -85,148 +41,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-require_command aws
-require_command docker
-require_command tofu
-require_command perl
-if [[ "$skip_healthcheck" -eq 0 ]]; then
-  require_command curl
-fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-INFRA_DIR="$REPO_ROOT/infra/tofu"
-TFVARS="$INFRA_DIR/terraform.tfvars"
-
-[[ -f "$TFVARS" ]] || fail "missing $TFVARS"
-
-AWS_CONFIG_PATH="${AWS_CONFIG_FILE:-$REPO_ROOT/.aws/config}"
-AWS_CREDENTIALS_PATH="${AWS_SHARED_CREDENTIALS_FILE:-$REPO_ROOT/.aws/credentials}"
-AWS_PROFILE_VALUE="${AWS_PROFILE:-$(read_tfvar_string aws_profile ancilla-dev)}"
-AWS_REGION_VALUE="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(read_tfvar_string aws_region us-east-1)}}"
-EMBEDDER_ENABLED="$(read_tfvar_bool embedder_enabled true)"
-EMBEDDER_ACCELERATOR="$(read_tfvar_string embedder_accelerator gpu)"
-
-[[ -f "$AWS_CONFIG_PATH" ]] || fail "missing AWS config file: $AWS_CONFIG_PATH"
-[[ -f "$AWS_CREDENTIALS_PATH" ]] || fail "missing AWS shared credentials file: $AWS_CREDENTIALS_PATH"
-
-export AWS_CONFIG_FILE="$AWS_CONFIG_PATH"
-export AWS_SHARED_CREDENTIALS_FILE="$AWS_CREDENTIALS_PATH"
-export AWS_PROFILE="$AWS_PROFILE_VALUE"
-export AWS_REGION="$AWS_REGION_VALUE"
-export AWS_DEFAULT_REGION="$AWS_REGION_VALUE"
+require_command bash
+init_deploy_context
+init_aws_env
 
 tag="${tag:-deploy-$(date +%Y%m%d-%H%M)}"
-
-log "using repo-local AWS config: $AWS_CONFIG_FILE"
-log "using repo-local AWS credentials: $AWS_SHARED_CREDENTIALS_FILE"
-log "using AWS profile: $AWS_PROFILE"
-log "using AWS region: $AWS_REGION"
 log "using image tag: $tag"
-log "embedder enabled: $EMBEDDER_ENABLED"
+
+common_args=(--tag "$tag")
+if [[ "$skip_healthcheck" -eq 1 ]]; then
+  common_args+=(--skip-healthcheck)
+fi
+
 if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
-  log "embedder accelerator: $EMBEDDER_ACCELERATOR"
+  log "deploying embedder"
+  "$SCRIPT_DIR/deploy-embedder.sh" --tag "$tag"
 fi
 
-aws sts get-caller-identity >/dev/null
-
-pushd "$INFRA_DIR" >/dev/null
-log "bootstrapping ECR repositories"
-if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
-  tofu apply -auto-approve \
-    -target=aws_ecr_repository.app \
-    -target=aws_ecr_repository.embedder >/dev/null
-else
-  tofu apply -auto-approve \
-    -target=aws_ecr_repository.app >/dev/null
-fi
-
-ECR_URL="$(tofu output -raw ecr_repository_url)"
-CLUSTER="$(tofu output -raw ecs_cluster_name)"
-SERVICE="$(tofu output -raw ecs_service_name)"
-EMBEDDER_ECR_URL=""
-if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
-  EMBEDDER_ECR_URL="$(tofu output -raw embedder_ecr_repository_url)"
-fi
-popd >/dev/null
-
-REGISTRY_HOST="${ECR_URL%/*}"
-
-log "logging into ECR: $REGISTRY_HOST"
-aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY_HOST" >/dev/null
-
-log "building app image: $ECR_URL:$tag"
-pushd "$REPO_ROOT" >/dev/null
-docker buildx build --platform linux/arm64 --load -t "$ECR_URL:$tag" .
-docker push "$ECR_URL:$tag"
-if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
-  torch_variant="cpu"
-  if [[ "$EMBEDDER_ACCELERATOR" == "gpu" ]]; then
-    torch_variant="cu124"
-  fi
-  log "building embedder image: $EMBEDDER_ECR_URL:$tag ($EMBEDDER_ACCELERATOR)"
-  docker buildx build \
-    --platform linux/amd64 \
-    --load \
-    --build-arg TORCH_VARIANT="$torch_variant" \
-    -f Dockerfile.embedder \
-    -t "$EMBEDDER_ECR_URL:$tag" .
-  docker push "$EMBEDDER_ECR_URL:$tag"
-else
-  log "skipping embedder image build because embedder_enabled=false"
-fi
-popd >/dev/null
-
-log "updating terraform.tfvars image tags"
-update_tfvar_string "container_image_tag" "$tag"
-if [[ "$EMBEDDER_ENABLED" == "true" ]]; then
-  update_tfvar_string "embedder_image_tag" "$tag"
-fi
-
-log "applying infrastructure"
-pushd "$INFRA_DIR" >/dev/null
-tofu apply -auto-approve
-
-log "waiting for ECS service to stabilize"
-aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
-
-TASK_ARN="$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --query 'taskArns[0]' --output text)"
-ENI="$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" --query "tasks[0].attachments[0].details[?name==\`networkInterfaceId\`].value | [0]" --output text)"
-APP_IP="$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" --query 'NetworkInterfaces[0].Association.PublicIp' --output text)"
-EMBEDDER_URL="$(tofu output -raw embedder_private_url 2>/dev/null || true)"
-EMBEDDER_PUBLIC_IP="$(tofu output -raw embedder_public_ip 2>/dev/null || true)"
-popd >/dev/null
-
-log "task ARN: $TASK_ARN"
-log "app IP: $APP_IP"
-if [[ -n "$EMBEDDER_URL" && "$EMBEDDER_URL" != "null" ]]; then
-  log "embedder URL: $EMBEDDER_URL"
-fi
-
-if [[ "$skip_healthcheck" -eq 0 ]]; then
-  log "running healthcheck"
-  curl -sS -o /tmp/ancilla-healthcheck.out -w '[redeploy] healthz status: %{http_code}\n' "http://$APP_IP:3000/healthz"
-fi
-
-EMBEDDER_IMAGE_SUMMARY="disabled"
-if [[ -n "$EMBEDDER_ECR_URL" ]]; then
-  EMBEDDER_IMAGE_SUMMARY="$EMBEDDER_ECR_URL:$tag"
-fi
-
-cat <<EOF
-
-Redeploy complete.
-App image:      $ECR_URL:$tag
-Embedder image: $EMBEDDER_IMAGE_SUMMARY
-Task:           $TASK_ARN
-App IP:         $APP_IP
-Embedder URL:   ${EMBEDDER_URL:-disabled}
-Embedder IP:    ${EMBEDDER_PUBLIC_IP:-disabled}
-
-Try:
-  curl "http://$APP_IP:3000/healthz"
-  curl "http://$APP_IP:3000/v1/timeline"
-
-If you want the ratatui client to target this deploy, set:
-  base_url = "http://$APP_IP:3000"
-EOF
+log "deploying app"
+"$SCRIPT_DIR/deploy-app.sh" "${common_args[@]}"
