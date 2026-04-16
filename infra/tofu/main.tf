@@ -509,6 +509,14 @@ data "aws_iam_policy_document" "ecs_task" {
   }
 
   statement {
+    sid = "SynthesizeSpeechWithPolly"
+    actions = [
+      "polly:SynthesizeSpeech",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
     sid = "AccessAncillaAssetsBucket"
     actions = [
       "s3:GetObject",

@@ -22,7 +22,7 @@ use crate::{
     model::{
         ApiErrorBody, AssembleContextRequest, ChatRespondRequest, ChatStreamEvent,
         CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest,
-        GenerateMemoriesRequest, PatchMemoryRequest, SearchMemoriesRequest,
+        GenerateMemoriesRequest, PatchMemoryRequest, SearchMemoriesRequest, SpeakRequest,
     },
     service::AppService,
 };
@@ -88,6 +88,7 @@ pub fn router(service: AppService, basic_auth: Option<BasicAuthConfig>) -> Route
         .route("/v1/profile/blocks", get(profile_blocks))
         .route("/v1/chat/respond", post(chat_respond))
         .route("/v1/chat/respond/stream", post(chat_respond_stream))
+        .route("/v1/speak", post(speak))
         .route("/v1/retrieval-traces/{id}", get(get_trace))
         .with_state(state.clone());
 
@@ -210,6 +211,7 @@ async fn get_memories(State(state): State<ApiState>) -> Json<Vec<crate::model::M
             .review_memories()
             .await
             .into_iter()
+            .filter(|memory| memory.state != crate::model::MemoryState::Deleted)
             .map(crate::model::MemoryRecord::without_embedding)
             .collect(),
     )
@@ -299,6 +301,8 @@ async fn chat_respond_stream(
         model_id,
         gate_metrics,
         chat_metrics,
+        remember_current_conversation_used,
+        remembered_memories_count,
         receiver,
     } = stream;
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
@@ -310,6 +314,8 @@ async fn chat_respond_stream(
             gate_metrics,
             injected_context,
             selected_memories,
+            remember_current_conversation_used,
+            remembered_memories_count,
         }
         .without_embeddings();
         if send_stream_event(&tx, &start).await.is_err() {
@@ -364,6 +370,28 @@ async fn chat_respond_stream(
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
         body,
+    )
+        .into_response())
+}
+
+async fn speak(
+    State(state): State<ApiState>,
+    Json(request): Json<SpeakRequest>,
+) -> Result<Response, ApiError> {
+    let output = state
+        .service
+        .synthesize_speech(&request.text, request.voice_id.as_deref())
+        .await?;
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&output.content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("audio/mpeg")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        output.audio,
     )
         .into_response())
 }
@@ -643,6 +671,44 @@ mod tests {
         assert_eq!(value.as_array().unwrap().len(), 1);
         assert!(value[0].get("embedding").is_none());
         assert_eq!(value[0]["title"], "You prefer sparkling water.");
+    }
+
+    #[tokio::test]
+    async fn api_hides_deleted_memories_from_memory_list() {
+        let service = AppService::new_in_memory();
+        let created = service
+            .create_memory(CreateMemoryRequest {
+                content_markdown: markdown_from_plain_text(
+                    "Smoke test memory.",
+                    &["test".to_string()],
+                ),
+                kind: crate::model::MemoryKind::Semantic,
+                captured_at: None,
+                timezone: Some("UTC".to_string()),
+                source_app: None,
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        service.delete_memory(created.memories[0].id).await.unwrap();
+        let app = router(service, None);
+
+        let response = app
+            .oneshot(Request::get("/v1/memories").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

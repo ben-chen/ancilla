@@ -13,7 +13,7 @@ create_api_record        = true
 enable_https_listener    = false
 basic_auth_enabled       = false
 basic_auth_username      = "ancilla"
-bedrock_chat_model_id    = "moonshotai.kimi-k2.5"
+bedrock_chat_model_id    = "us.anthropic.claude-opus-4-6-v1"
 bedrock_gate_model_id    = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 bedrock_chat_models = [
   {

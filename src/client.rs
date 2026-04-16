@@ -872,6 +872,7 @@ impl ClientApp {
                             gate_metrics,
                             injected_context,
                             selected_memories,
+                            ..
                         } => {
                             self.record_gate_metrics(gate_metrics.as_ref());
                             let model_label = model_id
@@ -2774,6 +2775,8 @@ mod tests {
                 "Relevant personal context:\n- You are building Ancilla.".to_string(),
             ),
             selected_memories: vec![sample_memory("You are building Ancilla.", &["project"])],
+            remember_current_conversation_used: false,
+            remembered_memories_count: 0,
         }))
         .unwrap();
         tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Delta {
@@ -2831,6 +2834,8 @@ mod tests {
             }),
             injected_context: None,
             selected_memories: Vec::new(),
+            remember_current_conversation_used: false,
+            remembered_memories_count: 0,
         }))
         .unwrap();
         tx.try_send(RemoteChatUpdate::Event(ChatStreamEvent::Done {

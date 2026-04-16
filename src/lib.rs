@@ -7,6 +7,7 @@ pub mod config;
 pub mod embedder_client;
 pub mod memory_markdown;
 pub mod model;
+pub mod polly;
 pub mod retrieval;
 pub mod server_cli;
 pub mod server_config;

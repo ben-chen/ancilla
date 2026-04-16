@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 
 type MemoryKind = 'semantic' | 'episodic' | 'procedural'
 type ConversationRole = 'user' | 'assistant'
 type ActiveView = 'chat' | 'memories'
+type ThemeMode = 'system' | 'light' | 'dark'
 
 type ChatModelOption = {
   label: string
@@ -23,6 +24,7 @@ type MemoryRecord = {
   id: string
   title: string
   kind: MemoryKind
+  state?: 'candidate' | 'accepted' | 'superseded' | 'rejected' | 'deleted'
   tags: string[]
   content_markdown: string
 }
@@ -49,6 +51,8 @@ type ChatStreamEvent =
       type: 'start'
       selected_memories: MemoryRecord[]
       gate_metrics?: LlmCallMetrics | null
+      remember_current_conversation_used?: boolean
+      remembered_memories_count?: number
     }
   | { type: 'delta'; delta: string }
   | {
@@ -60,8 +64,16 @@ type ChatStreamEvent =
 
 const CHAT_MODEL_KEY = 'ancilla.web.chat_model_id'
 const GATE_MODEL_KEY = 'ancilla.web.gate_model_id'
+const MEMORY_ALERTS_ENABLED_KEY = 'ancilla.web.memory_alerts_enabled'
+const SPEAK_ENABLED_KEY = 'ancilla.web.speak_enabled'
+const THEME_MODE_KEY = 'ancilla.web.theme_mode'
 const DEFAULT_MEMORY_TEMPLATE =
   '# Title\n\nTags: one-tag, another-tag\n\nWrite the memory here.\n'
+
+type MemoryToolAlert = {
+  id: number
+  message: string
+}
 
 function createConversationId() {
   return window.crypto?.randomUUID?.() ?? `conversation-${Date.now()}`
@@ -85,7 +97,7 @@ function excerpt(markdown: string, maxChars = 120) {
 }
 
 function formatUsd(value: number) {
-  return `$${value.toFixed(value < 0.01 ? 4 : 2)}`
+  return `$${value.toFixed(2)}`
 }
 
 function gateDefault(models: ChatModelOption[], defaultModelId?: string | null) {
@@ -108,6 +120,24 @@ function App() {
   const [selectedGateModelId, setSelectedGateModelId] = useState(
     () => window.localStorage.getItem(GATE_MODEL_KEY) ?? '',
   )
+  const [memoryAlertsEnabled, setMemoryAlertsEnabled] = useState(
+    () => window.localStorage.getItem(MEMORY_ALERTS_ENABLED_KEY) !== 'false',
+  )
+  const [speakEnabled, setSpeakEnabled] = useState(
+    () => window.localStorage.getItem(SPEAK_ENABLED_KEY) !== 'false',
+  )
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    const stored = window.localStorage.getItem(THEME_MODE_KEY)
+    if (stored === 'light' || stored === 'dark' || stored === 'system') {
+      return stored
+    }
+    return 'system'
+  })
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
+    typeof window !== 'undefined' &&
+    'matchMedia' in window &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches,
+  )
   const [memories, setMemories] = useState<MemoryRecord[]>([])
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null)
   const [memoryFilter, setMemoryFilter] = useState('')
@@ -123,12 +153,20 @@ function App() {
   const [chatMetrics, setChatMetrics] = useState<LlmCallMetrics | null>(null)
   const [runningGateUsd, setRunningGateUsd] = useState(0)
   const [runningChatUsd, setRunningChatUsd] = useState(0)
+  const [memoryAlert, setMemoryAlert] = useState<MemoryToolAlert | null>(null)
   const [status, setStatus] = useState('Ready')
   const [loadingMemories, setLoadingMemories] = useState(false)
   const [savingMemory, setSavingMemory] = useState(false)
   const [chatting, setChatting] = useState(false)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const audioUrlRef = useRef<string | null>(null)
 
   const models = modelsResponse?.models ?? []
+  const resolvedTheme = themeMode === 'system'
+    ? systemPrefersDark
+      ? 'dark'
+      : 'light'
+    : themeMode
 
   const filteredMemories = useMemo(() => {
     const query = memoryFilter.trim().toLowerCase()
@@ -155,6 +193,67 @@ function App() {
   }, [selectedGateModelId])
 
   useEffect(() => {
+    window.localStorage.setItem(
+      MEMORY_ALERTS_ENABLED_KEY,
+      String(memoryAlertsEnabled),
+    )
+  }, [memoryAlertsEnabled])
+
+  useEffect(() => {
+    window.localStorage.setItem(SPEAK_ENABLED_KEY, String(speakEnabled))
+  }, [speakEnabled])
+
+  useEffect(() => {
+    window.localStorage.setItem(THEME_MODE_KEY, themeMode)
+  }, [themeMode])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('matchMedia' in window)) {
+      return
+    }
+
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+    const updatePreference = (event?: MediaQueryListEvent) => {
+      setSystemPrefersDark(event?.matches ?? mediaQuery.matches)
+    }
+
+    updatePreference()
+    mediaQuery.addEventListener('change', updatePreference)
+    return () => mediaQuery.removeEventListener('change', updatePreference)
+  }, [])
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = resolvedTheme
+    document.documentElement.style.colorScheme = resolvedTheme
+  }, [resolvedTheme])
+
+  useEffect(() => {
+    if (memoryAlertsEnabled) {
+      return
+    }
+    setMemoryAlert(null)
+  }, [memoryAlertsEnabled])
+
+  useEffect(() => {
+    if (!memoryAlert) {
+      return
+    }
+
+    const timeout = window.setTimeout(() => {
+      setMemoryAlert((current) =>
+        current?.id === memoryAlert.id ? null : current,
+      )
+    }, 2600)
+    return () => window.clearTimeout(timeout)
+  }, [memoryAlert])
+
+  useEffect(() => {
+    return () => {
+      stopSpeech()
+    }
+  }, [])
+
+  useEffect(() => {
     void loadModels()
     void loadMemories()
   }, [])
@@ -177,6 +276,75 @@ function App() {
     setSelectedMemoryId(memory.id)
     setDraftKind(memory.kind)
     setDraftMarkdown(memory.content_markdown)
+  }
+
+  function stopSpeech() {
+    audioRef.current?.pause()
+    audioRef.current = null
+    if (audioUrlRef.current) {
+      window.URL.revokeObjectURL(audioUrlRef.current)
+      audioUrlRef.current = null
+    }
+  }
+
+  function showMemoryToolAlert(createdCount: number) {
+    if (!memoryAlertsEnabled) {
+      return
+    }
+
+    const message =
+      createdCount > 1
+        ? `Saved ${createdCount} memories.`
+        : createdCount === 1
+          ? 'Saved 1 memory.'
+          : 'Conversation reviewed for memory.'
+
+    setMemoryAlert({
+      id: Date.now(),
+      message,
+    })
+  }
+
+  async function speakText(text: string) {
+    if (!speakEnabled || !text.trim()) {
+      return
+    }
+
+    stopSpeech()
+    try {
+      const response = await fetch('/v1/speak', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      })
+      if (!response.ok) {
+        return
+      }
+      const audioBlob = await response.blob()
+      if (!audioBlob.size) {
+        return
+      }
+
+      const audioUrl = window.URL.createObjectURL(audioBlob)
+      const audio = new Audio(audioUrl)
+      audioRef.current = audio
+      audioUrlRef.current = audioUrl
+      const cleanup = () => {
+        if (audioUrlRef.current === audioUrl) {
+          window.URL.revokeObjectURL(audioUrl)
+          audioUrlRef.current = null
+        }
+        if (audioRef.current === audio) {
+          audioRef.current = null
+        }
+      }
+      audio.onended = cleanup
+      audio.onerror = cleanup
+      await audio.play()
+    } catch {
+      stopSpeech()
+    }
   }
 
   async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
@@ -217,11 +385,13 @@ function App() {
   async function loadMemories(preferredId?: string | null) {
     setLoadingMemories(true)
     try {
-      const nextMemories = await apiRequest<MemoryRecord[]>('/v1/memories')
+      const nextMemories = (await apiRequest<MemoryRecord[]>('/v1/memories')).filter(
+        (memory) => memory.state !== 'deleted',
+      )
       setMemories(nextMemories)
 
       if (preferredId === null) {
-        setStatus(`Loaded ${nextMemories.length} memories`)
+        setStatus(`${nextMemories.length} mem`)
         return
       }
 
@@ -239,7 +409,7 @@ function App() {
           selectMemory(nextSelected)
         }
       }
-      setStatus(`Loaded ${nextMemories.length} memories`)
+      setStatus(`${nextMemories.length} mem`)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Failed to load memories.')
     } finally {
@@ -318,6 +488,7 @@ function App() {
     if (!message || chatting) {
       return
     }
+    stopSpeech()
     setChatting(true)
     setPendingUserMessage(message)
     setStreamedAnswer('')
@@ -374,6 +545,9 @@ function App() {
           if (event.type === 'start') {
             setSelectedMemories(event.selected_memories)
             setGateMetrics(event.gate_metrics ?? null)
+            if (event.remember_current_conversation_used) {
+              showMemoryToolAlert(event.remembered_memories_count ?? 0)
+            }
             setRunningGateUsd((current) =>
               current + (event.gate_metrics?.cost.total_usd ?? 0),
             )
@@ -401,6 +575,7 @@ function App() {
       setPendingUserMessage('')
       setStreamedAnswer('')
       setStatus('Done')
+      void speakText(finalAnswer)
       await loadMemories(undefined)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Chat failed.')
@@ -411,6 +586,15 @@ function App() {
     }
   }
 
+  function handleChatInputKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter' || !event.metaKey || event.shiftKey || event.altKey || event.ctrlKey) {
+      return
+    }
+
+    event.preventDefault()
+    void sendChat()
+  }
+
   function startNewMemory() {
     setSelectedMemoryId(null)
     setDraftKind('semantic')
@@ -418,6 +602,7 @@ function App() {
   }
 
   function startNewConversation() {
+    stopSpeech()
     setConversationId(createConversationId())
     setTurns([])
     setPendingUserMessage('')
@@ -450,13 +635,30 @@ function App() {
             Memories
           </button>
         </nav>
-        <div className="status-box">
-          <strong>{status}</strong>
-          <div className="cost-strip">
-            <span>Gate {formatUsd(runningGateUsd)}</span>
-            <span>Chat {formatUsd(runningChatUsd)}</span>
-            <span>Total {formatUsd(runningGateUsd + runningChatUsd)}</span>
-          </div>
+        <div className="topbar-spacer" />
+        <select
+          className="theme-select"
+          aria-label="Theme"
+          value={themeMode}
+          onChange={(event) => setThemeMode(event.target.value as ThemeMode)}
+        >
+          <option value="system">System</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+        <div className={`status-box ${activeView === 'chat' ? 'is-chat' : 'is-memories'}`}>
+          {activeView === 'chat' ? (
+            <span className="status-total">Total {formatUsd(runningGateUsd + runningChatUsd)}</span>
+          ) : (
+            <>
+              <span className="status-text">{status}</span>
+              <div className="cost-strip">
+                <span>Gate {formatUsd(runningGateUsd)}</span>
+                <span>Chat {formatUsd(runningChatUsd)}</span>
+                <span>Total {formatUsd(runningGateUsd + runningChatUsd)}</span>
+              </div>
+            </>
+          )}
         </div>
       </header>
 
@@ -491,13 +693,27 @@ function App() {
                 </select>
               </label>
             </div>
-            <button
-              type="button"
-              className="button button-secondary"
-              onClick={startNewConversation}
-            >
-              New
-            </button>
+            <div className="memory-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={() => {
+                  if (speakEnabled) {
+                    stopSpeech()
+                  }
+                  setSpeakEnabled((current) => !current)
+                }}
+              >
+                {speakEnabled ? 'Voice On' : 'Voice Off'}
+              </button>
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={startNewConversation}
+              >
+                New
+              </button>
+            </div>
           </div>
 
           <div className="transcript">
@@ -528,6 +744,7 @@ function App() {
             <textarea
               value={chatInput}
               onChange={(event) => setChatInput(event.target.value)}
+              onKeyDown={handleChatInputKeyDown}
               placeholder="Ask something"
               disabled={chatting}
             />
@@ -580,6 +797,16 @@ function App() {
               placeholder="Filter"
             />
             <div className="memory-actions">
+              <label className="toggle-setting">
+                <input
+                  type="checkbox"
+                  checked={memoryAlertsEnabled}
+                  onChange={(event) =>
+                    setMemoryAlertsEnabled(event.target.checked)
+                  }
+                />
+                <span>Corner alerts</span>
+              </label>
               <button
                 type="button"
                 className="button button-secondary"
@@ -676,6 +903,12 @@ function App() {
             </section>
           </div>
         </main>
+      )}
+
+      {memoryAlert && (
+        <div className="memory-alert-stack" aria-live="polite" aria-atomic="true">
+          <div className="memory-alert">{memoryAlert.message}</div>
+        </div>
       )}
     </div>
   )

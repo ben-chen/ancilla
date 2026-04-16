@@ -15,6 +15,7 @@ use crate::{
         ChatRespondRequest, CreateAudioEntryRequest, CreateMemoryRequest, GenerateMemoriesRequest,
         MemoryKind, PatchMemoryRequest, SearchMemoriesRequest, empty_object,
     },
+    polly::{PollySpeechService, PollySpeechSettings},
     server_config::ServerConfig,
     service::AppService,
 };
@@ -145,7 +146,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         embedder,
         config.local_embed_model.clone(),
     )
-    .await?;
+    .await?
+    .with_speech_service(Some(
+        PollySpeechService::new(PollySpeechSettings {
+            region: config.aws_region.clone(),
+            profile: config.aws_profile.clone(),
+            config_file: config.aws_config_file.clone(),
+            shared_credentials_file: config.aws_shared_credentials_file.clone(),
+            default_voice_id: "Joanna".to_string(),
+        })
+        .await
+        .context("failed to configure Polly speech service")?,
+    ));
 
     match command {
         Command::Serve { bind } => run_server(service, &bind, basic_auth).await,

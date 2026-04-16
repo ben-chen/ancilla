@@ -23,6 +23,7 @@ use crate::{
         PreparedMemoryInput, ProfileBlock, RetrievalTrace, ScoredMemory, SearchMemoriesRequest,
         Thread, ThreadKind, ThreadStatus, empty_object, now_utc,
     },
+    polly::{PollySpeechService, SpeechSynthesisOutput},
     retrieval::{
         SearchEnvironment, build_context_bundle, build_trace,
         gate_candidates as deterministic_gate_candidates, rank_memories, rebuild_profile_blocks,
@@ -37,6 +38,7 @@ pub struct AppService {
     gate_backend: Option<Arc<dyn ContextGateBackend>>,
     embedder: Option<Arc<dyn Embedder>>,
     embedding_model: String,
+    speech_service: Option<PollySpeechService>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +66,8 @@ pub struct ChatResponseStream {
     pub model_id: Option<String>,
     pub gate_metrics: Option<LlmCallMetrics>,
     pub chat_metrics: Option<LlmCallMetrics>,
+    pub remember_current_conversation_used: bool,
+    pub remembered_memories_count: usize,
     pub receiver: tokio::sync::mpsc::Receiver<anyhow::Result<ChatCompletionStreamEvent>>,
 }
 
@@ -71,7 +75,7 @@ pub struct ChatResponseStream {
 struct ServiceChatToolExecutor {
     service: AppService,
     request: ChatRespondRequest,
-    remember_used: Arc<Mutex<bool>>,
+    remember_summary: Arc<Mutex<RememberToolSummary>>,
     llm_metrics: Arc<Mutex<Option<LlmCallMetrics>>>,
 }
 
@@ -79,6 +83,12 @@ struct ServiceChatToolExecutor {
 struct RememberCurrentConversationResult {
     memories: Vec<MemoryRecord>,
     metrics: Option<LlmCallMetrics>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RememberToolSummary {
+    used: bool,
+    created_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -134,7 +144,13 @@ impl AppService {
             gate_backend,
             embedder,
             embedding_model,
+            speech_service: None,
         })
+    }
+
+    pub fn with_speech_service(mut self, speech_service: Option<PollySpeechService>) -> Self {
+        self.speech_service = speech_service;
+        self
     }
 
     pub fn new_in_memory() -> Self {
@@ -148,6 +164,7 @@ impl AppService {
             gate_backend: None,
             embedder: None,
             embedding_model: "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
+            speech_service: None,
         }
     }
 
@@ -647,6 +664,22 @@ impl AppService {
             .with_context(|| format!("trace {trace_id} not found"))
     }
 
+    pub async fn synthesize_speech(
+        &self,
+        text: &str,
+        voice_id: Option<&str>,
+    ) -> anyhow::Result<SpeechSynthesisOutput> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("speech text cannot be empty");
+        }
+        let speech_service = self
+            .speech_service
+            .as_ref()
+            .context("speech synthesis is not configured on this server")?;
+        speech_service.synthesize(text, voice_id).await
+    }
+
     pub async fn chat_respond(&self, request: ChatRespondRequest) -> anyhow::Result<ChatResponse> {
         let recent_turns = request.recent_turns.clone();
         let recent_context = request.recent_context.clone();
@@ -669,7 +702,7 @@ impl AppService {
         let tool_executor = ServiceChatToolExecutor {
             service: self.clone(),
             request: request.clone(),
-            remember_used: Arc::new(Mutex::new(false)),
+            remember_summary: Arc::new(Mutex::new(RememberToolSummary::default())),
             llm_metrics: Arc::new(Mutex::new(None)),
         };
         let completion = self
@@ -746,7 +779,7 @@ impl AppService {
         let tool_executor = ServiceChatToolExecutor {
             service: self.clone(),
             request: request.clone(),
-            remember_used: Arc::new(Mutex::new(false)),
+            remember_summary: Arc::new(Mutex::new(RememberToolSummary::default())),
             llm_metrics: Arc::new(Mutex::new(None)),
         };
         let completion = self
@@ -768,6 +801,7 @@ impl AppService {
             completion.metrics.clone(),
             tool_executor.take_llm_metrics().await,
         );
+        let remember_summary = tool_executor.remember_tool_summary().await;
         let model_id = completion.model_id.clone();
         let answer = completion.answer.clone();
         let (tx, receiver) = tokio::sync::mpsc::channel(8);
@@ -816,6 +850,8 @@ impl AppService {
             model_id,
             gate_metrics: context.gate_metrics,
             chat_metrics,
+            remember_current_conversation_used: remember_summary.used,
+            remembered_memories_count: remember_summary.created_count,
             receiver,
         })
     }
@@ -1027,6 +1063,10 @@ impl ServiceChatToolExecutor {
     async fn take_llm_metrics(&self) -> Option<LlmCallMetrics> {
         self.llm_metrics.lock().await.take()
     }
+
+    async fn remember_tool_summary(&self) -> RememberToolSummary {
+        self.remember_summary.lock().await.clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1074,21 +1114,25 @@ impl ChatToolExecutor for ServiceChatToolExecutor {
         &self,
         reason: Option<String>,
     ) -> anyhow::Result<serde_json::Value> {
-        let mut guard = self.remember_used.lock().await;
-        if *guard {
+        let mut summary = self.remember_summary.lock().await;
+        if summary.used {
             return Ok(json!({
                 "created_count": 0,
                 "message": "remember_current_conversation was already used in this assistant turn"
             }));
         }
-        *guard = true;
-        drop(guard);
+        summary.used = true;
+        drop(summary);
 
         let result = self
             .service
             .remember_current_conversation(&self.request, reason.clone())
             .await?;
         let created_count = result.memories.len();
+        {
+            let mut summary = self.remember_summary.lock().await;
+            summary.created_count = created_count;
+        }
         {
             let mut metrics = self.llm_metrics.lock().await;
             *metrics = LlmCallMetrics::merged(metrics.take(), result.metrics);
@@ -1976,6 +2020,7 @@ mod tests {
             gate_backend: None,
             embedder: Some(Arc::new(embedder.clone())),
             embedding_model: "perplexity-ai/pplx-embed-v1-0.6b".to_string(),
+            speech_service: None,
         };
 
         let created = service
@@ -2185,6 +2230,9 @@ mod tests {
             })
             .await
             .unwrap();
+
+        assert!(stream.remember_current_conversation_used);
+        assert_eq!(stream.remembered_memories_count, 1);
 
         let mut answer = String::new();
         let mut receiver = stream.receiver;

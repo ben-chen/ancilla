@@ -396,6 +396,10 @@ pub enum ChatStreamEvent {
         injected_context: Option<String>,
         #[serde(default)]
         selected_memories: Vec<MemoryRecord>,
+        #[serde(default)]
+        remember_current_conversation_used: bool,
+        #[serde(default)]
+        remembered_memories_count: usize,
     },
     Delta {
         delta: String,
@@ -738,6 +742,13 @@ pub struct ChatRespondRequest {
     pub focus_from: Option<DateTime<Utc>>,
     pub focus_to: Option<DateTime<Utc>>,
     pub query_embedding: Option<EmbeddingVector>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SpeakRequest {
+    pub text: String,
+    #[serde(default)]
+    pub voice_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
