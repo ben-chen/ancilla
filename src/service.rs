@@ -464,6 +464,67 @@ impl AppService {
         memories
     }
 
+    pub async fn export_memories(&self) -> crate::model::ExportMemoriesResponse {
+        let state = self.store.read_clone().await;
+        let mut memories = state
+            .memories
+            .values()
+            .filter(|memory| memory.state != MemoryState::Deleted)
+            .cloned()
+            .collect::<Vec<_>>();
+        memories.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        let exported = memories
+            .into_iter()
+            .map(|memory| crate::model::PortableMemory {
+                kind: memory.kind,
+                content_markdown: memory.content_markdown,
+                attrs: memory.attrs,
+                observed_at: memory.observed_at,
+                valid_from: Some(memory.valid_from),
+                valid_to: memory.valid_to,
+                state: Some(memory.state),
+                thread_title: memory
+                    .thread_id
+                    .and_then(|thread_id| state.threads.get(&thread_id).map(|thread| thread.title.clone())),
+            })
+            .collect::<Vec<_>>();
+        crate::model::ExportMemoriesResponse {
+            exported_at: now_utc(),
+            memories: exported,
+        }
+    }
+
+    pub async fn import_memories(
+        &self,
+        request: crate::model::ImportMemoriesRequest,
+    ) -> anyhow::Result<crate::model::ImportMemoriesResponse> {
+        let prepared = request
+            .memories
+            .into_iter()
+            .map(|memory| PreparedMemoryInput {
+                kind: memory.kind,
+                content_markdown: memory.content_markdown,
+                attrs: memory.attrs,
+                observed_at: memory.observed_at,
+                valid_from: memory.valid_from,
+                valid_to: memory.valid_to,
+                state: memory.state,
+                embedding: None,
+                thread_title: memory.thread_title,
+                source_artifact_ordinals: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let imported = self
+            .persist_memories_without_entry(prepared, &format!("import/{}", Uuid::new_v4()))
+            .await?;
+
+        Ok(crate::model::ImportMemoriesResponse {
+            imported_count: imported.len(),
+            memories: imported,
+        })
+    }
+
     pub async fn search_memories(
         &self,
         request: SearchMemoriesRequest,
@@ -2097,6 +2158,89 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("Axum"))
         );
+    }
+
+    #[tokio::test]
+    async fn export_and_import_memories_round_trip_portable_payload() {
+        let source = AppService::new_in_memory();
+        let observed_at = Utc.with_ymd_and_hms(2026, 4, 16, 19, 0, 0).unwrap();
+        let valid_to = observed_at + Duration::days(7);
+
+        let created = source
+            .create_memory(CreateMemoryRequest {
+                content_markdown: memory_markdown(
+                    "You started a new role at OpenAI on April 16, 2026.",
+                    &["career", "openai"],
+                ),
+                kind: MemoryKind::Semantic,
+                captured_at: Some(observed_at),
+                timezone: Some("America/Los_Angeles".to_string()),
+                source_app: Some("test".to_string()),
+                attrs: json!({ "source": "round-trip" }),
+                observed_at: Some(observed_at),
+                valid_from: Some(observed_at),
+                valid_to: Some(valid_to),
+                thread_title: Some("Career".to_string()),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let deleted = source
+            .create_memory(CreateMemoryRequest {
+                content_markdown: memory_markdown("You no longer use Trello.", &["tools"]),
+                kind: MemoryKind::Semantic,
+                captured_at: Some(observed_at),
+                timezone: None,
+                source_app: None,
+                attrs: json!({}),
+                observed_at: None,
+                valid_from: None,
+                valid_to: None,
+                thread_title: None,
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        source
+            .delete_memory(deleted.memories[0].id)
+            .await
+            .unwrap();
+
+        let exported = source.export_memories().await;
+        assert_eq!(exported.memories.len(), 1);
+        let portable = &exported.memories[0];
+        assert_eq!(portable.thread_title.as_deref(), Some("Career"));
+        assert_eq!(portable.observed_at, Some(observed_at));
+        assert_eq!(portable.valid_from, Some(observed_at));
+        assert_eq!(portable.valid_to, Some(valid_to));
+        assert_eq!(portable.attrs["source"].as_str(), Some("round-trip"));
+        assert!(portable.content_markdown.contains("April 16, 2026"));
+
+        let target = AppService::new_in_memory();
+        let imported = target
+            .import_memories(crate::model::ImportMemoriesRequest {
+                memories: exported.memories.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(imported.imported_count, 1);
+        assert_eq!(imported.memories.len(), 1);
+        assert!(imported.memories[0].embedding.is_none());
+
+        let memories = target.review_memories().await;
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content_markdown, portable.content_markdown);
+        assert_eq!(memories[0].observed_at, Some(observed_at));
+        assert_eq!(memories[0].valid_from, observed_at);
+        assert_eq!(memories[0].valid_to, Some(valid_to));
+        assert_eq!(memories[0].attrs["source"].as_str(), Some("round-trip"));
+
+        let state = target.store.read_clone().await;
+        let thread_id = memories[0].thread_id.expect("thread should be preserved");
+        let thread = state.threads.get(&thread_id).expect("thread should exist");
+        assert_eq!(thread.title, "Career");
+        assert_eq!(created.memories[0].thread_id.is_some(), true);
     }
 
     #[tokio::test]

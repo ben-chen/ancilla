@@ -64,6 +64,14 @@ There are now two distinct ways to create memories:
 
 The runtime prompt explicitly allows returning zero memories. That is intentional.
 
+Portable memory transfer is API-only for now:
+
+3. Export/import:
+   `GET /v1/memories/export`
+   `POST /v1/memories/import`
+
+   Export returns the current non-deleted memories as portable JSON. Import accepts that same payload shape and stores the markdown memories back into the database.
+
 ## Retrieval Flow
 
 Current retrieval prefers a Postgres-backed hybrid search path:

@@ -68,6 +68,7 @@ The old unified `~/.config/ancilla/ancilla.toml` is legacy and should not be ext
 - the TUI now treats the memory browser as the primary view and keeps the timeline as a secondary provenance view
 - chat streaming is additive; `/v1/chat/respond` stays available while the TUI uses `/v1/chat/respond/stream`
 - `capture` in the TUI and CLI now targets the generated-memory path, while explicit markdown writes stay available through `POST /v1/memories`
+- portable memory backup/restore is API-only for now via `GET /v1/memories/export` and `POST /v1/memories/import`
 - after a memory edit, the patch returns immediately and the server re-embeds the memory asynchronously in the background
 
 ## Recommended Local Setup

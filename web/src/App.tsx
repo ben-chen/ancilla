@@ -75,6 +75,39 @@ type MemoryToolAlert = {
   message: string
 }
 
+function readActiveViewFromLocation() {
+  if (typeof window === 'undefined') {
+    return 'chat' as ActiveView
+  }
+
+  const params = new URLSearchParams(window.location.search)
+  return params.get('view') === 'memories' ? 'memories' : 'chat'
+}
+
+function writeActiveViewToLocation(view: ActiveView, replace = false) {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  const nextUrl = new URL(window.location.href)
+  if (view === 'chat') {
+    nextUrl.searchParams.delete('view')
+  } else {
+    nextUrl.searchParams.set('view', view)
+  }
+
+  const nextRelativeUrl = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`
+  const currentRelativeUrl =
+    `${window.location.pathname}${window.location.search}${window.location.hash}`
+
+  if (nextRelativeUrl === currentRelativeUrl) {
+    return
+  }
+
+  const method = replace ? 'replaceState' : 'pushState'
+  window.history[method](null, '', nextRelativeUrl)
+}
+
 function createConversationId() {
   return window.crypto?.randomUUID?.() ?? `conversation-${Date.now()}`
 }
@@ -110,7 +143,7 @@ function gateDefault(models: ChatModelOption[], defaultModelId?: string | null) 
 }
 
 function App() {
-  const [activeView, setActiveView] = useState<ActiveView>('chat')
+  const [activeView, setActiveView] = useState<ActiveView>(readActiveViewFromLocation)
   const [modelsResponse, setModelsResponse] = useState<ChatModelsResponse | null>(
     null,
   )
@@ -256,6 +289,16 @@ function App() {
   useEffect(() => {
     void loadModels()
     void loadMemories()
+  }, [])
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setActiveView(readActiveViewFromLocation())
+    }
+
+    writeActiveViewToLocation(readActiveViewFromLocation(), true)
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
   }, [])
 
   useEffect(() => {
@@ -620,6 +663,11 @@ function App() {
     setStatus('New conversation')
   }
 
+  function selectView(view: ActiveView) {
+    setActiveView(view)
+    writeActiveViewToLocation(view)
+  }
+
   return (
     <div className="shell">
       <header className="topbar">
@@ -628,14 +676,14 @@ function App() {
           <button
             type="button"
             className={activeView === 'chat' ? 'is-active' : ''}
-            onClick={() => setActiveView('chat')}
+            onClick={() => selectView('chat')}
           >
             Chat
           </button>
           <button
             type="button"
             className={activeView === 'memories' ? 'is-active' : ''}
-            onClick={() => setActiveView('memories')}
+            onClick={() => selectView('memories')}
           >
             Memories
           </button>
@@ -655,14 +703,7 @@ function App() {
           {activeView === 'chat' ? (
             <span className="status-total">Total {formatUsd(runningGateUsd + runningChatUsd)}</span>
           ) : (
-            <>
-              <span className="status-text">{status}</span>
-              <div className="cost-strip">
-                <span>Gate {formatUsd(runningGateUsd)}</span>
-                <span>Chat {formatUsd(runningChatUsd)}</span>
-                <span>Total {formatUsd(runningGateUsd + runningChatUsd)}</span>
-              </div>
-            </>
+            <span className="status-text">{status}</span>
           )}
         </div>
       </header>
@@ -861,21 +902,20 @@ function App() {
             <section className="editor-pane">
               <div className="editor-toolbar">
                 <div className="selectors">
-                  {!selectedMemory && (
-                    <label>
-                      Kind
-                      <select
-                        value={draftKind}
-                        onChange={(event) =>
-                          setDraftKind(event.target.value as MemoryKind)
-                        }
-                      >
-                        <option value="semantic">Semantic</option>
-                        <option value="episodic">Episodic</option>
-                        <option value="procedural">Procedural</option>
-                      </select>
-                    </label>
-                  )}
+                  <label className="memory-kind-field">
+                    Kind
+                    <select
+                      value={draftKind}
+                      onChange={(event) =>
+                        setDraftKind(event.target.value as MemoryKind)
+                      }
+                      disabled={Boolean(selectedMemory)}
+                    >
+                      <option value="semantic">Semantic</option>
+                      <option value="episodic">Episodic</option>
+                      <option value="procedural">Procedural</option>
+                    </select>
+                  </label>
                 </div>
                 <div className="memory-actions">
                   {selectedMemory && (

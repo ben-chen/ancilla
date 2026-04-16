@@ -689,6 +689,40 @@ pub struct GenerateMemoriesRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PortableMemory {
+    pub kind: MemoryKind,
+    pub content_markdown: String,
+    #[serde(default = "empty_object")]
+    pub attrs: Metadata,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub state: Option<MemoryState>,
+    pub thread_title: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExportMemoriesResponse {
+    pub exported_at: DateTime<Utc>,
+    #[serde(default)]
+    pub memories: Vec<PortableMemory>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImportMemoriesRequest {
+    #[serde(default)]
+    pub memories: Vec<PortableMemory>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImportMemoriesResponse {
+    pub imported_count: usize,
+    #[serde(default)]
+    pub memories: Vec<MemoryRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SearchMemoriesRequest {
     pub query: String,
     pub recent_context: Option<String>,

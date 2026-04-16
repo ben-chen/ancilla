@@ -419,6 +419,8 @@ The backend does not assume it owns transcription.
 
 `POST /v1/memories/generate` is the model-backed memory extraction path. It accepts freeform context text, runs the runtime prompt in [`prompts/memory_creation.md`](prompts/memory_creation.md), and may return zero or more memory documents if the model decides nothing is worth remembering.
 
+`GET /v1/memories/export` returns the current non-deleted memories as a portable JSON bundle. `POST /v1/memories/import` accepts that same portable format and stores the imported markdown memories back into Ancilla.
+
 Canonical stored memory format:
 
 ```md

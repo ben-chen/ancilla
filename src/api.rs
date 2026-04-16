@@ -22,7 +22,8 @@ use crate::{
     model::{
         ApiErrorBody, AssembleContextRequest, ChatRespondRequest, ChatStreamEvent,
         CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest,
-        GenerateMemoriesRequest, PatchMemoryRequest, SearchMemoriesRequest, SpeakRequest,
+        GenerateMemoriesRequest, ImportMemoriesRequest, PatchMemoryRequest, SearchMemoriesRequest,
+        SpeakRequest,
     },
     service::AppService,
 };
@@ -76,6 +77,8 @@ pub fn router(service: AppService, basic_auth: Option<BasicAuthConfig>) -> Route
         .route("/v1/entries/text", post(create_text_entry))
         .route("/v1/entries/audio", post(create_audio_entry))
         .route("/v1/memories", get(get_memories).post(create_memory))
+        .route("/v1/memories/export", get(export_memories))
+        .route("/v1/memories/import", post(import_memories))
         .route("/v1/memories/generate", post(generate_memories))
         .route("/v1/timeline", get(get_timeline))
         .route("/v1/chat/models", get(get_chat_models))
@@ -198,6 +201,27 @@ async fn generate_memories(
             .await?
             .without_embeddings(),
     ))
+}
+
+async fn export_memories(
+    State(state): State<ApiState>,
+) -> Json<crate::model::ExportMemoriesResponse> {
+    Json(state.service.export_memories().await)
+}
+
+async fn import_memories(
+    State(state): State<ApiState>,
+    Json(request): Json<ImportMemoriesRequest>,
+) -> Result<Json<crate::model::ImportMemoriesResponse>, ApiError> {
+    let response = state.service.import_memories(request).await?;
+    Ok(Json(crate::model::ImportMemoriesResponse {
+        imported_count: response.imported_count,
+        memories: response
+            .memories
+            .into_iter()
+            .map(crate::model::MemoryRecord::without_embedding)
+            .collect(),
+    }))
 }
 
 async fn get_timeline(State(state): State<ApiState>) -> Json<Vec<crate::model::Entry>> {
@@ -540,6 +564,64 @@ mod tests {
         assert!(value["context"].as_str().unwrap().contains("Ancilla"));
         assert!(value["selected_memories"][0].get("embedding").is_none());
         assert!(value["candidates"][0]["memory"].get("embedding").is_none());
+    }
+
+    #[tokio::test]
+    async fn api_memory_export_and_import_routes_work() {
+        let app = router(AppService::new_in_memory(), None);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/memories/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "memories": [{
+                                "kind": "semantic",
+                                "content_markdown": "# Portable API Test\n\nTags: api, import\n\nImported through the portable API.",
+                                "attrs": { "source": "api-test" },
+                                "observed_at": "2026-04-15T19:00:00Z",
+                                "valid_from": "2026-04-15T19:00:00Z",
+                                "thread_title": "Portable API"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["imported_count"].as_u64(), Some(1));
+        assert!(value["memories"][0].get("embedding").is_none());
+
+        let response = app
+            .oneshot(
+                Request::get("/v1/memories/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["memories"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["memories"][0]["thread_title"].as_str(),
+            Some("Portable API")
+        );
+        assert_eq!(
+            value["memories"][0]["attrs"]["source"].as_str(),
+            Some("api-test")
+        );
     }
 
     #[tokio::test]
