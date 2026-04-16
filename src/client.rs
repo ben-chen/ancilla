@@ -727,7 +727,7 @@ impl ClientApp {
             input: String::new(),
             response_title: "Response".to_string(),
             response_body:
-                "Press 's' to preview retrieval context, 'a' to ask the live service, or 'c' to capture a new memory. Use 'm' for the chat model and 'g' for the gate model. The memory browser is the default view; press Tab to switch to the raw timeline."
+                "Press 's' to preview retrieval context, 'a' to ask the live service, or 'c' to capture a new memory. Use 'm' for the chat model, 'v' for the gate model, and '?' for help. The memory browser is the default view; press Tab to switch to the raw timeline."
                     .to_string(),
             status: StatusLine {
                 kind: StatusKind::Info,
@@ -1063,7 +1063,7 @@ impl ClientApp {
                 }
             }
             KeyCode::Char('r') => ClientAction::Refresh,
-            KeyCode::Tab | KeyCode::Char('v') => {
+            KeyCode::Tab => {
                 self.toggle_browse_tab();
                 ClientAction::None
             }
@@ -1097,7 +1097,7 @@ impl ClientApp {
                 }
                 ClientAction::None
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('v') => {
                 if self.chat_models.is_empty() {
                     self.set_error("No remote model catalog is available on this server.");
                 } else {
@@ -1107,6 +1107,10 @@ impl ClientApp {
                         .select(self.selected_model_index().or(Some(0)));
                     self.set_info("Gate model picker. Use j/k and Enter.");
                 }
+                ClientAction::None
+            }
+            KeyCode::Char('?') => {
+                self.show_help();
                 ClientAction::None
             }
             KeyCode::Char('e') => {
@@ -1149,7 +1153,7 @@ impl ClientApp {
                 self.select_previous();
                 ClientAction::None
             }
-            KeyCode::Home => {
+            KeyCode::Home | KeyCode::Char('g') => {
                 self.select_first();
                 ClientAction::None
             }
@@ -1355,6 +1359,12 @@ impl ClientApp {
         }
 
         self.response_body = lines.join("\n");
+    }
+
+    fn show_help(&mut self) {
+        self.response_title = "Help".to_string();
+        self.response_body = help_text();
+        self.set_info("Showing hotkeys.");
     }
 
     fn set_info(&mut self, message: impl Into<String>) {
@@ -1902,20 +1912,18 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &ClientApp) {
                 Span::styled(" move  ", Style::default().fg(COLOR_MUTED)),
                 keycap("tab"),
                 Span::styled(" switch view  ", Style::default().fg(COLOR_MUTED)),
+                keycap("g/G"),
+                Span::styled(" top/bottom  ", Style::default().fg(COLOR_MUTED)),
                 keycap("e"),
                 Span::styled(" edit memory  ", Style::default().fg(COLOR_MUTED)),
                 keycap("x"),
                 Span::styled(" delete memory  ", Style::default().fg(COLOR_MUTED)),
-                keycap("r"),
-                Span::styled(" refresh  ", Style::default().fg(COLOR_MUTED)),
                 keycap("m"),
-                Span::styled(" models  ", Style::default().fg(COLOR_MUTED)),
-                keycap("s"),
-                Span::styled(" context  ", Style::default().fg(COLOR_MUTED)),
-                keycap("a"),
-                Span::styled(" ask  ", Style::default().fg(COLOR_MUTED)),
-                keycap("c"),
-                Span::styled(" capture  ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(" chat model  ", Style::default().fg(COLOR_MUTED)),
+                keycap("v"),
+                Span::styled(" gate model  ", Style::default().fg(COLOR_MUTED)),
+                keycap("?"),
+                Span::styled(" help  ", Style::default().fg(COLOR_MUTED)),
                 keycap("q"),
                 Span::styled(" quit", Style::default().fg(COLOR_MUTED)),
             ]),
@@ -2398,6 +2406,36 @@ fn editor_command(path: &Path) -> Command {
     child
 }
 
+fn help_text() -> String {
+    [
+        "Normal mode hotkeys",
+        "",
+        "j / Down      move down",
+        "k / Up        move up",
+        "g / Home      jump to top",
+        "G / End       jump to bottom",
+        "Tab           switch between Memories and Timeline",
+        "m             open chat model picker",
+        "v             open gate model picker",
+        "a             ask the live service",
+        "s             preview retrieval context",
+        "c             capture a new memory",
+        "e             edit selected memory in $VISUAL / $EDITOR / vi",
+        "x             delete selected memory (press twice to confirm)",
+        "r             refresh memories and timeline",
+        "?             show this help",
+        "q             quit (press twice to confirm)",
+        "Ctrl+C        quit immediately",
+        "",
+        "Other modes",
+        "",
+        "Enter         submit current input or confirm selected model",
+        "Esc           leave current input/picker mode",
+        "j/k, g/G      navigate the model picker",
+    ]
+    .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2506,6 +2544,71 @@ mod tests {
 
         assert!(screen.contains("[Memories 0]"));
         assert!(screen.contains("No memory selected."));
+    }
+
+    #[test]
+    fn question_mark_shows_help_in_response_pane() {
+        let mut app = test_app();
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            ClientAction::None
+        ));
+
+        assert_eq!(app.response_title, "Help");
+        assert!(app.response_body.contains("g / Home      jump to top"));
+        assert!(
+            app.response_body
+                .contains("v             open gate model picker")
+        );
+        assert!(
+            app.response_body
+                .contains("r             refresh memories and timeline")
+        );
+    }
+
+    #[test]
+    fn v_opens_gate_model_picker() {
+        let mut app = test_app();
+        app.apply_chat_models(ChatModelsResponse {
+            backend: "bedrock".to_string(),
+            default_model_id: Some("moonshotai.kimi-k2.5".to_string()),
+            models: vec![ChatModelOption {
+                label: "Kimi K2.5".to_string(),
+                model_id: "moonshotai.kimi-k2.5".to_string(),
+                description: None,
+                thinking_mode: None,
+                thinking_effort: None,
+                thinking_budget_tokens: None,
+                pricing: None,
+            }],
+        });
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
+            ClientAction::None
+        ));
+
+        assert_eq!(app.mode, InputMode::ModelPicker);
+        assert_eq!(app.model_picker_target, ModelPickerTarget::Gate);
+        assert_eq!(app.status.message, "Gate model picker. Use j/k and Enter.");
+    }
+
+    #[test]
+    fn g_jumps_to_top_in_normal_mode() {
+        let mut app = test_app();
+        app.memories = vec![
+            sample_memory("Memory one", &["one"]),
+            sample_memory("Memory two", &["two"]),
+        ];
+        app.memory_state.select(Some(1));
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            ClientAction::None
+        ));
+
+        assert_eq!(app.memory_state.selected(), Some(0));
     }
 
     fn sample_memory(title_text: &str, tags: &[&str]) -> MemoryRecord {
