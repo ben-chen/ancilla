@@ -17,11 +17,12 @@ use crate::{
     model::{
         Artifact, ArtifactKind, AssembleContextRequest, AssembleContextResponse,
         CaptureEntryResponse, ChatModelsResponse, ChatRespondRequest, ChatResponse,
-        ConversationRole, CreateAudioEntryRequest, CreateMemoryRequest, CreateTextEntryRequest,
-        EmbeddingVector, Entry, EntryKind, GenerateMemoriesRequest, LlmCallMetrics, MemoryKind,
-        MemoryRecord, MemoryState, PatchMemoryRequest, PersistedState, PreparedArtifactInput,
-        PreparedMemoryInput, ProfileBlock, RetrievalTrace, ScoredMemory, SearchMemoriesRequest,
-        Thread, ThreadKind, ThreadStatus, empty_object, now_utc,
+        ConversationRole, ConversationTurn, CreateAudioEntryRequest, CreateMemoryRequest,
+        CreateTextEntryRequest, EmbeddingVector, Entry, EntryKind, GenerateMemoriesRequest,
+        LlmCallMetrics, MemoryKind, MemoryRecord, MemoryState, PatchMemoryRequest,
+        PersistedState, PreparedArtifactInput, PreparedMemoryInput, ProfileBlock, RetrievalTrace,
+        ScoredMemory, SearchMemoriesRequest, Thread, ThreadKind, ThreadStatus, empty_object,
+        now_utc,
     },
     polly::{PollySpeechService, SpeechSynthesisOutput},
     retrieval::{
@@ -584,6 +585,8 @@ impl AppService {
         let max_candidates = request.max_candidates.unwrap_or(20);
         let max_injected = request.max_injected.unwrap_or(3);
         let mut request = request;
+        request.recent_turns =
+            resolve_conversation_turns(&state, request.conversation_id, &request.recent_turns);
         request.query_embedding = self
             .hydrate_query_embedding(&request)
             .await?
@@ -756,12 +759,14 @@ impl AppService {
     }
 
     pub async fn chat_respond(&self, request: ChatRespondRequest) -> anyhow::Result<ChatResponse> {
-        let recent_turns = request.recent_turns.clone();
+        let recent_turns = self
+            .resolved_chat_recent_turns(request.conversation_id, &request.recent_turns)
+            .await;
         let recent_context = request.recent_context.clone();
         let context = self
             .assemble_context(AssembleContextRequest {
                 query: request.message.clone(),
-                recent_turns,
+                recent_turns: recent_turns.clone(),
                 recent_context: recent_context.clone(),
                 gate_model_id: request.gate_model_id.clone(),
                 conversation_id: request.conversation_id,
@@ -776,7 +781,10 @@ impl AppService {
 
         let tool_executor = ServiceChatToolExecutor {
             service: self.clone(),
-            request: request.clone(),
+            request: ChatRespondRequest {
+                recent_turns: recent_turns.clone(),
+                ..request.clone()
+            },
             remember_summary: Arc::new(Mutex::new(RememberToolSummary::default())),
             llm_metrics: Arc::new(Mutex::new(None)),
         };
@@ -786,7 +794,7 @@ impl AppService {
                 &ChatCompletionRequest {
                     message: request.message.clone(),
                     model_id: request.model_id.clone(),
-                    recent_turns: request.recent_turns.clone(),
+                    recent_turns: recent_turns.clone(),
                     recent_context,
                     injected_context: context.context.clone(),
                     selected_memories: context.selected_memories.clone(),
@@ -798,25 +806,13 @@ impl AppService {
         let chat_metrics =
             LlmCallMetrics::merged(completion.metrics, tool_executor.take_llm_metrics().await);
 
-        self.store
-            .write_with(|state| {
-                let entry = Entry {
-                    id: Uuid::new_v4(),
-                    kind: EntryKind::ChatTurn,
-                    raw_text: Some(request.message.clone()),
-                    asset_ref: None,
-                    captured_at: now_utc(),
-                    timezone: "UTC".to_string(),
-                    source_app: Some("chat".to_string()),
-                    metadata: json!({
-                        "role": ConversationRole::User,
-                        "trace_id": context.trace_id,
-                    }),
-                    created_at: now_utc(),
-                };
-                state.entries.insert(entry.id, entry);
-            })
-            .await?;
+        self.persist_chat_turns(
+            request.conversation_id,
+            context.trace_id,
+            &request.message,
+            &completion.answer,
+        )
+        .await?;
 
         Ok(ChatResponse {
             answer: completion.answer,
@@ -833,12 +829,14 @@ impl AppService {
         &self,
         request: ChatRespondRequest,
     ) -> anyhow::Result<ChatResponseStream> {
-        let recent_turns = request.recent_turns.clone();
+        let recent_turns = self
+            .resolved_chat_recent_turns(request.conversation_id, &request.recent_turns)
+            .await;
         let recent_context = request.recent_context.clone();
         let context = self
             .assemble_context(AssembleContextRequest {
                 query: request.message.clone(),
-                recent_turns,
+                recent_turns: recent_turns.clone(),
                 recent_context: recent_context.clone(),
                 gate_model_id: request.gate_model_id.clone(),
                 conversation_id: request.conversation_id,
@@ -853,7 +851,10 @@ impl AppService {
 
         let tool_executor = ServiceChatToolExecutor {
             service: self.clone(),
-            request: request.clone(),
+            request: ChatRespondRequest {
+                recent_turns: recent_turns.clone(),
+                ..request.clone()
+            },
             remember_summary: Arc::new(Mutex::new(RememberToolSummary::default())),
             llm_metrics: Arc::new(Mutex::new(None)),
         };
@@ -863,7 +864,7 @@ impl AppService {
                 &ChatCompletionRequest {
                     message: request.message.clone(),
                     model_id: request.model_id.clone(),
-                    recent_turns: request.recent_turns.clone(),
+                    recent_turns: recent_turns.clone(),
                     recent_context,
                     injected_context: context.context.clone(),
                     selected_memories: context.selected_memories.clone(),
@@ -898,25 +899,13 @@ impl AppService {
                 .await;
         });
 
-        self.store
-            .write_with(|state| {
-                let entry = Entry {
-                    id: Uuid::new_v4(),
-                    kind: EntryKind::ChatTurn,
-                    raw_text: Some(request.message.clone()),
-                    asset_ref: None,
-                    captured_at: now_utc(),
-                    timezone: "UTC".to_string(),
-                    source_app: Some("chat".to_string()),
-                    metadata: json!({
-                        "role": ConversationRole::User,
-                        "trace_id": context.trace_id,
-                    }),
-                    created_at: now_utc(),
-                };
-                state.entries.insert(entry.id, entry);
-            })
-            .await?;
+        self.persist_chat_turns(
+            request.conversation_id,
+            context.trace_id,
+            &request.message,
+            &completion.answer,
+        )
+        .await?;
 
         Ok(ChatResponseStream {
             trace_id: context.trace_id,
@@ -929,6 +918,81 @@ impl AppService {
             remembered_memories_count: remember_summary.created_count,
             receiver,
         })
+    }
+
+    async fn resolved_chat_recent_turns(
+        &self,
+        conversation_id: Option<Uuid>,
+        fallback: &[ConversationTurn],
+    ) -> Vec<ConversationTurn> {
+        let state = self.store.read_clone().await;
+        resolve_conversation_turns(&state, conversation_id, fallback)
+    }
+
+    async fn persist_chat_turns(
+        &self,
+        conversation_id: Option<Uuid>,
+        trace_id: Uuid,
+        user_message: &str,
+        assistant_message: &str,
+    ) -> anyhow::Result<()> {
+        let user_message = user_message.trim();
+        let assistant_message = assistant_message.trim();
+        if user_message.is_empty() && assistant_message.is_empty() {
+            return Ok(());
+        }
+
+        self.store
+            .write_with(|state| {
+                let user_created_at = now_utc();
+                if !user_message.is_empty() {
+                    let entry_id = Uuid::new_v4();
+                    state.entries.insert(
+                        entry_id,
+                        Entry {
+                            id: entry_id,
+                            kind: EntryKind::ChatTurn,
+                            raw_text: Some(user_message.to_string()),
+                            asset_ref: None,
+                            captured_at: user_created_at,
+                            timezone: "UTC".to_string(),
+                            source_app: Some("chat".to_string()),
+                            metadata: chat_turn_metadata(
+                                ConversationRole::User,
+                                conversation_id,
+                                trace_id,
+                            ),
+                            created_at: user_created_at,
+                        },
+                    );
+                }
+
+                if !assistant_message.is_empty() {
+                    let assistant_created_at = user_created_at + Duration::microseconds(1);
+                    let entry_id = Uuid::new_v4();
+                    state.entries.insert(
+                        entry_id,
+                        Entry {
+                            id: entry_id,
+                            kind: EntryKind::ChatTurn,
+                            raw_text: Some(assistant_message.to_string()),
+                            asset_ref: None,
+                            captured_at: assistant_created_at,
+                            timezone: "UTC".to_string(),
+                            source_app: Some("chat".to_string()),
+                            metadata: chat_turn_metadata(
+                                ConversationRole::Assistant,
+                                conversation_id,
+                                trace_id,
+                            ),
+                            created_at: assistant_created_at,
+                        },
+                    );
+                }
+            })
+            .await?;
+
+        Ok(())
     }
 
     pub fn chat_models(&self) -> ChatModelsResponse {
@@ -1506,6 +1570,77 @@ fn build_query_embedding_text(request: &AssembleContextRequest) -> String {
         .collect::<Vec<_>>();
     let start = tokens.len().saturating_sub(500);
     tokens[start..].join(" ")
+}
+
+fn resolve_conversation_turns(
+    state: &PersistedState,
+    conversation_id: Option<Uuid>,
+    fallback: &[ConversationTurn],
+) -> Vec<ConversationTurn> {
+    let Some(conversation_id) = conversation_id else {
+        return fallback.to_vec();
+    };
+
+    let mut turns = state
+        .entries
+        .values()
+        .filter_map(|entry| conversation_turn_from_entry(entry, conversation_id))
+        .collect::<Vec<_>>();
+    turns.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    if turns.is_empty() {
+        fallback.to_vec()
+    } else {
+        turns.into_iter().map(|(_, _, turn)| turn).collect()
+    }
+}
+
+fn conversation_turn_from_entry(
+    entry: &Entry,
+    conversation_id: Uuid,
+) -> Option<(DateTime<Utc>, Uuid, ConversationTurn)> {
+    if entry.kind != EntryKind::ChatTurn {
+        return None;
+    }
+
+    let entry_conversation_id = entry
+        .metadata
+        .get("conversation_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok())?;
+    if entry_conversation_id != conversation_id {
+        return None;
+    }
+
+    let role = entry
+        .metadata
+        .get("role")
+        .and_then(|value| serde_json::from_value::<ConversationRole>(value.clone()).ok())?;
+    let text = entry.raw_text.as_ref()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    Some((
+        entry.created_at,
+        entry.id,
+        ConversationTurn {
+            role,
+            text: text.to_string(),
+        },
+    ))
+}
+
+fn chat_turn_metadata(
+    role: ConversationRole,
+    conversation_id: Option<Uuid>,
+    trace_id: Uuid,
+) -> serde_json::Value {
+    json!({
+        "role": role,
+        "conversation_id": conversation_id,
+        "trace_id": trace_id,
+    })
 }
 
 fn build_conversation_memory_context(request: &ChatRespondRequest) -> String {
@@ -2441,6 +2576,60 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("personal memory system")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_response_reuses_server_persisted_conversation_turns() {
+        let backend = RecordingBackend::default();
+        let service = AppService::new_in_memory_with_chat_backend(Arc::new(backend.clone()));
+        let conversation_id = Uuid::new_v4();
+
+        service
+            .chat_respond(ChatRespondRequest {
+                message: "My name is Ben.".to_string(),
+                model_id: Some("anthropic.claude-opus-4-6-v1".to_string()),
+                gate_model_id: None,
+                recent_turns: Vec::new(),
+                recent_context: None,
+                conversation_id: Some(conversation_id),
+                active_thread_id: None,
+                focus_from: None,
+                focus_to: None,
+                query_embedding: None,
+            })
+            .await
+            .unwrap();
+        service
+            .chat_respond(ChatRespondRequest {
+                message: "What is my name?".to_string(),
+                model_id: Some("anthropic.claude-opus-4-6-v1".to_string()),
+                gate_model_id: None,
+                recent_turns: Vec::new(),
+                recent_context: None,
+                conversation_id: Some(conversation_id),
+                active_thread_id: None,
+                focus_from: None,
+                focus_to: None,
+                query_embedding: None,
+            })
+            .await
+            .unwrap();
+
+        let seen = backend.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[1].recent_turns,
+            vec![
+                ConversationTurn {
+                    role: ConversationRole::User,
+                    text: "My name is Ben.".to_string(),
+                },
+                ConversationTurn {
+                    role: ConversationRole::Assistant,
+                    text: "bedrock-mock: My name is Ben.".to_string(),
+                },
+            ]
         );
     }
 

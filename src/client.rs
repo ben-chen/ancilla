@@ -310,13 +310,13 @@ impl RemoteApi {
         model_id: Option<&str>,
         gate_model_id: Option<&str>,
         conversation_id: Uuid,
-        recent_turns: &[ConversationTurn],
+        _recent_turns: &[ConversationTurn],
     ) -> mpsc::Receiver<RemoteChatUpdate> {
         let request = ChatRespondRequest {
             message: message.to_string(),
             model_id: model_id.map(ToOwned::to_owned),
             gate_model_id: gate_model_id.map(ToOwned::to_owned),
-            recent_turns: recent_turns.to_vec(),
+            recent_turns: Vec::new(),
             recent_context: None,
             conversation_id: Some(conversation_id),
             active_thread_id: None,
@@ -342,13 +342,13 @@ impl RemoteApi {
         message: &str,
         gate_model_id: Option<&str>,
         conversation_id: Option<Uuid>,
-        recent_turns: &[ConversationTurn],
+        _recent_turns: &[ConversationTurn],
     ) -> anyhow::Result<AssembleContextResponse> {
         self.post_json(
             "/v1/context/assemble",
             &AssembleContextRequest {
                 query: message.to_string(),
-                recent_turns: recent_turns.to_vec(),
+                recent_turns: Vec::new(),
                 recent_context: None,
                 gate_model_id: gate_model_id.map(ToOwned::to_owned),
                 conversation_id,

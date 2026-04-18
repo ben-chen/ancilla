@@ -556,7 +556,6 @@ function App() {
           message,
           model_id: selectedChatModelId || undefined,
           gate_model_id: selectedGateModelId || undefined,
-          recent_turns: turns.slice(-12),
           conversation_id: conversationId,
         }),
       })
